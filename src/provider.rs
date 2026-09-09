@@ -1,0 +1,343 @@
+use crate::config::Config;
+use crate::protocol::{Event, ToolCall};
+use anyhow::{Context, Result};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChatRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+    stream: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ToolDef>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChatMessage {
+    role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ApiToolCall>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolDef {
+    #[serde(rename = "type")]
+    tool_type: String,
+    function: ToolFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolFunction {
+    name: String,
+    description: String,
+    parameters: Value,
+}
+
+/// Tool-call wrapper in the API response delta. Only deserialized, never sent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ApiToolCall {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    index: usize,
+    function: ApiFunctionCall,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ApiFunctionCall {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+/// Server-sent chunk delta. `content` is optional because some providers emit
+/// a leading delta with only `role` set before the first token.
+#[derive(Debug, Clone, Deserialize)]
+struct StreamChunk {
+    choices: Vec<StreamChoice>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StreamChoice {
+    delta: StreamDelta,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StreamDelta {
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ApiToolCall>>,
+}
+
+/// Parsed tool call accumulated across deltas.
+#[derive(Debug, Clone)]
+struct AccumulatedToolCall {
+    id: String,
+    name: String,
+    args: String,
+    /// Ids already seen for this slot, used to detect the start of a new call.
+    seen: std::collections::HashSet<String>,
+}
+
+/// Send a message to the provider and return a list of events (text deltas,
+/// tool calls, and a terminal Done). Supports function-calling when `tools`
+/// is provided.
+pub async fn send_message(
+    cfg: &Config,
+    session_messages: &[crate::storage::Message],
+    tools: Option<&[crate::tools::ToolDefinition]>,
+    memory_context: &str,
+) -> Result<Vec<Event>> {
+    let api_key = resolve_api_key(cfg)?;
+    let base_url = cfg.provider.base_url.trim_end_matches('/');
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?;
+
+    let mut system = "You are a helpful AI coding agent running with full local filesystem access on the user's machine. You have tools to explore the codebase: list_dir (list a directory), glob (find files by pattern), read (read file contents), agentgrep (search file contents), bash (run shell commands), write (create/overwrite files), and edit (replace text in a file). When the user asks you to analyze or inspect a project, USE these tools to explore the working directory yourself before responding — do not ask the user for file paths or tell them you lack access. Start by calling list_dir on '.' or the current directory to discover the structure.".to_string();
+    if !memory_context.is_empty() {
+        system.push_str("\n\nProject memory (facts the user has told you before; trust them unless they conflict with what you see):\n");
+        system.push_str(memory_context);
+    }
+
+    let mut messages: Vec<ChatMessage> = Vec::new();
+    messages.push(ChatMessage {
+        role: "system".to_string(),
+        content: Some(system),
+        tool_calls: None,
+        tool_call_id: None,
+    });
+    messages.extend(
+        session_messages
+            .iter()
+            .map(|m| ChatMessage {
+                role: m.role.clone(),
+                content: if m.content.is_empty() { None } else { Some(m.content.clone()) },
+                tool_calls: m.tool_calls.as_ref().map(|tcs| {
+                    tcs.iter()
+                        .enumerate()
+                        .map(|(i, tc)| ApiToolCall {
+                            id: Some(tc.id.clone()),
+                            index: i,
+                            function: ApiFunctionCall {
+                                name: Some(tc.name.clone()),
+                                arguments: Some(tc.arguments.clone()),
+                            },
+                        })
+                        .collect()
+                }),
+                tool_call_id: m.tool_call_id.clone(),
+            }),
+    );
+
+    let tool_defs = tools.map(|tds| {
+        tds.iter()
+            .map(|td| ToolDef {
+                tool_type: "function".to_string(),
+                function: ToolFunction {
+                    name: td.name.clone(),
+                    description: td.description.clone(),
+                    parameters: td.parameters.clone(),
+                },
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let tool_choice = if tool_defs.is_some() {
+        Some(serde_json::json!("auto"))
+    } else {
+        Some(serde_json::json!("none"))
+    };
+
+    let req = ChatRequest {
+        model: cfg.provider.default_model.clone(),
+        messages,
+        stream: true,
+        tools: tool_defs,
+        tool_choice,
+    };
+
+    let url = format!("{}/chat/completions", base_url);
+    tracing::info!("provider request: model={}, messages={}, tools={}", req.model, req.messages.len(), req.tools.as_ref().map_or(0, |t| t.len()));
+    if let Some(ref tool_list) = req.tools {
+        for td in tool_list {
+            tracing::info!("  tool: {} - {}", td.function.name, td.function.description.chars().take(60).collect::<String>());
+        }
+    }
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&req)
+        .send()
+        .await
+        .context("sending chat request")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        tracing::error!("provider error {}: {}", status, text);
+        anyhow::bail!("provider error {}: {}", status, text);
+    }
+
+    let mut events = Vec::new();
+    let mut full = String::new();
+
+    // Accumulate tool calls across deltas; emit them as a single ToolCall event
+    // when the turn finishes.
+    let mut pending: Vec<AccumulatedToolCall> = Vec::new();
+
+    let body = resp.text().await.context("reading response body")?;
+    tracing::info!("provider response body ({} bytes): {}", body.len(), body);
+    for line in body.lines() {
+        process_line(line, &mut events, &mut full, &mut pending);
+    }
+
+    // Flush any accumulated tool calls into a ToolCall event.
+    if !pending.is_empty() {
+        let calls: Vec<ToolCall> = pending
+            .into_iter()
+            .map(|a| {
+                let input: Value = serde_json::from_str(&a.args).unwrap_or_else(|_| {
+                    serde_json::json!({ "raw": a.args.clone() })
+                });
+                ToolCall {
+                    id: a.id,
+                    name: a.name,
+                    input,
+                }
+            })
+            .collect();
+        events.push(Event::ToolCall { id: None, calls });
+    }
+
+    // Ensure a terminal Done event.
+    if !events.iter().any(|ev| matches!(ev, Event::Done { .. })) {
+        events.push(Event::Done { id: Some(0) });
+    }
+    if events.is_empty() {
+        events.push(Event::TextDelta { id: None, text: full });
+        events.push(Event::Done { id: Some(0) });
+    }
+    Ok(events)
+}
+
+fn process_line(
+    line: &str,
+    events: &mut Vec<Event>,
+    full: &mut String,
+    pending: &mut Vec<AccumulatedToolCall>,
+) {
+    let line = line.trim();
+    if !line.starts_with("data: ") {
+        return;
+    }
+    let data = &line[6..];
+    if data == "[DONE]" {
+        events.push(Event::Done { id: Some(0) });
+        return;
+    }
+    let chunk: StreamChunk = match serde_json::from_str(data) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                "failed to parse SSE chunk {:?}: {}",
+                data.chars().take(80).collect::<String>(),
+                e
+            );
+            return;
+        }
+    };
+    if let Some(choice) = chunk.choices.first() {
+        // Text delta
+        if let Some(text) = &choice.delta.content {
+            if !text.is_empty() {
+                full.push_str(text);
+                events.push(Event::TextDelta { id: None, text: text.clone() });
+            }
+        }
+
+        // Tool-call delta (OpenAI streams tool_calls as an array with deltas).
+        // Different providers format these differently, so we accumulate by
+        // index and treat a fresh id as the start of a new call. Argument
+        // fragments are appended whether or not the chunk carries an id, which
+        // handles both OpenAI (id only on the first chunk) and Claude-style
+        // routers (id on every chunk).
+        if let Some(tcs) = &choice.delta.tool_calls {
+            for tc in tcs {
+                // Ensure the slot for this index exists.
+                while pending.len() <= tc.index {
+                    pending.push(AccumulatedToolCall {
+                        id: String::new(),
+                        name: String::new(),
+                        args: String::new(),
+                        seen: std::collections::HashSet::new(),
+                    });
+                }
+                let slot = &mut pending[tc.index];
+                // A fresh id means the start of a new tool call.
+                if let Some(id) = &tc.id {
+                    if !id.is_empty() && !slot.seen.contains(id) {
+                        slot.seen.insert(id.clone());
+                        slot.id = id.clone();
+                        slot.args.clear();
+                    }
+                }
+                if let Some(name) = &tc.function.name {
+                    if !name.is_empty() {
+                        slot.name = name.clone();
+                    }
+                }
+                if let Some(args) = &tc.function.arguments {
+                    if !args.is_empty() {
+                        slot.args.push_str(args);
+                    }
+                }
+            }
+        }
+
+        if choice.finish_reason.is_some() {
+            events.push(Event::Done { id: Some(0) });
+        }
+    }
+}
+
+fn resolve_api_key(cfg: &Config) -> Result<String> {
+    // 1. Inline key in config (easiest for single-user setups)
+    if let Some(ref key) = cfg.provider.api_key {
+        if !key.trim().is_empty() {
+            return Ok(key.clone());
+        }
+    }
+    // 2. Named environment variable from config
+    if let Some(ref env_name) = cfg.provider.api_key_env {
+        if let Ok(val) = std::env::var(env_name) {
+            if !val.trim().is_empty() {
+                return Ok(val);
+            }
+        }
+    }
+    // 3. Default OPENAI_API_KEY
+    if let Ok(val) = std::env::var("OPENAI_API_KEY") {
+        if !val.trim().is_empty() {
+            return Ok(val);
+        }
+    }
+    anyhow::bail!(
+        "no API key found; set provider.api_key in config.toml, or set {} env var, or set OPENAI_API_KEY",
+        cfg.provider.api_key_env.as_deref().unwrap_or("api_key_env")
+    );
+}

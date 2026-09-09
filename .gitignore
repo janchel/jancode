@@ -1,0 +1,45 @@
+# Rust build artifacts
+target/
+
+# Local runtime / logs
+daemon.log
+*.log
+
+# Local notes / scratch files (may contain keys, credentials, or plans)
+*.txt
+*.tmp
+*.swp
+*~
+
+# Changelogs are local keep-notes, not part of the published repo
+changelog
+changelog*
+CHANGELOG.md
+CHANGELOG*
+
+# Secrets & credentials — never commit these
+.env
+.env.*
+!.env.example
+*.env
+config.toml
+*.key
+*.pem
+*.crt
+*.p12
+*.jcode-backup
+*.jancode-backup
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.iml
+
+# Config dirs / sockets created by the app at runtime
+.jancode/
+jancode.sock
+/data/
+/run/jcode/
+/run/jancode/
