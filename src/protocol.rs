@@ -18,6 +18,10 @@ pub enum Request {
         model: Option<String>,
         #[serde(default)]
         cwd: Option<String>,
+        /// True when a human is attached and can answer approval prompts
+        /// (`Event::ApprovalRequired`). Headless clients leave this false.
+        #[serde(default)]
+        interactive: bool,
     },
     Cancel { id: u64, session_id: Option<String> },
     Ping { id: u64 },
@@ -25,6 +29,17 @@ pub enum Request {
     /// Probe configured MCP servers: connect, initialize, and list their tools.
     /// Responded with `Event::McpInfo`. Safe read-only introspection.
     McpProbe { id: u64 },
+
+    /// Client reply to `Event::ApprovalRequired`. `approved` decides whether the
+    /// risky tool call may proceed. The server waits (with a timeout) for this
+    /// before executing the gated tool.
+    ApprovalResponse {
+        id: u64,
+        #[serde(default)]
+        session_id: Option<String>,
+        tool_call_id: String,
+        approved: bool,
+    },
 
     // ---- Swarm / multi-agent (jancode-style, in-process) ----
     /// Spawn a new agent session inside the same daemon. The new session runs
@@ -80,6 +95,18 @@ pub enum Event {
     McpInfo {
         id: u64,
         servers: Vec<crate::mcp::McpServerProbe>,
+    },
+
+    /// A tool call needs human approval before the server will run it (file
+    /// modification, or a read that resolves outside the working directory).
+    /// The client must reply with `Request::ApprovalResponse` (correlating on
+    /// `id` + `tool_call_id`); otherwise the call times out and is denied.
+    ApprovalRequired {
+        id: u64,
+        tool_call_id: String,
+        tool_name: String,
+        path: Option<String>,
+        reason: String,
     },
 
     // ---- Swarm / multi-agent ----

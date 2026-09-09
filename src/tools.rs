@@ -92,6 +92,31 @@ impl ToolContext {
     }
 }
 
+/// Lexically normalize a path (resolve `.` / `..`) without touching the
+/// filesystem or following symlinks.
+pub fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            c => out.push(c.as_os_str()),
+        }
+    }
+    out
+}
+
+/// True if `target` (after lexical normalization) is not inside `base`.
+pub fn is_outside(base: &Path, target: &Path) -> bool {
+    let base = normalize_path(base);
+    let target = normalize_path(target);
+    !target.starts_with(&base)
+}
+
 // ---------------------------------------------------------------------------
 // Tool registry
 // ---------------------------------------------------------------------------
@@ -140,6 +165,8 @@ pub fn default_registry() -> ToolRegistry {
     r.register(ListDirTool);
     r.register(GlobTool);
     r.register(GrepTool);
+    r.register(ApplyPatchTool);
+    r.register(PlanTool);
     r
 }
 
@@ -597,5 +624,453 @@ impl Tool for GrepTool {
         }
 
         Ok(matches.join("\n"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// apply_patch
+// ---------------------------------------------------------------------------
+
+/// Applies a unified diff (git-style) to one or more files in the working
+/// directory with one call. This is the workhorse for multi-file changes:
+/// create, modify, and delete files from a single `patch`.
+pub struct ApplyPatchTool;
+
+#[derive(Debug)]
+enum DiffLine {
+    Context(String),
+    Remove(String),
+    Add(String),
+}
+
+#[derive(Debug)]
+struct Hunk {
+    old_start: usize,
+    lines: Vec<DiffLine>,
+}
+
+#[derive(Debug)]
+struct PatchFile {
+    old_path: Option<String>,
+    new_path: Option<String>,
+    hunks: Vec<Hunk>,
+}
+
+fn patch_path(s: &str, prefix: &str) -> Option<String> {
+    let s = s.trim();
+    if s == "/dev/null" {
+        None
+    } else {
+        Some(s.strip_prefix(prefix).unwrap_or(s).to_string())
+    }
+}
+
+fn parse_patch(text: &str) -> Result<Vec<PatchFile>> {
+    let mut files: Vec<PatchFile> = Vec::new();
+    let empty = || PatchFile { old_path: None, new_path: None, hunks: Vec::new() };
+    let mut cur = empty();
+    let mut cur_hunk: Option<Hunk> = None;
+    let mut in_body = false;
+
+    let flush_hunk = |cur: &mut PatchFile, cur_hunk: &mut Option<Hunk>| {
+        if let Some(h) = cur_hunk.take() {
+            cur.hunks.push(h);
+        }
+    };
+    let flush_file = |files: &mut Vec<PatchFile>, cur: &mut PatchFile, empty: &dyn Fn() -> PatchFile| {
+        if cur.new_path.is_some() || !cur.hunks.is_empty() {
+            files.push(std::mem::replace(cur, empty()));
+        }
+    };
+
+    for raw in text.lines() {
+        let line = raw.trim_end_matches('\r');
+        if line.is_empty() {
+            in_body = false;
+            continue;
+        }
+        // Parse hunk body lines first (single-char prefix). Detect file/hunk
+        // boundaries before consuming `---` / `+++` as removal/addition lines.
+        if in_body {
+            match line.as_bytes().first() {
+                Some(b' ') => {
+                    cur_hunk.as_mut().unwrap().lines.push(DiffLine::Context(line[1..].to_string()));
+                    continue;
+                }
+                Some(b'-') if !line.starts_with("--- ") => {
+                    cur_hunk.as_mut().unwrap().lines.push(DiffLine::Remove(line[1..].to_string()));
+                    continue;
+                }
+                Some(b'+') if !line.starts_with("+++ ") => {
+                    cur_hunk.as_mut().unwrap().lines.push(DiffLine::Add(line[1..].to_string()));
+                    continue;
+                }
+                Some(b'\\') => continue, // "\ No newline at end of file"
+                _ => { in_body = false; }
+            }
+        }
+        if line.starts_with("@@ ") {
+            flush_hunk(&mut cur, &mut cur_hunk);
+            let num = line
+                .trim_start_matches("@@ ")
+                .split_once(' ')
+                .map(|(a, _)| a)
+                .unwrap_or_else(|| line.trim_start_matches("@@ "));
+            let old_start: usize = num
+                .trim_start_matches('-')
+                .split(',')
+                .next()
+                .unwrap_or("1")
+                .parse()
+                .unwrap_or(1);
+            cur_hunk = Some(Hunk { old_start, lines: Vec::new() });
+            in_body = true;
+            continue;
+        }
+        if line.starts_with("diff --git ") {
+            flush_hunk(&mut cur, &mut cur_hunk);
+            flush_file(&mut files, &mut cur, &empty);
+            in_body = false;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("--- ") {
+            flush_hunk(&mut cur, &mut cur_hunk);
+            if cur.new_path.is_some() {
+                flush_file(&mut files, &mut cur, &empty);
+            }
+            cur.old_path = patch_path(rest, "a/");
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            flush_hunk(&mut cur, &mut cur_hunk);
+            if cur.old_path.is_some() && cur.new_path.is_some() {
+                flush_file(&mut files, &mut cur, &empty);
+            }
+            cur.new_path = patch_path(rest, "b/");
+            continue;
+        }
+        // index / mode / similarity / any other metadata lines: ignore.
+    }
+    flush_hunk(&mut cur, &mut cur_hunk);
+    flush_file(&mut files, &mut cur, &empty);
+    Ok(files)
+}
+
+async fn apply_patch_file(file: &PatchFile, base_dir: &Path) -> Result<String> {
+    let new_path = match &file.new_path {
+        Some(p) => p,
+        None => anyhow::bail!("patch has no target file (new_path missing)"),
+    };
+
+    if new_path == "/dev/null" {
+        let old = file.old_path.as_deref().unwrap_or("");
+        let full = base_dir.join(old);
+        if tokio::fs::remove_file(&full).await.is_ok() {
+            return Ok(format!("deleted {}", full.display()));
+        }
+        return Ok(format!("(delete skipped: {} not found)", full.display()));
+    }
+
+    let is_new = file.old_path.is_none();
+    let full = base_dir.join(new_path);
+    let content = if is_new {
+        String::new()
+    } else {
+        match tokio::fs::read_to_string(&full).await {
+            Ok(c) => c,
+            Err(_) => {
+                return Ok(format!(
+                    "ERROR: cannot apply patch to {}: file does not exist",
+                    full.display()
+                ))
+            }
+        }
+    };
+
+    let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut idx = 0usize;
+    let mut added = 0usize;
+    let mut removed = 0usize;
+
+    for hunk in &file.hunks {
+        let target = hunk.old_start.saturating_sub(1);
+        while idx < target && idx < lines.len() {
+            out.push(lines[idx].clone());
+            idx += 1;
+        }
+        for dline in &hunk.lines {
+            match dline {
+                DiffLine::Context(c) => {
+                    if idx >= lines.len() || lines[idx] != *c {
+                        return Ok(format!(
+                            "ERROR: patch context mismatch in {} (expected {:?})",
+                            full.display(),
+                            c
+                        ));
+                    }
+                    out.push(lines[idx].clone());
+                    idx += 1;
+                }
+                DiffLine::Remove(c) => {
+                    if idx >= lines.len() || lines[idx] != *c {
+                        return Ok(format!(
+                            "ERROR: patch removal mismatch in {} (expected {:?})",
+                            full.display(),
+                            c
+                        ));
+                    }
+                    idx += 1;
+                    removed += 1;
+                }
+                DiffLine::Add(c) => {
+                    out.push(c.clone());
+                    added += 1;
+                }
+            }
+        }
+    }
+    while idx < lines.len() {
+        out.push(lines[idx].clone());
+        idx += 1;
+    }
+
+    let new_content = out.join("\n");
+    if let Some(parent) = full.parent() {
+        tokio::fs::create_dir_all(parent).await.ok();
+    }
+    if let Err(e) = tokio::fs::write(&full, &new_content).await {
+        return Ok(format!("ERROR: writing {}: {}", full.display(), e));
+    }
+    Ok(format!(
+        "{} {} ({}+/{}- lines)",
+        if is_new { "created" } else { "updated" },
+        full.display(),
+        added,
+        removed
+    ))
+}
+
+#[async_trait]
+impl Tool for ApplyPatchTool {
+    fn name(&self) -> &str {
+        "apply_patch"
+    }
+
+    fn description(&self) -> &str {
+        "Apply a unified diff to one or more files in the working directory with a\n\
+         single call. Pass a git-style patch in the 'patch' parameter:\n\
+         ```\n\
+         --- a/existing.rs\n\
+         +++ b/existing.rs\n\
+         @@ -1,3 +1,4 @@\n\
+          unchanged context line\n\
+         -removed line\n\
+         +added line\n\
+         ```\n\
+         Use it for coordinated multi-file edits: create new files (--- /dev/null),\n\
+         modify several files, or delete files (+++ /dev/null). Fails loudly if the\n\
+         context does not match the current file contents."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "patch": {
+                    "type": "string",
+                    "description": "The unified diff text (git-style, one or more files)."
+                }
+            },
+            "required": ["patch"]
+        })
+    }
+
+    async fn execute(&self, input: &Value, ctx: &ToolContext) -> Result<String> {
+        let patch_text = input
+            .get("patch")
+            .and_then(|v| v.as_str())
+            .context("missing 'patch' parameter")?;
+        let files = parse_patch(patch_text)?;
+        if files.is_empty() {
+            anyhow::bail!("no valid file hunks found in patch");
+        }
+        let mut summary = format!("applied patch to {} file(s):", files.len());
+        for f in &files {
+            match apply_patch_file(f, &ctx.working_dir).await {
+                Ok(s) => summary.push_str(&format!("\n  {}", s)),
+                Err(e) => summary.push_str(&format!("\n  ERROR: {}", e)),
+            }
+        }
+        Ok(summary)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// plan
+// ---------------------------------------------------------------------------
+
+/// Persists a step-by-step plan in `<working_dir>/.jancode-plan.md` so agents
+/// can track multi-step work across turns and tool calls.
+pub struct PlanTool;
+
+#[async_trait]
+impl Tool for PlanTool {
+    fn name(&self) -> &str {
+        "plan"
+    }
+
+    fn description(&self) -> &str {
+        "Maintain a persistent step-by-step plan for this working directory in\n\
+         .jancode-plan.md. Actions: 'create' (write 'steps'), 'append' (add more\n\
+         steps), 'complete' (mark step N done by number), 'show' (print the plan).\n\
+         Start a multi-step task by creating a plan, then update it as you go so\n\
+         you never lose track or redo finished work."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["create", "append", "complete", "show"],
+                    "description": "What to do with the plan."
+                },
+                "steps": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Steps to write (create) or add (append)."
+                },
+                "step": {
+                    "type": "integer",
+                    "description": "1-based step number to mark complete."
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Optional plan title set on create."
+                }
+            },
+            "required": ["action"]
+        })
+    }
+
+    async fn execute(&self, input: &Value, ctx: &ToolContext) -> Result<String> {
+        let action = input
+            .get("action")
+            .and_then(|v| v.as_str())
+            .context("missing 'action' parameter")?;
+        let plan_file = ctx.working_dir.join(".jancode-plan.md");
+        let steps_from = |v: Option<&Value>| -> Option<Vec<String>> {
+            v.and_then(|v| v.as_array()).map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+        };
+
+        match action {
+            "create" => {
+                let steps = steps_from(input.get("steps")).context("missing 'steps' array for create")?;
+                let title = input.get("title").and_then(|v| v.as_str()).unwrap_or("Plan");
+                let mut out = format!("# {}\n\n", title);
+                for s in &steps {
+                    out.push_str(&format!("- [ ] {}\n", s));
+                }
+                tokio::fs::write(&plan_file, &out)
+                    .await
+                    .with_context(|| format!("writing {}", plan_file.display()))?;
+                Ok(format!("plan updated: {} steps", steps.len()))
+            }
+            "append" => {
+                let steps = steps_from(input.get("steps")).context("missing 'steps' array for append")?;
+                let mut out = tokio::fs::read_to_string(&plan_file).await.unwrap_or_default();
+                for s in &steps {
+                    out.push_str(&format!("- [ ] {}\n", s));
+                }
+                tokio::fs::write(&plan_file, &out)
+                    .await
+                    .with_context(|| format!("writing {}", plan_file.display()))?;
+                Ok(format!("added {} steps", steps.len()))
+            }
+            "complete" => {
+                let n: usize = input
+                    .get("step")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .context("missing 'step' number for complete")?;
+                let data = tokio::fs::read_to_string(&plan_file)
+                    .await
+                    .with_context(|| format!("reading {}", plan_file.display()))?;
+                let mut count = 0usize;
+                let mut changed = false;
+                let mut out = String::new();
+                for l in data.lines() {
+                    if let Some(rest) = l.strip_prefix("- [ ] ") {
+                        count += 1;
+                        if count == n {
+                            out.push_str(&format!("- [x] {}\n", rest));
+                            changed = true;
+                        } else {
+                            out.push_str(l);
+                            out.push('\n');
+                        }
+                    } else {
+                        out.push_str(l);
+                        out.push('\n');
+                    }
+                }
+                if !changed {
+                    return Ok(format!("no step {} in plan ({} steps)", n, count));
+                }
+                tokio::fs::write(&plan_file, &out)
+                    .await
+                    .with_context(|| format!("writing {}", plan_file.display()))?;
+                Ok(format!("completed step {}", n))
+            }
+            "show" => {
+                let data = tokio::fs::read_to_string(&plan_file)
+                    .await
+                    .with_context(|| format!("no plan yet — create one with action=create"))?;
+                Ok(data)
+            }
+            _ => Ok(format!("unknown plan action: {}", action)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_escape_detection() {
+        let base = Path::new("/work/proj");
+        assert!(!is_outside(base, &base.join("src/main.rs")));
+        assert!(!is_outside(base, &base.join("src/../lib.rs")));
+        assert!(is_outside(base, &base.join("../secrets.txt")));
+        assert!(is_outside(base, &Path::new("/etc/passwd")));
+        assert!(!is_outside(base, &Path::new("/work/proj")));
+    }
+
+    #[test]
+    fn parses_multi_file_patch() {
+        let patch = "\
+--- a/a.txt
++++ b/a.txt
+@@ -1,1 +1,2 @@
+ hello
++world
+--- /dev/null
++++ b/new.txt
+@@ -0,0 +1,1 @@
++content
+";
+        let files = parse_patch(patch).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].new_path.as_deref(), Some("a.txt"));
+        assert_eq!(files[0].hunks.len(), 1);
+        assert_eq!(files[1].old_path, None);
+        assert_eq!(files[1].new_path.as_deref(), Some("new.txt"));
     }
 }

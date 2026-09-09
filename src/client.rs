@@ -115,6 +115,7 @@ pub async fn handle_swarm(sub: crate::SwarmCommands) -> Result<()> {
             Event::TextDelta { id: _, text: _ } => {}
             Event::ToolCall { .. } => {}
             Event::ToolResult { .. } => {}
+            Event::ApprovalRequired { .. } => {}
         }
     }
     Ok(())
@@ -405,12 +406,15 @@ pub async fn connect() -> Result<()> {
                     "list_dir".to_string(),
                     "glob".to_string(),
                     "agentgrep".to_string(),
+                    "apply_patch".to_string(),
+                    "plan".to_string(),
                 ])
             } else {
                 None
             },
             model: None,
             cwd,
+            interactive: true,
         };
         let data = serde_json::to_string(&req)?;
         w.write_all(data.as_bytes()).await?;
@@ -439,6 +443,10 @@ pub async fn connect() -> Result<()> {
                             c.input.get("path").and_then(|v| v.as_str())
                                 .map(|s| s.to_string())
                                 .unwrap_or_default()
+                        } else if c.name == "plan" {
+                            c.input.get("action").and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                                .unwrap_or_default()
                         } else {
                             c.input.to_string()
                         };
@@ -455,6 +463,30 @@ pub async fn connect() -> Result<()> {
                     in_stream = true;
                     print!("{}", text);
                     std::io::stdout().flush()?;
+                }
+                Event::ApprovalRequired { id, tool_call_id, tool_name, path, reason } => {
+                    in_stream = false;
+                    eprintln!();
+                    eprintln!("[approval] {} — {}", tool_name, reason);
+                    if let Some(p) = path {
+                        eprintln!("           target: {}", p);
+                    }
+                    eprint!("allow? [y/N] ");
+                    std::io::stdout().flush()?;
+                    let mut ans = String::new();
+                    let _ = std::io::stdin().read_line(&mut ans);
+                    let approved = matches!(ans.trim().to_lowercase().as_str(), "y" | "yes");
+                    let resp = Request::ApprovalResponse {
+                        id,
+                        session_id: session_id.clone(),
+                        tool_call_id,
+                        approved,
+                    };
+                    let data = serde_json::to_string(&resp)?;
+                    w.write_all(data.as_bytes()).await?;
+                    w.write_all(b"\n").await?;
+                    w.flush().await?;
+                    eprintln!("[approval] {}", if approved { "allowed" } else { "DENIED" });
                 }
                 Event::Done { id: _ } => {
                     if in_stream {
@@ -494,12 +526,15 @@ pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool) -> Res
                 "list_dir".to_string(),
                 "glob".to_string(),
                 "agentgrep".to_string(),
+                "apply_patch".to_string(),
+                "plan".to_string(),
             ])
         } else {
             None
         },
         model,
         cwd,
+        interactive: false,
     };
     let data = serde_json::to_string(&req)?;
     w.write_all(data.as_bytes()).await?;

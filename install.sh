@@ -151,6 +151,10 @@ setup_config() {
 # jancode configuration — edit this file.
 [server]
 idle_timeout_secs = 300
+# Approval policy for risky tool calls (file writes/edits/patches and reads
+# outside the working directory). "prompt" is interactive-only; "auto" never
+# asks; "deny" always blocks.
+# approve_mode = "prompt"
 
 [provider]
 base_url = "https://api.openai.com/v1"
