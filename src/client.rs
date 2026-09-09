@@ -566,6 +566,7 @@ pub async fn connect() -> Result<()> {
                     "agentgrep".to_string(),
                     "apply_patch".to_string(),
                     "plan".to_string(),
+                    "git".to_string(),
                 ])
             } else {
                 None
@@ -605,6 +606,22 @@ pub async fn connect() -> Result<()> {
                             c.input.get("action").and_then(|v| v.as_str())
                                 .map(|s| s.to_string())
                                 .unwrap_or_default()
+                        } else if c.name == "git" {
+                            let action = c.input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                            let target = if action == "checkout" || action == "branch" || action == "push" {
+                                c.input.get("branch").and_then(|v| v.as_str())
+                                    .or_else(|| c.input.get("refspec").and_then(|v| v.as_str()))
+                                    .unwrap_or_default()
+                            } else if action == "add" || action == "diff" {
+                                c.input.get("path").and_then(|v| v.as_str()).unwrap_or_default()
+                            } else {
+                                ""
+                            };
+                            if target.is_empty() {
+                                action.to_string()
+                            } else {
+                                format!("{} {}", action, target)
+                            }
                         } else {
                             c.input.to_string()
                         };
@@ -705,6 +722,7 @@ pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool) -> Res
                 "agentgrep".to_string(),
                 "apply_patch".to_string(),
                 "plan".to_string(),
+                "git".to_string(),
             ])
         } else {
             None
@@ -740,6 +758,22 @@ pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool) -> Res
                         c.input.get("path").and_then(|v| v.as_str())
                             .map(|s| s.to_string())
                             .unwrap_or_default()
+                    } else if c.name == "git" {
+                        let action = c.input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                        let target = if action == "checkout" || action == "push" {
+                            c.input.get("branch").and_then(|v| v.as_str())
+                                .or_else(|| c.input.get("refspec").and_then(|v| v.as_str()))
+                                .unwrap_or_default()
+                        } else if action == "add" {
+                            c.input.get("path").and_then(|v| v.as_str()).unwrap_or_default()
+                        } else {
+                            ""
+                        };
+                        if target.is_empty() {
+                            action.to_string()
+                        } else {
+                            format!("{} {}", action, target)
+                        }
                     } else {
                         c.input.to_string()
                     };

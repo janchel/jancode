@@ -128,6 +128,11 @@ jancode ships with these tools (plus any discovered via [MCP servers](#mcp-model
 - `plan` — maintain a persistent step checklist in `.jancode-plan.md`
   (`create` / `append` / `complete` / `show`) so multi-step work stays on track
   across turns.
+- `git` — manage the repo in the working directory: `status`, `branch`,
+  `checkout`, `diff`, `log`, `add`, `commit`, `push`, `pull`, `remote`,
+  `stash`. Mutations (`add`/`commit`/`push`/`pull`/`checkout`) require
+  approval; read-only actions (`status`/`log`/`diff`/`branch` list/`remote`)
+  run freely.
 
 ### Approval (safe file changes)
 
@@ -141,7 +146,9 @@ resolve outside the working directory** (`read`, `list_dir`, `glob`,
 - Headless one-shots (`jancode run --tools`) and swarm agents auto-approve — no
   human is attached.
 - `bash` and `plan` are intentionally ungated: `bash` is the all-purpose power
-  tool, and `plan` only touches its own bookkeeping file.
+  tool, and `plan` only touches its own bookkeeping file. `git` gates only the
+  mutating actions (`add`/`commit`/`push`/`pull`/`checkout`); read-only git
+  actions run without approval.
 
 The policy lives in `$JANCODE_HOME/config.toml` under `[server]`:
 

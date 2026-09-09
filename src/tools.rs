@@ -167,6 +167,7 @@ pub fn default_registry() -> ToolRegistry {
     r.register(GrepTool);
     r.register(ApplyPatchTool);
     r.register(PlanTool);
+    r.register(GitTool);
     r
 }
 
@@ -1035,6 +1036,225 @@ impl Tool for PlanTool {
                 Ok(data)
             }
             _ => Ok(format!("unknown plan action: {}", action)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// git
+// ---------------------------------------------------------------------------
+
+/// A single git tool with structured actions, mirroring what other CLI agents
+/// expose: status, branch, checkout, diff, log, add, commit, push, pull,
+/// remote, and stash. Read-only actions are never approval-gated; mutating
+/// actions (add/commit/push/pull/checkout/branch -d/stash mutations) are gated
+/// by `gate_tool` so interactive sessions confirm them.
+pub struct GitTool;
+
+const GIT_ACTIONS: &str =
+    "status, branch, checkout, diff, log, add, commit, push, pull, remote, stash";
+
+#[async_trait]
+impl Tool for GitTool {
+    fn name(&self) -> &str {
+        "git"
+    }
+
+    fn description(&self) -> &str {
+        "Manage a git repository in the working directory. Actions:\n\
+         - status: show branch, staged/unstaged/untracked changes\n\
+         - branch: list branches (pass branch to create/delete)\n\
+         - checkout: switch branch (create_branch=true to make + switch)\n\
+         - diff: show changes (staged=true for --cached, path to limit)\n\
+         - log: recent commits (max = count, default 10)\n\
+         - add: stage files (path = file/pattern, or \"all\" for .)\n\
+         - commit: commit staged changes with message\n\
+         - push: push commits (remote, refspec; force=true to overwrite)\n\
+         - pull: pull from remote (refspec optional)\n\
+         - remote: list remotes\n\
+         - stash: list/save/pop/drop via stash_action\n\
+         Use status/diff/log before committing, commit with a clear message,\n\
+         then push. Mutations (add/commit/push/pull/checkout) ask for approval\n\
+         in the interactive chat."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["status", "branch", "checkout", "diff", "log", "add", "commit", "push", "pull", "remote", "stash"],
+                    "description": "git subcommand to run."
+                },
+                "path": { "type": "string", "description": "File/pattern to add or limit diff to; 'all' stages everything." },
+                "branch": { "type": "string", "description": "Branch name (branch/checkout)." },
+                "create_branch": { "type": "boolean", "description": "With checkout: create then switch." },
+                "delete_branch": { "type": "boolean", "description": "With branch: delete the branch." },
+                "message": { "type": "string", "description": "Commit message (commit)." },
+                "staged": { "type": "boolean", "description": "With diff: show only staged changes (--cached)." },
+                "max": { "type": "integer", "description": "With log: number of commits (default 10)." },
+                "remote": { "type": "string", "description": "Remote name (default origin)." },
+                "refspec": { "type": "string", "description": "Refspec/remote branch for push/pull (e.g. main or main:main)." },
+                "force": { "type": "boolean", "description": "With push: force overwrite (use with care)." },
+                "stash_action": { "type": "string", "enum": ["list", "save", "pop", "drop"], "description": "Which stash operation to run when action=stash." }
+            },
+            "required": ["action"]
+        })
+    }
+
+    async fn execute(&self, input: &Value, ctx: &ToolContext) -> Result<String> {
+        let action = input
+            .get("action")
+            .and_then(|v| v.as_str())
+            .context("missing 'action' parameter")?;
+
+        let git = |args: Vec<&str>| {
+            let args: Vec<String> = args.into_iter().map(|s| s.to_string()).collect();
+            Self::run_git(ctx, args)
+        };
+
+        match action {
+            "status" => git(vec!["status", "--short", "--branch"]).await,
+            "branch" => {
+                let branch = input.get("branch").and_then(|v| v.as_str()).unwrap_or("");
+                if branch.is_empty() {
+                    git(vec!["branch", "-avv"]).await
+                } else if input.get("delete_branch").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    git(vec!["branch", "-D", branch]).await
+                } else {
+                    git(vec!["branch", branch]).await
+                }
+            }
+            "checkout" => {
+                let branch = input
+                    .get("branch")
+                    .and_then(|v| v.as_str())
+                    .context("missing 'branch' for checkout")?;
+                if input.get("create_branch").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    git(vec!["checkout", "-b", branch]).await
+                } else {
+                    git(vec!["checkout", branch]).await
+                }
+            }
+            "diff" => {
+                let mut args = vec!["diff"];
+                if input.get("staged").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    args.push("--cached");
+                }
+                if let Some(p) = input.get("path").and_then(|v| v.as_str()) {
+                    if !p.is_empty() {
+                        args.push("--");
+                        args.push(p);
+                    }
+                }
+                git(args).await
+            }
+            "log" => {
+                let max = input.get("max").and_then(|v| v.as_u64()).unwrap_or(10);
+                git(vec!["log", "--oneline", "--decorate", "-n", &max.to_string()]).await
+            }
+            "add" => {
+                let p = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+                let target = if p == "all" { "." } else { p };
+                git(vec!["add", "--", target]).await
+            }
+            "commit" => {
+                let message = input
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .context("missing 'message' for commit")?;
+                git(vec!["commit", "-m", message]).await
+            }
+            "push" => {
+                let remote = input.get("remote").and_then(|v| v.as_str()).unwrap_or("origin");
+                let mut args = vec!["push"];
+                if input.get("force").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    args.push("--force");
+                }
+                args.push(remote);
+                if let Some(rs) = input.get("refspec").and_then(|v| v.as_str()) {
+                    if !rs.is_empty() {
+                        args.push(rs);
+                    }
+                }
+                git(args).await
+            }
+            "pull" => {
+                let remote = input.get("remote").and_then(|v| v.as_str()).unwrap_or("origin");
+                let mut args = vec!["pull", remote];
+                if let Some(rs) = input.get("refspec").and_then(|v| v.as_str()) {
+                    if !rs.is_empty() {
+                        args.push(rs);
+                    }
+                }
+                git(args).await
+            }
+            "remote" => git(vec!["remote", "-v"]).await,
+            "stash" => {
+                let sa = input
+                    .get("stash_action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("list");
+                match sa {
+                    "save" => {
+                        let msg = input.get("message").and_then(|v| v.as_str()).unwrap_or("wip");
+                        git(vec!["stash", "save", msg]).await
+                    }
+                    "pop" => git(vec!["stash", "pop"]).await,
+                    "drop" => git(vec!["stash", "drop"]).await,
+                    _ => git(vec!["stash", "list"]).await,
+                }
+            }
+            _ => Ok(format!(
+                "unknown git action: {} (available: {})",
+                action, GIT_ACTIONS
+            )),
+        }
+    }
+}
+
+impl GitTool {
+    async fn run_git(ctx: &ToolContext, args: Vec<String>) -> Result<String> {
+        let mut child = tokio::process::Command::new("git")
+            .args(&args)
+            .current_dir(&ctx.working_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context("failed to spawn git (is git installed?)")?;
+
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            async {
+                let out = child.wait_with_output().await?;
+                Ok::<_, std::io::Error>(out)
+            },
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("git {} timed out after 60s", args[0]))??;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if !output.status.success() {
+            let msg = if stderr.trim().is_empty() {
+                stdout.trim().to_string()
+            } else {
+                stderr.trim().to_string()
+            };
+            return Ok(format!("git {} failed (exit {}): {}", args[0], output.status.code().unwrap_or(-1), msg));
+        }
+        let mut out = stdout.trim().to_string();
+        if !stderr.trim().is_empty() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(stderr.trim());
+        }
+        if out.is_empty() {
+            Ok(format!("git {}: ok (no output)", args[0]))
+        } else {
+            Ok(out)
         }
     }
 }
