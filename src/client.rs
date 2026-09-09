@@ -266,8 +266,20 @@ pub async fn connect() -> Result<()> {
             input = remainder;
         }
         if input == "/model" || input.starts_with("/model ") {
-            let remainder = input.strip_prefix("/model").unwrap_or("").trim().to_string();
             let cfg = crate::config::load().unwrap_or_default();
+            let mut remainder = input.strip_prefix("/model").unwrap_or("").trim().to_string();
+
+            // /model grep <term> and /model search <term> narrow the catalog
+            // instead of being treated as literal model ids.
+            let mut filter: Option<String> = None;
+            for kw in ["grep ", "search "] {
+                if let Some(t) = remainder.strip_prefix(kw) {
+                    filter = Some(t.trim().to_string());
+                    remainder = String::new();
+                    break;
+                }
+            }
+
             // Build the model catalog: config list, else live `GET /models`.
             let catalog = match &models_cache {
                 Some(l) => l.clone(),
@@ -289,12 +301,31 @@ pub async fn connect() -> Result<()> {
                 .filter(|m| seen.insert(m.clone()))
                 .collect();
 
+            if catalog.is_empty() && filter.is_some() {
+                println!("no models available (provider /models failed and no models list in config.toml)");
+                continue;
+            }
+
+            // Narrow the catalog with the filter term if one was given.
+            let show: Vec<String> = match &filter {
+                Some(term) if !term.is_empty() => catalog
+                    .iter()
+                    .filter(|m| m.to_lowercase().contains(&term.to_lowercase()))
+                    .cloned()
+                    .collect(),
+                _ => catalog.clone(),
+            };
+            if show.is_empty() && filter.is_some() {
+                println!("no models match '{}' (run /model grep <term>)", filter.as_deref().unwrap_or(""));
+                continue;
+            }
+
             // Resolve a 1-based selection to a model. 0 = default (None).
-            let resolve = |n: usize| {
+            let resolve = |n: usize, list: &[String]| -> Option<Option<String>> {
                 if n == 0 {
                     return Some(None);
                 }
-                catalog.get(n.saturating_sub(1)).cloned().map(Some)
+                list.get(n.saturating_sub(1)).cloned().map(Some)
             };
 
             if remainder.is_empty() {
@@ -303,8 +334,13 @@ pub async fn connect() -> Result<()> {
                     println!("usage: /model <name>, or add a models list under [provider]");
                     continue;
                 }
-                println!("available models ({}):", catalog.len());
-                for (i, m) in catalog.iter().enumerate() {
+                match &filter {
+                    Some(term) if !term.is_empty() => {
+                        println!("models matching '{}' ({}):", term, show.len());
+                    }
+                    _ => println!("available models ({}) (narrow with /model grep <term>):", show.len()),
+                }
+                for (i, m) in show.iter().enumerate() {
                     println!("  [{}] {}", i + 1, m);
                 }
                 println!("  [0] default ({})", default_model);
@@ -317,7 +353,7 @@ pub async fn connect() -> Result<()> {
                         current_model = None;
                         println!("model reset to default ({})", default_model);
                     }
-                    Ok(n) => match resolve(n) {
+                    Ok(n) => match resolve(n, &show) {
                         Some(Some(m)) => {
                             current_model = Some(m.clone());
                             println!("model switched to: {}", m);
@@ -332,7 +368,7 @@ pub async fn connect() -> Result<()> {
 
             // /model <number>: select from the catalog.
             if let Ok(n) = remainder.parse::<usize>() {
-                match resolve(n) {
+                match resolve(n, &catalog) {
                     Some(Some(m)) => {
                         current_model = Some(m.clone());
                         println!("model switched to: {}", m);
@@ -347,6 +383,9 @@ pub async fn connect() -> Result<()> {
             }
 
             // /model <name>: set an explicit model id regardless of the catalog.
+            if !catalog.is_empty() && !catalog.iter().any(|m| m == &remainder) {
+                println!("note: '{}' is not in the fetched model list; the provider may reject it", remainder);
+            }
             current_model = Some(remainder.clone());
             println!("model switched to: {}", remainder);
             continue;

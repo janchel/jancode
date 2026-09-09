@@ -90,10 +90,13 @@ In interactive mode, use these commands:
   the same session file on each turn).
 - `/model` — List available models with numbers and switch (the prompt shows
   the current model, e.g. `gpt-4o>`). Also accepts `/model <number>` to pick
-  from the last listed catalog, `/model 0` to return to the config default, and
-  `/model <name>` to set an explicit model id. The catalog is fetched live from
-  the provider's `GET /models` endpoint, or taken from a `models` list under
-  `[provider]` in `config.toml`.
+  from the last listed catalog, `/model 0` to return to the config default,
+  `/model grep <term>` / `/model search <term>` to narrow the catalog by
+  substring (handy with hundreds of models), and `/model <name>` to set an
+  explicit model id (warns if it isn't in the fetched catalog). The catalog is
+  fetched live from the provider's `GET /models` endpoint, or taken from a
+  `models` list under `[provider]` in `config.toml`. Note: some models don't
+  support tool calling and every turn will error while tools are enabled.
 - `/memory` — List auto-captured memory notes for the current folder.
 - `/forget <number>` — Delete a memory note listed by `/memory`.
 - `/mcp` — List MCP servers configured in `$JANCODE_HOME/config.toml`.
