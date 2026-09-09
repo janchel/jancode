@@ -52,6 +52,13 @@ pub struct ProviderConfig {
 pub struct ServerConfig {
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_secs: u64,
+    /// Approval policy for risky tool calls (file writes/edits/patches, and
+    /// reads outside the working directory). Values:
+    ///   - "auto":   always allow (no prompts).
+    ///   - "prompt": ask interactive sessions; headless `run`/swarm auto-allow.
+    ///   - "deny":   always deny risky calls.
+    #[serde(default = "default_approve_mode")]
+    pub approve_mode: String,
 }
 
 fn default_base_url() -> String {
@@ -64,6 +71,10 @@ fn default_model() -> String {
 
 fn default_idle_timeout() -> u64 {
     300
+}
+
+fn default_approve_mode() -> String {
+    "prompt".to_string()
 }
 
 pub fn jancode_dir() -> PathBuf {

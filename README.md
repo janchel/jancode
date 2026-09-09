@@ -106,6 +106,46 @@ shown compactly as `[tool] <name> <target>` lines (e.g. `[tool] read
 package.json`); full tool output is fed back to the model but suppressed from
 the terminal so only the AI's final response is prominent.
 
+### Built-in tools
+
+jancode ships with these tools (plus any discovered via [MCP servers](#mcp-model-context-protocol-servers)):
+
+- `list_dir` / `glob` / `read` / `agentgrep` — explore the working directory.
+- `bash` — run git, cargo, tests, or any command.
+- `write` / `edit` — single-file writes and exact-string edits.
+- `apply_patch` — apply a git-style unified diff to **multiple files** in one
+  call (create, modify, delete). The workhorse for coordinated multi-file
+  changes.
+- `plan` — maintain a persistent step checklist in `.jancode-plan.md`
+  (`create` / `append` / `complete` / `show`) so multi-step work stays on track
+  across turns.
+
+### Approval (safe file changes)
+
+File **modifications** (`write`, `edit`, `apply_patch`) and **reads that
+resolve outside the working directory** (`read`, `list_dir`, `glob`,
+`agentgrep`) require consent before the daemon executes them:
+
+- In `jancode connect` you get an interactive prompt: `[approval] <tool> —
+  <reason>` then `allow? [y/N]`. Answering `n` sends `APPROVAL_DENIED` to the
+  model, which will adapt (and the file is untouched).
+- Headless one-shots (`jancode run --tools`) and swarm agents auto-approve — no
+  human is attached.
+- `bash` and `plan` are intentionally ungated: `bash` is the all-purpose power
+  tool, and `plan` only touches its own bookkeeping file.
+
+The policy lives in `$JANCODE_HOME/config.toml` under `[server]`:
+
+```toml
+[server]
+idle_timeout_secs = 300
+approve_mode = "prompt"   # "prompt" | "auto" | "deny"
+```
+
+- `"prompt"` (default) — interactive sessions ask; headless sessions auto-allow.
+- `"auto"` — always allow risky calls (no prompts).
+- `"deny"` — always block risky calls with `APPROVAL_DENIED`.
+
 ### Automatic project memory
 
 jancode automatically remembers durable facts you mention and re-injects them

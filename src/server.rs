@@ -2,14 +2,16 @@ use crate::config::runtime_dir;
 use crate::protocol::{Event, Request};
 use crate::storage::{list_sessions, save_session, Session, Message};
 use crate::swarm::{self, Interrupt, SwarmState};
+use crate::tools::{is_outside, ToolContext};
 use anyhow::{Context, Result};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::RwLock;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 type SessionMap = Arc<RwLock<HashMap<String, Session>>>;
 /// Count of currently-connected clients, shared with the idle-shutdown watcher.
@@ -120,7 +122,7 @@ async fn handle_client(stream: UnixStream, sessions: SessionMap, swarm: SharedSw
                 )
                 .await?;
             }
-            Request::Message { id, session_id, content, tools, model, cwd } => {
+            Request::Message { id, session_id, content, tools, model, cwd, interactive } => {
                 let session_id_s = session_id.unwrap_or_else(|| format!("session-{}", id));
                 let working_dir = cwd.clone().unwrap_or_else(|| {
                     std::env::current_dir().unwrap_or_default().to_string_lossy().to_string()
@@ -281,18 +283,53 @@ async fn handle_client(stream: UnixStream, sessions: SessionMap, swarm: SharedSw
                             for tc in &tool_calls {
                                 send(&mut w, &Event::Status { id: Some(id), message: format!("Executing tool: {}...", tc.name) }).await?;
                                 if let Some(tool) = tool_registry.as_ref().and_then(|r| r.find(&tc.name)) {
-                                    let out = tool.execute(&tc.input, &ctx).await;
-                                    let result_entry = match out {
-                                        Ok(s) => crate::protocol::ToolResultEntry {
-                                            tool_call_id: tc.id.clone(),
-                                            output: s,
-                                            is_error: false,
+                                    // Approval gate: file modifications and reads
+                                    // outside the workspace require consent.
+                                    let gate = gate_tool(&tc.name, &tc.input, &ctx);
+                                    let (approved, deny_reason) = match &gate {
+                                        None => (true, None),
+                                        Some(g) => match cfg.server.approve_mode.as_str() {
+                                            "auto" => (true, None),
+                                            "deny" => (false, Some(g.reason.clone())),
+                                            _ => {
+                                                if interactive {
+                                                    send(&mut w, &Event::ApprovalRequired {
+                                                        id,
+                                                        tool_call_id: tc.id.clone(),
+                                                        tool_name: tc.name.clone(),
+                                                        path: g.path.clone(),
+                                                        reason: g.reason.clone(),
+                                                    }).await?;
+                                                    info!("asking approval for {} ({})", tc.name, g.reason);
+                                                    let ok = await_approval(&mut lines, id, &tc.id).await;
+                                                    (ok, if ok { None } else { Some(g.reason.clone()) })
+                                                } else {
+                                                    info!("auto-approving {} in non-interactive mode: {}", tc.name, g.reason);
+                                                    (true, None)
+                                                }
+                                            }
                                         },
-                                        Err(e) => crate::protocol::ToolResultEntry {
+                                    };
+                                    let result_entry = if approved {
+                                        match tool.execute(&tc.input, &ctx).await {
+                                            Ok(s) => crate::protocol::ToolResultEntry {
+                                                tool_call_id: tc.id.clone(),
+                                                output: s,
+                                                is_error: false,
+                                            },
+                                            Err(e) => crate::protocol::ToolResultEntry {
+                                                tool_call_id: tc.id.clone(),
+                                                output: format!("ERROR: {}", e),
+                                                is_error: true,
+                                            },
+                                        }
+                                    } else {
+                                        warn!("tool denied: {} ({})", tc.name, deny_reason.as_deref().unwrap_or("no approval"));
+                                        crate::protocol::ToolResultEntry {
                                             tool_call_id: tc.id.clone(),
-                                            output: format!("ERROR: {}", e),
+                                            output: format!("APPROVAL_DENIED: {}", deny_reason.as_deref().unwrap_or("no approval")),
                                             is_error: true,
-                                        },
+                                        }
                                     };
                                     send(&mut w, &Event::ToolResult {
                                         id: Some(id),
@@ -403,9 +440,91 @@ async fn handle_client(stream: UnixStream, sessions: SessionMap, swarm: SharedSw
             Request::SwarmList { id } => {
                 handle_swarm_list(&mut w, &swarm, id).await?;
             }
+            Request::ApprovalResponse { .. } => {}
         }
     }
     Ok(())
+}
+
+/// A tool call that requires approval before executing, with a human-readable
+/// reason and (where applicable) the target path for context.
+struct ApprovalGate {
+    path: Option<String>,
+    reason: String,
+}
+
+/// Decide whether a tool call must be gated behind approval.
+fn gate_tool(name: &str, input: &Value, ctx: &ToolContext) -> Option<ApprovalGate> {
+    match name {
+        "write" | "edit" => {
+            let p = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            let full = ctx.resolve_path(p);
+            Some(ApprovalGate {
+                path: Some(full.display().to_string()),
+                reason: format!("modify file {}", full.display()),
+            })
+        }
+        "apply_patch" => Some(ApprovalGate {
+            path: None,
+            reason: "apply a multi-file patch".to_string(),
+        }),
+        "read" | "list_dir" | "glob" | "agentgrep" => {
+            let p = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            let full = ctx.resolve_path(p);
+            // Heuristic: `..` inside a glob pattern can escape the base path.
+            let pattern_escape = if name == "glob" {
+                input
+                    .get("pattern")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.split(['/', '\\']).any(|c| c == ".."))
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            if is_outside(&ctx.working_dir, &full) || pattern_escape {
+                Some(ApprovalGate {
+                    path: Some(full.display().to_string()),
+                    reason: format!("read outside workspace ({})", full.display()),
+                })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Read the socket until an `ApprovalResponse` matching this message + tool call
+/// arrives (up to 5 minutes), then return the user's decision. Times out -> deny.
+async fn await_approval(
+    lines: &mut tokio::io::Lines<tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>>,
+    msg_id: u64,
+    tool_call_id: &str,
+) -> bool {
+    let timeout = std::time::Duration::from_secs(300);
+    let res = tokio::time::timeout(
+        timeout,
+        async {
+            while let Some(line) = lines.next_line().await? {
+                if let Ok(req) = serde_json::from_str::<Request>(&line) {
+                    if let Request::ApprovalResponse {
+                        id,
+                        tool_call_id: tcid,
+                        approved,
+                        ..
+                    } = req
+                    {
+                        if id == msg_id && tcid == tool_call_id {
+                            return Ok::<bool, std::io::Error>(approved);
+                        }
+                    }
+                }
+            }
+            Ok::<bool, std::io::Error>(false)
+        },
+    )
+    .await;
+    res.map(|r| r.unwrap_or(false)).unwrap_or(false)
 }
 
 /// Append the assistant turn for this session (if any text was produced) and
@@ -713,4 +832,29 @@ async fn handle_swarm_list(
     let sw = swarm.read().await;
     send(&mut *w, &Event::MemberList { id, members: sw.member_list() }).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gate_logic() {
+        let ctx = ToolContext { working_dir: std::path::PathBuf::from("/work/proj") };
+        // write/edit/apply_patch always gate.
+        assert!(gate_tool("write", &serde_json::json!({"path": "x.rs"}), &ctx).is_some());
+        assert!(gate_tool("edit", &serde_json::json!({"path": "x.rs"}), &ctx).is_some());
+        assert!(gate_tool("apply_patch", &serde_json::json!({}), &ctx).is_some());
+        // In-workspace reads are ungated.
+        assert!(gate_tool("read", &serde_json::json!({"path": "x.rs"}), &ctx).is_none());
+        assert!(gate_tool("agentgrep", &serde_json::json!({"query": "foo"}), &ctx).is_none());
+        // Reads outside the workspace are gated.
+        assert!(gate_tool("read", &serde_json::json!({"path": "../secret"}), &ctx).is_some());
+        assert!(gate_tool("read", &serde_json::json!({"path": "/etc/passwd"}), &ctx).is_some());
+        // Glob with an escaping base is gated.
+        assert!(gate_tool("glob", &serde_json::json!({"pattern": "**", "path": "../"}), &ctx).is_some());
+        // bash / plan are ungated.
+        assert!(gate_tool("bash", &serde_json::json!({"command": "ls"}), &ctx).is_none());
+        assert!(gate_tool("plan", &serde_json::json!({"action": "show"}), &ctx).is_none());
+    }
 }
