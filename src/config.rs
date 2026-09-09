@@ -46,6 +46,11 @@ pub struct ProviderConfig {
     pub api_key_env: Option<String>,
     #[serde(default = "default_model")]
     pub default_model: String,
+    /// Optional hardcoded model catalog shown by the `/model` picker. When
+    /// empty, jancode tries the provider's OpenAI-compatible `GET /models`
+    /// endpoint instead.
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

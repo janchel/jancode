@@ -213,9 +213,15 @@ pub async fn connect() -> Result<()> {
         session_id.as_deref().unwrap_or(""),
         session_id.as_deref().unwrap_or("")
     );
+    let default_model = crate::config::load()
+        .map(|c| c.provider.default_model.clone())
+        .unwrap_or_else(|_| "default".to_string());
+    let mut current_model: Option<String> = None;
+    let mut models_cache: Option<Vec<String>> = None;
     let mut sessions_cache: Vec<crate::storage::Session> = Vec::new();
     loop {
-        print!("> ");
+        let prompt_label = current_model.as_deref().unwrap_or(&default_model);
+        print!("{}> ", prompt_label);
         std::io::stdout().flush()?;
         let mut raw_input = String::new();
         std::io::stdin().read_line(&mut raw_input)?;
@@ -258,6 +264,92 @@ pub async fn connect() -> Result<()> {
             tools_enabled = true;
             println!("tools enabled: true (MCP + built-in)");
             input = remainder;
+        }
+        if input == "/model" || input.starts_with("/model ") {
+            let remainder = input.strip_prefix("/model").unwrap_or("").trim().to_string();
+            let cfg = crate::config::load().unwrap_or_default();
+            // Build the model catalog: config list, else live `GET /models`.
+            let catalog = match &models_cache {
+                Some(l) => l.clone(),
+                None => {
+                    let l = crate::provider::list_models(&cfg)
+                        .await
+                        .unwrap_or_else(|e| {
+                            eprintln!("note: could not fetch model list from provider: {}", e);
+                            Vec::new()
+                        });
+                    models_cache = Some(l.clone());
+                    l
+                }
+            };
+            // De-duplicate while preserving order.
+            let mut seen = std::collections::HashSet::new();
+            let catalog: Vec<String> = catalog
+                .into_iter()
+                .filter(|m| seen.insert(m.clone()))
+                .collect();
+
+            // Resolve a 1-based selection to a model. 0 = default (None).
+            let resolve = |n: usize| {
+                if n == 0 {
+                    return Some(None);
+                }
+                catalog.get(n.saturating_sub(1)).cloned().map(Some)
+            };
+
+            if remainder.is_empty() {
+                if catalog.is_empty() {
+                    println!("no models available (provider /models failed and no models list in config.toml)");
+                    println!("usage: /model <name>, or add a models list under [provider]");
+                    continue;
+                }
+                println!("available models ({}):", catalog.len());
+                for (i, m) in catalog.iter().enumerate() {
+                    println!("  [{}] {}", i + 1, m);
+                }
+                println!("  [0] default ({})", default_model);
+                print!("select model number: ");
+                std::io::stdout().flush()?;
+                let mut pick = String::new();
+                std::io::stdin().read_line(&mut pick)?;
+                match pick.trim().parse::<usize>() {
+                    Ok(0) => {
+                        current_model = None;
+                        println!("model reset to default ({})", default_model);
+                    }
+                    Ok(n) => match resolve(n) {
+                        Some(Some(m)) => {
+                            current_model = Some(m.clone());
+                            println!("model switched to: {}", m);
+                        }
+                        Some(None) => unreachable!(),
+                        None => println!("no model at number {} (run /model to list)", n),
+                    },
+                    Err(_) => println!("invalid selection: {}", pick.trim()),
+                }
+                continue;
+            }
+
+            // /model <number>: select from the catalog.
+            if let Ok(n) = remainder.parse::<usize>() {
+                match resolve(n) {
+                    Some(Some(m)) => {
+                        current_model = Some(m.clone());
+                        println!("model switched to: {}", m);
+                    }
+                    Some(None) => {
+                        current_model = None;
+                        println!("model reset to default ({})", default_model);
+                    }
+                    None => println!("no model at number {} (run /model to list)", n),
+                }
+                continue;
+            }
+
+            // /model <name>: set an explicit model id regardless of the catalog.
+            current_model = Some(remainder.clone());
+            println!("model switched to: {}", remainder);
+            continue;
         }
         if input == "/mcp_tools" || input == "/mcp_status" {
             let show_tools = input == "/mcp_tools";
@@ -363,7 +455,8 @@ pub async fn connect() -> Result<()> {
             match sessions_cache.get(idx) {
                 Some(s) => {
                     session_id = Some(s.id.clone());
-                    println!("resumed session: {} ({} messages)", s.title, s.messages.len());
+                    current_model = Some(s.model.clone());
+                    println!("resumed session: {} ({} messages, model: {})", s.title, s.messages.len(), s.model);
                     for m in &s.messages {
                         println!("  [{}] {}", m.role, m.content.chars().take(120).collect::<String>());
                     }
@@ -414,7 +507,7 @@ pub async fn connect() -> Result<()> {
             continue;
         }
         if input == "/help" {
-            println!("Available commands: /quit, /exit, /q (quit), /tools (toggle tool calling), /mcp (list MCP servers / send with MCP tools), /mcp_tools (list tools exposed by MCP servers), /mcp_status (MCP server connection status), /session (list sessions), /resume <number>, /memory (list memories), /forget <number>, /help");
+            println!("Available commands: /quit, /exit, /q (quit), /tools (toggle tool calling), /model (list models and switch), /mcp (list MCP servers / send with MCP tools), /mcp_tools (list tools exposed by MCP servers), /mcp_status (MCP server connection status), /session (list sessions), /resume <number>, /memory (list memories), /forget <number>, /help");
             continue;
         }
         let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
@@ -438,7 +531,7 @@ pub async fn connect() -> Result<()> {
             } else {
                 None
             },
-            model: None,
+            model: current_model.clone(),
             cwd,
             interactive: true,
         };

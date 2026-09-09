@@ -88,6 +88,12 @@ In interactive mode, use these commands:
 - `/resume <number>` — Resume a session listed by `/session`. Prints its
   history, then subsequent messages continue that conversation (saved back to
   the same session file on each turn).
+- `/model` — List available models with numbers and switch (the prompt shows
+  the current model, e.g. `gpt-4o>`). Also accepts `/model <number>` to pick
+  from the last listed catalog, `/model 0` to return to the config default, and
+  `/model <name>` to set an explicit model id. The catalog is fetched live from
+  the provider's `GET /models` endpoint, or taken from a `models` list under
+  `[provider]` in `config.toml`.
 - `/memory` — List auto-captured memory notes for the current folder.
 - `/forget <number>` — Delete a memory note listed by `/memory`.
 - `/mcp` — List MCP servers configured in `$JANCODE_HOME/config.toml`.
@@ -221,31 +227,69 @@ jancode run "Explain this code" --model <model-name> --tools
 id you can address agents with:
 
 ```bash
-# Start an interactive chat, note the printed swarm session id
+# Terminal 1: start an interactive chat, note the printed swarm session id
 jancode connect
 # -> swarm session id: connect-... (spawn agents with `jancode swarm spawn --parent <id>`)
 ```
 
-Spawn a headless agent with the same agent tools (read/write/edit/apply_patch/
-bash/plan/grep/glob/list_dir) and auto-approval:
+Keep that chat open — it is your swarm "hub". Spawn child agents from a
+**separate terminal**. Each `swarm spawn` returns immediately; the agent runs
+headless inside the daemon and reports back to its parent's chat when done.
 
 ```bash
-# Spawn a child agent; it reports back to the parent's chat when done
-jancode swarm spawn "Edit the README and fix the typo" --label editor \
-  --parent <connect-session-id>
-
-# Manage swarm
-jancode swarm list
-jancode swarm status --session <session_id>
-jancode swarm dm --to <connect-session-id> "Message"   # DMs surface in that chat
-jancode swarm stop <session_id>
+# Terminal 2 (set SID to the id printed by your chat)
+SID=connect-...
 ```
 
-Headless agents plan, code, test and fix on their own; their completion report
-(and any DMs/broadcasts) surface in the parent's `connect` chat as
-`[report] from agent-...` / `[DM] from ...` notifications when the chat next
-reads from the daemon. Each one-shot `swarm` command returns after its
-response — the spawned agent keeps running headless in the daemon until done.
+**Headless agents are autonomous** — they get the same agent tools
+(read/write/edit/apply_patch/bash/plan/grep/glob/list_dir) and **auto-approve
+every tool call**, no `[approval]` prompts. `approve_mode` only governs your
+interactive `connect` chat.
+
+```bash
+# One agent does a full job
+jancode swarm spawn "Create index.html with a red heading, then style.css to match" \
+  --parent $SID --label builder
+
+# Sequential chaining: spawn step 2 only AFTER step 1's [report] appears in the chat
+jancode swarm spawn "Create index.html with a red heading" --parent $SID --label html-maker
+# ...wait for [report] in the connect chat...
+jancode swarm spawn "Create style.css with a red color rule" --parent $SID --label css-maker
+
+# Parallel: both run at the same time
+jancode swarm spawn "Create index.html with a red heading" --parent $SID --label html-maker &
+jancode swarm spawn "Create style.css with a red color rule" --parent $SID --label css-maker &
+
+# Manage swarm
+jancode swarm list                       # all members
+jancode swarm status --session $SID      # one member
+jancode swarm dm --to $SID "Message"     # DMs surface in that chat
+jancode swarm stop $SID                  # stop one member (--force outside your subtree)
+```
+
+Completion reports (and DMs/broadcasts) surface in the parent's `connect` chat
+as `[report] from agent-...` / `[DM] from ...` notifications on the chat's next
+read from the daemon.
+
+**Ending swarm sessions:**
+
+```bash
+# Stop every spawned agent
+for id in $(jancode swarm list | awk '/agent-/ {print $2}'); do
+  jancode swarm stop --force "$id"
+done
+
+# Or kill the daemon (agents run inside it, so this ends everything at once)
+pkill -x jancode      # the next `jancode connect` lazily starts a fresh daemon
+```
+
+The roster is rebuilt at daemon start from persisted session files under
+`$JANCODE_HOME/sessions/`. Dead sessions accumulate there across restarts; to
+clear them:
+
+```bash
+rm ~/.jancode/sessions/*.json   # or $JANCODE_HOME/sessions/*
+```
 
 ## Provider setup
 
@@ -262,7 +306,12 @@ Or edit `$JANCODE_HOME/config.toml` (defaults to `~/.jancode/config.toml`):
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 default_model = "gpt-4o-mini"
+# Optional: pin the model catalog shown by /model instead of the live GET /models
+models = ["gpt-4o-mini", "gpt-4o", "gpt-5"]
 ```
+
+`/model` bulk-switches the model mid-chat; each message uses the session's
+current model (also honored in `run --model` and `swarm spawn --model`).
 
 ## Core mechanics
 

@@ -250,6 +250,13 @@ async fn handle_client(
                         s.get(&session_id_s).map(|e| e.messages.clone()).unwrap_or_default()
                     };
 
+                    let session_model = {
+                        let s = sessions.read().await;
+                        s.get(&session_id_s)
+                            .map(|e| e.model.clone())
+                            .unwrap_or_else(|| cfg.provider.default_model.clone())
+                    };
+
                     // Build memory context: recent facts relevant to the working
                     // dir are appended to the system prompt automatically.
                     let query = if msgs.len() >= 1 { content.clone() } else { String::new() };
@@ -259,8 +266,8 @@ async fn handle_client(
                         .collect::<Vec<_>>()
                         .join("\n");
 
-                    let result = crate::provider::send_message(
-                        &cfg, &msgs, tool_defs_ref, &memory_context,
+                        let result = crate::provider::send_message(
+                        &cfg, &session_model, &msgs, tool_defs_ref, &memory_context,
                     ).await;
 
                     match result {
@@ -716,7 +723,14 @@ async fn run_headless_agent(
             s.get(session_id).map(|e| e.messages.clone()).unwrap_or_default()
         };
 
-        let events = match crate::provider::send_message(cfg, &msgs, tool_defs_ref, "").await {
+        let session_model = {
+            let s = sessions.read().await;
+            s.get(session_id)
+                .map(|e| e.model.clone())
+                .unwrap_or_else(|| cfg.provider.default_model.clone())
+        };
+
+        let events = match crate::provider::send_message(cfg, &session_model, &msgs, tool_defs_ref, "").await {
             Ok(events) => events,
             Err(e) => {
                 let msg = format!("ERROR: {}", e);

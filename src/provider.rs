@@ -94,9 +94,11 @@ struct AccumulatedToolCall {
 
 /// Send a message to the provider and return a list of events (text deltas,
 /// tool calls, and a terminal Done). Supports function-calling when `tools`
-/// is provided.
+/// is provided. `model` is the model to use for this request (session model,
+/// CLI override, or the config default).
 pub async fn send_message(
     cfg: &Config,
+    model: &str,
     session_messages: &[crate::storage::Message],
     tools: Option<&[crate::tools::ToolDefinition]>,
     memory_context: &str,
@@ -163,7 +165,7 @@ pub async fn send_message(
     };
 
     let req = ChatRequest {
-        model: cfg.provider.default_model.clone(),
+        model: model.to_string(),
         messages,
         stream: true,
         tools: tool_defs,
@@ -313,6 +315,42 @@ fn process_line(
             events.push(Event::Done { id: Some(0) });
         }
     }
+}
+
+/// Fetch the model catalog from the provider. Prefers the explicit `models`
+/// list in config; otherwise queries the OpenAI-compatible `GET /models`
+/// endpoint. Used by the `/model` interactive picker.
+pub async fn list_models(cfg: &Config) -> Result<Vec<String>> {
+    if !cfg.provider.models.is_empty() {
+        return Ok(cfg.provider.models.clone());
+    }
+    let api_key = resolve_api_key(cfg)?;
+    let base_url = cfg.provider.base_url.trim_end_matches('/');
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+
+    #[derive(Deserialize)]
+    struct ModelsResponse {
+        #[serde(default)]
+        data: Vec<ModelEntry>,
+    }
+    #[derive(Deserialize)]
+    struct ModelEntry {
+        id: String,
+    }
+
+    let resp = client
+        .get(format!("{}/models", base_url))
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send()
+        .await
+        .context("listing provider models")?;
+    if !resp.status().is_success() {
+        anyhow::bail!("provider /models returned {}", resp.status());
+    }
+    let parsed: ModelsResponse = resp.json().await.context("parsing /models response")?;
+    Ok(parsed.data.into_iter().map(|m| m.id).collect())
 }
 
 fn resolve_api_key(cfg: &Config) -> Result<String> {
