@@ -206,6 +206,12 @@ pub async fn connect() -> Result<()> {
     let (r, mut w) = stream.into_split();
     let mut lines = BufReader::new(r).lines();
 
+    // Ctrl+C never kills the chat: while a request is streaming it cancels the
+    // request (sends `Request::Cancel` to the daemon); at the idle prompt it is
+    // drained into a no-op. Quit with /q, /quit, /exit, or Ctrl+D.
+    let mut interrupt =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+
     let mut tools_enabled = true;
     let mut session_id = Some(format!("connect-{}", crate::protocol::new_message_id()));
     println!(
@@ -224,7 +230,12 @@ pub async fn connect() -> Result<()> {
         print!("{}> ", prompt_label);
         std::io::stdout().flush()?;
         let mut raw_input = String::new();
-        std::io::stdin().read_line(&mut raw_input)?;
+        let n = std::io::stdin().read_line(&mut raw_input)?;
+        if n == 0 {
+            // EOF (Ctrl+D): quit the chat cleanly instead of looping forever.
+            println!();
+            break;
+        }
         let mut input = raw_input.trim().to_string();
         if input.is_empty() {
             continue;
@@ -546,9 +557,16 @@ pub async fn connect() -> Result<()> {
             continue;
         }
         if input == "/help" {
-            println!("Available commands: /quit, /exit, /q (quit), /tools (toggle tool calling), /model (list models and switch), /mcp (list MCP servers / send with MCP tools), /mcp_tools (list tools exposed by MCP servers), /mcp_status (MCP server connection status), /session (list sessions), /resume <number>, /memory (list memories), /forget <number>, /help");
+            println!("Available commands: /quit, /exit, /q (quit), /tools (toggle tool calling), /model (list models and switch), /mcp (list MCP servers / send with MCP tools), /mcp_tools (list tools exposed by MCP servers), /mcp_status (MCP server connection status), /session (list sessions), /resume <number>, /memory (list memories), /forget <number>, /help (Ctrl+C cancels the running request; Ctrl+D quits)");
             continue;
         }
+        // Drain any queued Ctrl+C first so a stray keypress while idle can't
+        // cancel the request we're about to send.
+        while tokio::time::timeout(std::time::Duration::from_millis(1), interrupt.recv())
+            .await
+            .is_ok()
+        {}
+
         let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
         let id = crate::protocol::new_message_id();
         let req = Request::Message {
@@ -586,155 +604,189 @@ pub async fn connect() -> Result<()> {
         w.flush().await?;
 
         let mut in_stream = false;
-        while let Some(line) = lines.next_line().await? {
-            let ev: Event = match serde_json::from_str(&line) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            match ev {
-                Event::Ack { .. } => {}
-                Event::ToolCall { id: _, calls } => {
-                    for c in &calls {
-                        let arg_str = if c.name == "bash" {
-                            c.input.get("command").and_then(|v| v.as_str())
-                                .map(|s| s.chars().take(80).collect::<String>())
-                                .unwrap_or_default()
-                        } else if c.name == "read" {
-                            c.input.get("path").and_then(|v| v.as_str())
-                                .map(|s| s.to_string())
-                                .unwrap_or_default()
-                        } else if c.name == "write" || c.name == "edit" {
-                            c.input.get("path").and_then(|v| v.as_str())
-                                .map(|s| s.to_string())
-                                .unwrap_or_default()
-                        } else if c.name == "plan" {
-                            c.input.get("action").and_then(|v| v.as_str())
-                                .map(|s| s.to_string())
-                                .unwrap_or_default()
-                        } else if c.name == "git" {
-                            let action = c.input.get("action").and_then(|v| v.as_str()).unwrap_or("");
-                            let target: String = if matches!(action, "checkout" | "branch" | "push") {
-                                c.input.get("branch").and_then(|v| v.as_str())
-                                    .or_else(|| c.input.get("refspec").and_then(|v| v.as_str()))
-                                    .unwrap_or_default().to_string()
-                            } else if matches!(action, "merge" | "rebase") {
-                                match c.input.get("branch").and_then(|v| v.as_str()) {
-                                    Some(b) => b.to_string(),
-                                    None => {
-                                        if action == "rebase"
-                                            && c.input.get("rebase_continue").and_then(|v| v.as_bool()).unwrap_or(false)
-                                        {
-                                            "--continue".to_string()
-                                        } else {
-                                            String::new()
+        let mut cancelled = false;
+        loop {
+            tokio::select! {
+                line = lines.next_line() => {
+                    let line = match line {
+                        Ok(Some(l)) => l,
+                        _ => break,
+                    };
+                    let ev: Event = match serde_json::from_str(&line) {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
+                    match ev {
+                        Event::Ack { .. } => {}
+                        Event::ToolCall { id: _, calls } => {
+                            for c in &calls {
+                                let arg_str = if c.name == "bash" {
+                                    c.input.get("command").and_then(|v| v.as_str())
+                                        .map(|s| s.chars().take(80).collect::<String>())
+                                        .unwrap_or_default()
+                                } else if c.name == "read" {
+                                    c.input.get("path").and_then(|v| v.as_str())
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_default()
+                                } else if c.name == "write" || c.name == "edit" {
+                                    c.input.get("path").and_then(|v| v.as_str())
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_default()
+                                } else if c.name == "plan" {
+                                    c.input.get("action").and_then(|v| v.as_str())
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_default()
+                                } else if c.name == "git" {
+                                    let action = c.input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                                    let target: String = if matches!(action, "checkout" | "branch" | "push") {
+                                        c.input.get("branch").and_then(|v| v.as_str())
+                                            .or_else(|| c.input.get("refspec").and_then(|v| v.as_str()))
+                                            .unwrap_or_default().to_string()
+                                    } else if matches!(action, "merge" | "rebase") {
+                                        match c.input.get("branch").and_then(|v| v.as_str()) {
+                                            Some(b) => b.to_string(),
+                                            None => {
+                                                if action == "rebase"
+                                                    && c.input.get("rebase_continue").and_then(|v| v.as_bool()).unwrap_or(false)
+                                                {
+                                                    "--continue".to_string()
+                                                } else {
+                                                    String::new()
+                                                }
+                                            }
                                         }
+                                    } else if action == "reset" {
+                                        c.input.get("ref").and_then(|v| v.as_str())
+                                            .map(|s| format!("{} {}", c.input.get("mode").and_then(|v| v.as_str()).unwrap_or("mixed"), s))
+                                            .unwrap_or_default()
+                                    } else if action == "add" || action == "diff" {
+                                        c.input.get("path").and_then(|v| v.as_str()).unwrap_or_default().to_string()
+                                    } else {
+                                        String::new()
+                                    };
+                                    if target.is_empty() {
+                                        action.to_string()
+                                    } else {
+                                        format!("{} {}", action, target)
                                     }
-                                }
-                            } else if action == "reset" {
-                                c.input.get("ref").and_then(|v| v.as_str())
-                                    .map(|s| format!("{} {}", c.input.get("mode").and_then(|v| v.as_str()).unwrap_or("mixed"), s))
-                                    .unwrap_or_default()
-                            } else if action == "add" || action == "diff" {
-                                c.input.get("path").and_then(|v| v.as_str()).unwrap_or_default().to_string()
-                            } else {
-                                String::new()
-                            };
-                            if target.is_empty() {
-                                action.to_string()
-                            } else {
-                                format!("{} {}", action, target)
+                                } else if c.name == "fetch_url" {
+                                    c.input.get("url").and_then(|v| v.as_str()).unwrap_or_default().to_string()
+                                } else if c.name == "http_request" {
+                                    let m = c.input.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
+                                    let u = c.input.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                                    format!("{} {}", m, u)
+                                } else if c.name == "note" {
+                                    let a = c.input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                                    let t = c.input.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                                    if t.is_empty() { a.to_string() } else { format!("{} {}", a, t) }
+                                } else if c.name == "docker" {
+                                    let a = c.input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                                    let t = c.input.get("container").and_then(|v| v.as_str())
+                                        .or_else(|| c.input.get("image").and_then(|v| v.as_str()))
+                                        .unwrap_or("");
+                                    if t.is_empty() { a.to_string() } else { format!("{} {}", a, t) }
+                                } else if c.name == "sql" {
+                                    c.input.get("query").and_then(|v| v.as_str()).unwrap_or("")
+                                        .chars().take(60).collect::<String>()
+                                } else {
+                                    c.input.to_string()
+                                };
+                                eprintln!("[tool] {}", if arg_str.is_empty() { c.name.clone() } else { format!("{} {}", c.name, arg_str) });
                             }
-                        } else if c.name == "fetch_url" {
-                            c.input.get("url").and_then(|v| v.as_str()).unwrap_or_default().to_string()
-                        } else if c.name == "http_request" {
-                            let m = c.input.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
-                            let u = c.input.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                            format!("{} {}", m, u)
-                        } else if c.name == "note" {
-                            let a = c.input.get("action").and_then(|v| v.as_str()).unwrap_or("");
-                            let t = c.input.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                            if t.is_empty() { a.to_string() } else { format!("{} {}", a, t) }
-                        } else if c.name == "docker" {
-                            let a = c.input.get("action").and_then(|v| v.as_str()).unwrap_or("");
-                            let t = c.input.get("container").and_then(|v| v.as_str())
-                                .or_else(|| c.input.get("image").and_then(|v| v.as_str()))
-                                .unwrap_or("");
-                            if t.is_empty() { a.to_string() } else { format!("{} {}", a, t) }
-                        } else if c.name == "sql" {
-                            c.input.get("query").and_then(|v| v.as_str()).unwrap_or("")
-                                .chars().take(60).collect::<String>()
-                        } else {
-                            c.input.to_string()
-                        };
-                        eprintln!("[tool] {}", if arg_str.is_empty() { c.name.clone() } else { format!("{} {}", c.name, arg_str) });
+                        }
+                        Event::ToolResult { .. } => {
+                            // Suppress tool result output for a quiet, readable session.
+                        }
+                        Event::Status { .. } => {
+                            // Suppress status/progress messages.
+                        }
+                        Event::TextDelta { id: _, text } => {
+                            in_stream = true;
+                            print!("{}", text);
+                            std::io::stdout().flush()?;
+                        }
+                        Event::ApprovalRequired { id, tool_call_id, tool_name, path, reason } => {
+                            in_stream = false;
+                            eprintln!();
+                            eprintln!("[approval] {} — {}", tool_name, reason);
+                            if let Some(p) = path {
+                                eprintln!("           target: {}", p);
+                            }
+                            eprint!("allow? [y/N] ");
+                            std::io::stdout().flush()?;
+                            let mut ans = String::new();
+                            let _ = std::io::stdin().read_line(&mut ans);
+                            let approved = matches!(ans.trim().to_lowercase().as_str(), "y" | "yes");
+                            let resp = Request::ApprovalResponse {
+                                id,
+                                session_id: session_id.clone(),
+                                tool_call_id,
+                                approved,
+                            };
+                            let data = serde_json::to_string(&resp)?;
+                            w.write_all(data.as_bytes()).await?;
+                            w.write_all(b"\n").await?;
+                            w.flush().await?;
+                            eprintln!("[approval] {}", if approved { "allowed" } else { "DENIED" });
+                        }
+                        Event::Notification {
+                            id: _,
+                            from_session,
+                            notification_type,
+                            message,
+                        } => {
+                            // Out-of-band swarm event (DM / broadcast / child-agent
+                            // completion report). Show it so the parent sees agent
+                            // activity live, without corrupting the streamed reply.
+                            in_stream = false;
+                            eprintln!();
+                            let from = from_session.as_deref().unwrap_or("system");
+                            eprintln!(
+                                "[{}] from {}: {}",
+                                notification_type_str(&notification_type),
+                                from,
+                                message
+                            );
+                        }
+                        Event::Done { id: _ } => {
+                            if in_stream {
+                                println!();
+                            }
+                            break;
+                        }
+                        Event::Error { id: _, message } => {
+                            eprintln!("error: {}", message);
+                            break;
+                        }
+                        _ => {}
                     }
                 }
-                Event::ToolResult { .. } => {
-                    // Suppress tool result output for a quiet, readable session.
-                }
-                Event::Status { .. } => {
-                    // Suppress status/progress messages.
-                }
-                Event::TextDelta { id: _, text } => {
-                    in_stream = true;
-                    print!("{}", text);
-                    std::io::stdout().flush()?;
-                }
-                Event::ApprovalRequired { id, tool_call_id, tool_name, path, reason } => {
-                    in_stream = false;
-                    eprintln!();
-                    eprintln!("[approval] {} — {}", tool_name, reason);
-                    if let Some(p) = path {
-                        eprintln!("           target: {}", p);
+                _ = interrupt.recv() => {
+                    if cancelled {
+                        continue;
                     }
-                    eprint!("allow? [y/N] ");
-                    std::io::stdout().flush()?;
-                    let mut ans = String::new();
-                    let _ = std::io::stdin().read_line(&mut ans);
-                    let approved = matches!(ans.trim().to_lowercase().as_str(), "y" | "yes");
-                    let resp = Request::ApprovalResponse {
+                    cancelled = true;
+                    eprintln!("\n[ctrl-c] cancelling request...");
+                    let req = Request::Cancel {
                         id,
                         session_id: session_id.clone(),
-                        tool_call_id,
-                        approved,
                     };
-                    let data = serde_json::to_string(&resp)?;
+                    let data = serde_json::to_string(&req)?;
                     w.write_all(data.as_bytes()).await?;
                     w.write_all(b"\n").await?;
                     w.flush().await?;
-                    eprintln!("[approval] {}", if approved { "allowed" } else { "DENIED" });
+                    // Keep draining events until the server's Done (from the
+                    // aborted turn) so no stale events bleed into the next
+                    // request's stream.
                 }
-                Event::Notification {
-                    id: _,
-                    from_session,
-                    notification_type,
-                    message,
-                } => {
-                    // Out-of-band swarm event (DM / broadcast / child-agent
-                    // completion report). Show it so the parent sees agent
-                    // activity live, without corrupting the streamed reply.
-                    in_stream = false;
-                    eprintln!();
-                    let from = from_session.as_deref().unwrap_or("system");
-                    eprintln!(
-                        "[{}] from {}: {}",
-                        notification_type_str(&notification_type),
-                        from,
-                        message
-                    );
-                }
-                Event::Done { id: _ } => {
-                    if in_stream {
-                        println!();
-                    }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)), if cancelled => {
+                    // Safety net: the daemon should ack the abort promptly.
                     break;
                 }
-                Event::Error { id: _, message } => {
-                    eprintln!("error: {}", message);
-                    break;
-                }
-                _ => {}
             }
+        }
+        if cancelled {
+            println!("cancelled");
         }
     }
     Ok(())

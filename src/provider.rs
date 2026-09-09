@@ -96,6 +96,45 @@ struct AccumulatedToolCall {
 /// tool calls, and a terminal Done). Supports function-calling when `tools`
 /// is provided. `model` is the model to use for this request (session model,
 /// CLI override, or the config default).
+async fn do_chat_request(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    req: &ChatRequest,
+) -> Result<String> {
+    // Perform the POST and read the full (streamed) response body. The client
+    // has a 300s deadline covering first byte + whole stream, so a stalled
+    // upstream surfaces here as a timeout error.
+    let resp = client
+        .post(url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(req)
+        .send()
+        .await
+        .context("sending chat request")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        tracing::error!("provider error {}: {}", status, text);
+        anyhow::bail!("provider error {}: {}", status, text);
+    }
+    resp.text().await.context("reading response body")
+}
+
+/// True when the failure is a transient transport problem worth retrying once:
+/// connection refused/reset, body-read stall, or the overall deadline (which
+/// upstream slowness trips). HTTP status errors are not retried.
+fn is_retryable_transport_error(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|cause| {
+            cause
+                .downcast_ref::<reqwest::Error>()
+                .map(|re| re.is_timeout() || re.is_connect() || re.is_body())
+                .unwrap_or(false)
+        })
+}
+
 pub async fn send_message(
     cfg: &Config,
     model: &str,
@@ -107,7 +146,7 @@ pub async fn send_message(
     let api_key = resolve_api_key(cfg)?;
     let base_url = cfg.provider.base_url.trim_end_matches('/');
     let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(300))
         .build()?;
 
     let mut system = "You are a helpful AI coding agent running with full local filesystem access on the user's machine. You have tools to explore the codebase: list_dir (list a directory), glob (find files by pattern), read (read file contents), agentgrep (search file contents), bash (run shell commands), write (create/overwrite files), and edit (replace text in a file). When the user asks you to analyze or inspect a project, USE these tools to explore the working directory yourself before responding — do not ask the user for file paths or tell them you lack access. Start by calling list_dir on '.' or the current directory to discover the structure.".to_string();
@@ -185,22 +224,6 @@ pub async fn send_message(
             tracing::info!("  tool: {} - {}", td.function.name, td.function.description.chars().take(60).collect::<String>());
         }
     }
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&req)
-        .send()
-        .await
-        .context("sending chat request")?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        tracing::error!("provider error {}: {}", status, text);
-        anyhow::bail!("provider error {}: {}", status, text);
-    }
-
     let mut events = Vec::new();
     let mut full = String::new();
 
@@ -208,7 +231,24 @@ pub async fn send_message(
     // when the turn finishes.
     let mut pending: Vec<AccumulatedToolCall> = Vec::new();
 
-    let body = resp.text().await.context("reading response body")?;
+    // Retry once when the failure is a transient transport problem (timeout,
+    // dropped connection, or body-read stall). The whole request is re-issued;
+    // this is safe because the provider call is just a generation, not a
+    // mutation. Non-transport errors (HTTP 4xx/5xx etc.) are surfaced as-is.
+    let body = {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match do_chat_request(&client, &url, &api_key, &req).await {
+                Ok(body) => break body,
+                Err(e) if attempt == 1 && is_retryable_transport_error(&e) => {
+                    tracing::warn!("provider transport failure: {:?}; retrying once", e);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    };
     tracing::info!("provider response body ({} bytes): {}", body.len(), body);
     for line in body.lines() {
         process_line(line, &mut events, &mut full, &mut pending);
