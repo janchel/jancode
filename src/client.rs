@@ -13,6 +13,14 @@ pub async fn handle_swarm(sub: crate::SwarmCommands) -> Result<()> {
     let (r, mut w) = stream.into_split();
     let mut lines = BufReader::new(r).lines();
 
+    let sub_kind = match &sub {
+        crate::SwarmCommands::Spawn { .. } => "spawn",
+        crate::SwarmCommands::List => "list",
+        crate::SwarmCommands::Status { .. } => "status",
+        crate::SwarmCommands::Dm { .. } => "dm",
+        crate::SwarmCommands::Stop { .. } => "stop",
+    };
+
     let req = match sub {
         crate::SwarmCommands::Spawn {
             prompt,
@@ -59,7 +67,7 @@ pub async fn handle_swarm(sub: crate::SwarmCommands) -> Result<()> {
             Ok(e) => e,
             Err(_) => continue,
         };
-        match ev {
+        match &ev {
             Event::Spawned {
                 id: _,
                 new_session_id,
@@ -70,7 +78,7 @@ pub async fn handle_swarm(sub: crate::SwarmCommands) -> Result<()> {
             }
             Event::MemberList { id: _, members } => {
                 println!("swarm members ({}):", members.len());
-                for m in &members {
+                for m in members {
                     println!(
                         "  {} [{}] label={:?} headless={} parent={:?}",
                         m.session_id, m.status, m.label, m.is_headless, m.parent_session_id
@@ -98,7 +106,7 @@ pub async fn handle_swarm(sub: crate::SwarmCommands) -> Result<()> {
                 message,
             } => {
                 let from = from_session.as_deref().unwrap_or("system");
-                println!("[{}] from {}: {}", notification_type_str(&notification_type), from, message);
+                println!("[{}] from {}: {}", notification_type_str(notification_type), from, message);
             }
             Event::Stopped { id: _, session_id } => {
                 println!("stopped session: {}", session_id);
@@ -106,7 +114,7 @@ pub async fn handle_swarm(sub: crate::SwarmCommands) -> Result<()> {
             Event::Done { id: _ } => break,
             Event::Error { id: _, message } => {
                 eprintln!("error: {}", message);
-                anyhow::bail!(message);
+                anyhow::bail!(message.to_string());
             }
             Event::Ack { .. } => {}
             Event::Pong { .. } => {}
@@ -116,6 +124,19 @@ pub async fn handle_swarm(sub: crate::SwarmCommands) -> Result<()> {
             Event::ToolCall { .. } => {}
             Event::ToolResult { .. } => {}
             Event::ApprovalRequired { .. } => {}
+        }
+        // Exit once the expected response for this subcommand has been seen so
+        // one-shot CLI calls return instead of hanging on the open connection.
+        let done = match sub_kind {
+            "spawn" => matches!(ev, Event::Spawned { .. }),
+            "list" => matches!(ev, Event::MemberList { .. }),
+            "status" => matches!(ev, Event::MemberStatus { .. }),
+            "dm" => matches!(ev, Event::Notification { .. }),
+            "stop" => matches!(ev, Event::Stopped { .. }),
+            _ => false,
+        };
+        if done {
+            break;
         }
     }
     Ok(())
@@ -187,9 +208,20 @@ pub async fn connect() -> Result<()> {
 
     let mut tools_enabled = true;
     let mut session_id = Some(format!("connect-{}", crate::protocol::new_message_id()));
+    println!(
+        "swarm session id: {} (spawn agents with `jancode swarm spawn --parent {}`)",
+        session_id.as_deref().unwrap_or(""),
+        session_id.as_deref().unwrap_or("")
+    );
+    let default_model = crate::config::load()
+        .map(|c| c.provider.default_model.clone())
+        .unwrap_or_else(|_| "default".to_string());
+    let mut current_model: Option<String> = None;
+    let mut models_cache: Option<Vec<String>> = None;
     let mut sessions_cache: Vec<crate::storage::Session> = Vec::new();
     loop {
-        print!("> ");
+        let prompt_label = current_model.as_deref().unwrap_or(&default_model);
+        print!("{}> ", prompt_label);
         std::io::stdout().flush()?;
         let mut raw_input = String::new();
         std::io::stdin().read_line(&mut raw_input)?;
@@ -232,6 +264,131 @@ pub async fn connect() -> Result<()> {
             tools_enabled = true;
             println!("tools enabled: true (MCP + built-in)");
             input = remainder;
+        }
+        if input == "/model" || input.starts_with("/model ") {
+            let cfg = crate::config::load().unwrap_or_default();
+            let mut remainder = input.strip_prefix("/model").unwrap_or("").trim().to_string();
+
+            // /model grep <term> and /model search <term> narrow the catalog
+            // instead of being treated as literal model ids.
+            let mut filter: Option<String> = None;
+            for kw in ["grep ", "search "] {
+                if let Some(t) = remainder.strip_prefix(kw) {
+                    filter = Some(t.trim().to_string());
+                    remainder = String::new();
+                    break;
+                }
+            }
+
+            // Build the model catalog: config list, else live `GET /models`.
+            let catalog = match &models_cache {
+                Some(l) => l.clone(),
+                None => {
+                    let l = crate::provider::list_models(&cfg)
+                        .await
+                        .unwrap_or_else(|e| {
+                            eprintln!("note: could not fetch model list from provider: {}", e);
+                            Vec::new()
+                        });
+                    models_cache = Some(l.clone());
+                    l
+                }
+            };
+            // De-duplicate while preserving order.
+            let mut seen = std::collections::HashSet::new();
+            let catalog: Vec<String> = catalog
+                .into_iter()
+                .filter(|m| seen.insert(m.clone()))
+                .collect();
+
+            if catalog.is_empty() && filter.is_some() {
+                println!("no models available (provider /models failed and no models list in config.toml)");
+                continue;
+            }
+
+            // Narrow the catalog with the filter term if one was given.
+            let show: Vec<String> = match &filter {
+                Some(term) if !term.is_empty() => catalog
+                    .iter()
+                    .filter(|m| m.to_lowercase().contains(&term.to_lowercase()))
+                    .cloned()
+                    .collect(),
+                _ => catalog.clone(),
+            };
+            if show.is_empty() && filter.is_some() {
+                println!("no models match '{}' (run /model grep <term>)", filter.as_deref().unwrap_or(""));
+                continue;
+            }
+
+            // Resolve a 1-based selection to a model. 0 = default (None).
+            let resolve = |n: usize, list: &[String]| -> Option<Option<String>> {
+                if n == 0 {
+                    return Some(None);
+                }
+                list.get(n.saturating_sub(1)).cloned().map(Some)
+            };
+
+            if remainder.is_empty() {
+                if catalog.is_empty() {
+                    println!("no models available (provider /models failed and no models list in config.toml)");
+                    println!("usage: /model <name>, or add a models list under [provider]");
+                    continue;
+                }
+                match &filter {
+                    Some(term) if !term.is_empty() => {
+                        println!("models matching '{}' ({}):", term, show.len());
+                    }
+                    _ => println!("available models ({}) (narrow with /model grep <term>):", show.len()),
+                }
+                for (i, m) in show.iter().enumerate() {
+                    println!("  [{}] {}", i + 1, m);
+                }
+                println!("  [0] default ({})", default_model);
+                print!("select model number: ");
+                std::io::stdout().flush()?;
+                let mut pick = String::new();
+                std::io::stdin().read_line(&mut pick)?;
+                match pick.trim().parse::<usize>() {
+                    Ok(0) => {
+                        current_model = None;
+                        println!("model reset to default ({})", default_model);
+                    }
+                    Ok(n) => match resolve(n, &show) {
+                        Some(Some(m)) => {
+                            current_model = Some(m.clone());
+                            println!("model switched to: {}", m);
+                        }
+                        Some(None) => unreachable!(),
+                        None => println!("no model at number {} (run /model to list)", n),
+                    },
+                    Err(_) => println!("invalid selection: {}", pick.trim()),
+                }
+                continue;
+            }
+
+            // /model <number>: select from the catalog.
+            if let Ok(n) = remainder.parse::<usize>() {
+                match resolve(n, &catalog) {
+                    Some(Some(m)) => {
+                        current_model = Some(m.clone());
+                        println!("model switched to: {}", m);
+                    }
+                    Some(None) => {
+                        current_model = None;
+                        println!("model reset to default ({})", default_model);
+                    }
+                    None => println!("no model at number {} (run /model to list)", n),
+                }
+                continue;
+            }
+
+            // /model <name>: set an explicit model id regardless of the catalog.
+            if !catalog.is_empty() && !catalog.iter().any(|m| m == &remainder) {
+                println!("note: '{}' is not in the fetched model list; the provider may reject it", remainder);
+            }
+            current_model = Some(remainder.clone());
+            println!("model switched to: {}", remainder);
+            continue;
         }
         if input == "/mcp_tools" || input == "/mcp_status" {
             let show_tools = input == "/mcp_tools";
@@ -337,7 +494,8 @@ pub async fn connect() -> Result<()> {
             match sessions_cache.get(idx) {
                 Some(s) => {
                     session_id = Some(s.id.clone());
-                    println!("resumed session: {} ({} messages)", s.title, s.messages.len());
+                    current_model = Some(s.model.clone());
+                    println!("resumed session: {} ({} messages, model: {})", s.title, s.messages.len(), s.model);
                     for m in &s.messages {
                         println!("  [{}] {}", m.role, m.content.chars().take(120).collect::<String>());
                     }
@@ -388,7 +546,7 @@ pub async fn connect() -> Result<()> {
             continue;
         }
         if input == "/help" {
-            println!("Available commands: /quit, /exit, /q (quit), /tools (toggle tool calling), /mcp (list MCP servers / send with MCP tools), /mcp_tools (list tools exposed by MCP servers), /mcp_status (MCP server connection status), /session (list sessions), /resume <number>, /memory (list memories), /forget <number>, /help");
+            println!("Available commands: /quit, /exit, /q (quit), /tools (toggle tool calling), /model (list models and switch), /mcp (list MCP servers / send with MCP tools), /mcp_tools (list tools exposed by MCP servers), /mcp_status (MCP server connection status), /session (list sessions), /resume <number>, /memory (list memories), /forget <number>, /help");
             continue;
         }
         let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
@@ -412,7 +570,7 @@ pub async fn connect() -> Result<()> {
             } else {
                 None
             },
-            model: None,
+            model: current_model.clone(),
             cwd,
             interactive: true,
         };
@@ -487,6 +645,25 @@ pub async fn connect() -> Result<()> {
                     w.write_all(b"\n").await?;
                     w.flush().await?;
                     eprintln!("[approval] {}", if approved { "allowed" } else { "DENIED" });
+                }
+                Event::Notification {
+                    id: _,
+                    from_session,
+                    notification_type,
+                    message,
+                } => {
+                    // Out-of-band swarm event (DM / broadcast / child-agent
+                    // completion report). Show it so the parent sees agent
+                    // activity live, without corrupting the streamed reply.
+                    in_stream = false;
+                    eprintln!();
+                    let from = from_session.as_deref().unwrap_or("system");
+                    eprintln!(
+                        "[{}] from {}: {}",
+                        notification_type_str(&notification_type),
+                        from,
+                        message
+                    );
                 }
                 Event::Done { id: _ } => {
                     if in_stream {
