@@ -13,6 +13,14 @@ pub async fn handle_swarm(sub: crate::SwarmCommands) -> Result<()> {
     let (r, mut w) = stream.into_split();
     let mut lines = BufReader::new(r).lines();
 
+    let sub_kind = match &sub {
+        crate::SwarmCommands::Spawn { .. } => "spawn",
+        crate::SwarmCommands::List => "list",
+        crate::SwarmCommands::Status { .. } => "status",
+        crate::SwarmCommands::Dm { .. } => "dm",
+        crate::SwarmCommands::Stop { .. } => "stop",
+    };
+
     let req = match sub {
         crate::SwarmCommands::Spawn {
             prompt,
@@ -59,7 +67,7 @@ pub async fn handle_swarm(sub: crate::SwarmCommands) -> Result<()> {
             Ok(e) => e,
             Err(_) => continue,
         };
-        match ev {
+        match &ev {
             Event::Spawned {
                 id: _,
                 new_session_id,
@@ -70,7 +78,7 @@ pub async fn handle_swarm(sub: crate::SwarmCommands) -> Result<()> {
             }
             Event::MemberList { id: _, members } => {
                 println!("swarm members ({}):", members.len());
-                for m in &members {
+                for m in members {
                     println!(
                         "  {} [{}] label={:?} headless={} parent={:?}",
                         m.session_id, m.status, m.label, m.is_headless, m.parent_session_id
@@ -98,7 +106,7 @@ pub async fn handle_swarm(sub: crate::SwarmCommands) -> Result<()> {
                 message,
             } => {
                 let from = from_session.as_deref().unwrap_or("system");
-                println!("[{}] from {}: {}", notification_type_str(&notification_type), from, message);
+                println!("[{}] from {}: {}", notification_type_str(notification_type), from, message);
             }
             Event::Stopped { id: _, session_id } => {
                 println!("stopped session: {}", session_id);
@@ -106,7 +114,7 @@ pub async fn handle_swarm(sub: crate::SwarmCommands) -> Result<()> {
             Event::Done { id: _ } => break,
             Event::Error { id: _, message } => {
                 eprintln!("error: {}", message);
-                anyhow::bail!(message);
+                anyhow::bail!(message.to_string());
             }
             Event::Ack { .. } => {}
             Event::Pong { .. } => {}
@@ -116,6 +124,19 @@ pub async fn handle_swarm(sub: crate::SwarmCommands) -> Result<()> {
             Event::ToolCall { .. } => {}
             Event::ToolResult { .. } => {}
             Event::ApprovalRequired { .. } => {}
+        }
+        // Exit once the expected response for this subcommand has been seen so
+        // one-shot CLI calls return instead of hanging on the open connection.
+        let done = match sub_kind {
+            "spawn" => matches!(ev, Event::Spawned { .. }),
+            "list" => matches!(ev, Event::MemberList { .. }),
+            "status" => matches!(ev, Event::MemberStatus { .. }),
+            "dm" => matches!(ev, Event::Notification { .. }),
+            "stop" => matches!(ev, Event::Stopped { .. }),
+            _ => false,
+        };
+        if done {
+            break;
         }
     }
     Ok(())
@@ -187,6 +208,11 @@ pub async fn connect() -> Result<()> {
 
     let mut tools_enabled = true;
     let mut session_id = Some(format!("connect-{}", crate::protocol::new_message_id()));
+    println!(
+        "swarm session id: {} (spawn agents with `jancode swarm spawn --parent {}`)",
+        session_id.as_deref().unwrap_or(""),
+        session_id.as_deref().unwrap_or("")
+    );
     let mut sessions_cache: Vec<crate::storage::Session> = Vec::new();
     loop {
         print!("> ");
@@ -487,6 +513,25 @@ pub async fn connect() -> Result<()> {
                     w.write_all(b"\n").await?;
                     w.flush().await?;
                     eprintln!("[approval] {}", if approved { "allowed" } else { "DENIED" });
+                }
+                Event::Notification {
+                    id: _,
+                    from_session,
+                    notification_type,
+                    message,
+                } => {
+                    // Out-of-band swarm event (DM / broadcast / child-agent
+                    // completion report). Show it so the parent sees agent
+                    // activity live, without corrupting the streamed reply.
+                    in_stream = false;
+                    eprintln!();
+                    let from = from_session.as_deref().unwrap_or("system");
+                    eprintln!(
+                        "[{}] from {}: {}",
+                        notification_type_str(&notification_type),
+                        from,
+                        message
+                    );
                 }
                 Event::Done { id: _ } => {
                     if in_stream {

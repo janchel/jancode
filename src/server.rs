@@ -18,6 +18,9 @@ type SessionMap = Arc<RwLock<HashMap<String, Session>>>;
 type ActiveClients = Arc<AtomicUsize>;
 /// Shared swarm state (in-process multi-agent coordination).
 type SharedSwarm = Arc<RwLock<SwarmState>>;
+/// session_id -> the owning interactive client's socket (for live push of
+/// swarm notifications like DM / broadcast / completion reports).
+type SessionClients = Arc<RwLock<HashMap<String, Arc<tokio::net::UnixStream>>>>;
 
 pub async fn run() -> Result<()> {
     let cfg = crate::config::load()?;
@@ -52,6 +55,7 @@ pub async fn run() -> Result<()> {
     // Idle shutdown: like jancode, the daemon exits on its own once no client is
     // connected long enough, so `run`/`connect` re-spawn it lazily instead of
     // leaving a permanent background process.
+    let session_clients: SessionClients = Arc::new(RwLock::new(HashMap::new()));
     let active_clients: ActiveClients = Arc::new(AtomicUsize::new(0));
     let idle_secs = cfg.server.idle_timeout_secs;
     if idle_secs > 0 {
@@ -72,10 +76,11 @@ pub async fn run() -> Result<()> {
             Ok((stream, _)) => {
                 let sessions = sessions.clone();
                 let swarm = swarm.clone();
+                let session_clients = session_clients.clone();
                 let active = active_clients.clone();
                 active.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
-                    let _ = handle_client(stream, sessions, swarm).await;
+                    let _ = handle_client(stream, sessions, swarm, session_clients).await;
                     active.fetch_sub(1, Ordering::SeqCst);
                 });
             }
@@ -84,10 +89,28 @@ pub async fn run() -> Result<()> {
     }
 }
 
-async fn handle_client(stream: UnixStream, sessions: SessionMap, swarm: SharedSwarm) -> Result<()> {
+async fn handle_client(
+    stream: UnixStream,
+    sessions: SessionMap,
+    swarm: SharedSwarm,
+    session_clients: SessionClients,
+) -> Result<()> {
+    // Duplicate the socket so swarm handlers running on other connections can
+    // push Notification events (DM / broadcast / completion report) into this
+    // client's chat live. Dropping the mirror never shuts down the socket.
+    let std_stream = stream.into_std().context("converting to std stream")?;
+    let mirror = std_stream
+        .try_clone()
+        .ok()
+        .and_then(|dup| tokio::net::UnixStream::from_std(dup).ok())
+        .map(Arc::new);
+    let stream = tokio::net::UnixStream::from_std(std_stream).context("rebuilding tokio stream")?;
     let (r, mut w) = stream.into_split();
     let mut lines = BufReader::new(r).lines();
     let cfg = crate::config::load()?;
+    // Sessions this client registered as the interactive owner for; cleaned up
+    // on disconnect so stale socket handles don't accumulate.
+    let mut registered_sessions: Vec<String> = Vec::new();
 
     while let Some(line) = lines.next_line().await? {
         let req: Request = match serde_json::from_str(&line) {
@@ -127,6 +150,31 @@ async fn handle_client(stream: UnixStream, sessions: SessionMap, swarm: SharedSw
                 let working_dir = cwd.clone().unwrap_or_else(|| {
                     std::env::current_dir().unwrap_or_default().to_string_lossy().to_string()
                 });
+
+                // An interactive client is a human-attached swarm member: it can
+                // act as a parent for spawned agents and receives their DMs and
+                // completion reports live on its socket.
+                if interactive {
+                    {
+                        let mut sw = swarm.write().await;
+                        if sw.get_member(&session_id_s).is_none() {
+                            let member = swarm::make_member(
+                                &session_id_s,
+                                Some("interactive".to_string()),
+                                None,
+                                false,
+                            );
+                            sw.register_member(member);
+                        }
+                    }
+                    if let Some(m) = &mirror {
+                        session_clients
+                            .write()
+                            .await
+                            .insert(session_id_s.clone(), m.clone());
+                        registered_sessions.push(session_id_s.clone());
+                    }
+                }
 
                 let enable_tools = tools.is_some();
                 let tool_registry = if enable_tools {
@@ -400,7 +448,7 @@ async fn handle_client(stream: UnixStream, sessions: SessionMap, swarm: SharedSw
                 label,
             } => {
                 handle_swarm_spawn(
-                    &mut w, id, &sessions, &swarm, parent_session_id,
+                    &mut w, id, &sessions, &swarm, &session_clients, parent_session_id,
                     &initial_message, model.as_deref(), label.as_deref(),
                 )
                 .await?;
@@ -412,7 +460,7 @@ async fn handle_client(stream: UnixStream, sessions: SessionMap, swarm: SharedSw
                 message,
             } => {
                 handle_swarm_dm(
-                    &mut w, &swarm, from_session_id.as_deref(),
+                    &mut w, &swarm, &session_clients, from_session_id.as_deref(),
                     &to_session_id, &message,
                 )
                 .await?;
@@ -423,7 +471,7 @@ async fn handle_client(stream: UnixStream, sessions: SessionMap, swarm: SharedSw
                 message,
             } => {
                 handle_swarm_broadcast(
-                    &mut w, &swarm, from_session_id.as_deref(), &message,
+                    &mut w, &swarm, &session_clients, from_session_id.as_deref(), &message,
                 )
                 .await?;
             }
@@ -441,6 +489,14 @@ async fn handle_client(stream: UnixStream, sessions: SessionMap, swarm: SharedSw
                 handle_swarm_list(&mut w, &swarm, id).await?;
             }
             Request::ApprovalResponse { .. } => {}
+        }
+    }
+    // Client disconnected: drop our socket registrations so notifications stop
+    // flowing to a dead handle (the sessions stay as swarm members).
+    {
+        let mut map = session_clients.write().await;
+        for sid in &registered_sessions {
+            map.remove(sid);
         }
     }
     Ok(())
@@ -563,12 +619,214 @@ async fn send(w: &mut tokio::net::unix::OwnedWriteHalf, ev: &Event) -> Result<()
     Ok(())
 }
 
+/// Push a `Notification` event to a session's connected interactive client, if
+/// any. Uses a shared socket handle (`try_write`, which needs only `&self`) so
+/// a swarm handler on another connection (spawn / DM / broadcast) can surface
+/// the event live in that client's chat.
+async fn notify_session(
+    session_clients: &SessionClients,
+    target_session: &str,
+    from_session: Option<&str>,
+    notification_type: crate::protocol::NotificationType,
+    message: String,
+) {
+    let ev = crate::swarm::interrupt_event(from_session, notification_type, message);
+    let Ok(data) = serde_json::to_string(&ev).map(|d| d + "\n") else {
+        return;
+    };
+    let sock = {
+        let map = session_clients.read().await;
+        map.get(target_session).cloned()
+    };
+    let Some(sock) = sock else { return };
+
+    let payload = data.as_bytes();
+    let mut written = 0;
+    loop {
+        match sock.try_write(&payload[written..]) {
+            Ok(n) => {
+                written += n;
+                if written >= payload.len() {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if sock.writable().await.is_err() {
+                    // Dead socket — drop the registration.
+                    session_clients.write().await.remove(target_session);
+                    return;
+                }
+            }
+            Err(_) => {
+                // Dead socket — drop the registration.
+                session_clients.write().await.remove(target_session);
+                return;
+            }
+        }
+    }
+}
+
+/// Run a spawned headless agent session to completion: feed its conversation
+/// through the provider, executing any tool calls (auto-approved — no human is
+/// attached) and appending results, until a turn has no tool calls or the loop
+/// budget is exhausted. Returns the accumulated assistant text for the report.
+async fn run_headless_agent(
+    cfg: &crate::config::Config,
+    sessions: &SessionMap,
+    session_id: &str,
+) -> Result<String> {
+    let tool_registry = {
+        let mut reg = crate::tools::default_registry();
+        for t in crate::mcp::load_tools(cfg).await {
+            reg.register_boxed(t);
+        }
+        reg
+    };
+    let tool_defs: Vec<crate::tools::ToolDefinition> =
+        tool_registry.all().iter().map(|t| t.to_definition()).collect();
+    let tool_defs_ref = if tool_defs.is_empty() { None } else { Some(tool_defs.as_slice()) };
+
+    let working_dir = {
+        let s = sessions.read().await;
+        s.get(session_id)
+            .map(|e| e.working_dir.clone())
+            .unwrap_or_default()
+    };
+    let ctx = crate::tools::ToolContext {
+        working_dir: std::path::PathBuf::from(&working_dir),
+    };
+
+    const MAX_TOOL_LOOPS: u32 = 20;
+    let mut total_text = String::new();
+    let mut iteration = 0u32;
+
+    loop {
+        iteration += 1;
+        if iteration > MAX_TOOL_LOOPS {
+            info!("headless agent {} exceeded {} tool loops", session_id, MAX_TOOL_LOOPS);
+            total_text.push_str(&format!(
+                "\n[stopped: exceeded {} tool-calling iterations]",
+                MAX_TOOL_LOOPS
+            ));
+            break;
+        }
+
+        let msgs: Vec<crate::storage::Message> = {
+            let s = sessions.read().await;
+            s.get(session_id).map(|e| e.messages.clone()).unwrap_or_default()
+        };
+
+        let events = match crate::provider::send_message(cfg, &msgs, tool_defs_ref, "").await {
+            Ok(events) => events,
+            Err(e) => {
+                let msg = format!("ERROR: {}", e);
+                total_text.push_str(&msg);
+                persist_assistant(sessions, session_id, &msg).await;
+                return Ok(total_text);
+            }
+        };
+
+        let mut turn_text = String::new();
+        let mut tool_calls: Vec<crate::protocol::ToolCall> = Vec::new();
+        for ev in &events {
+            if let Event::TextDelta { id: _, text } = ev {
+                turn_text.push_str(text);
+            }
+            if let Event::ToolCall { id: _, calls } = ev {
+                tool_calls.extend(calls.clone());
+            }
+        }
+        total_text.push_str(&turn_text);
+
+        // Persist the assistant turn (text + tool calls).
+        {
+            let mut map = sessions.write().await;
+            if let Some(entry) = map.get_mut(session_id) {
+                if !turn_text.is_empty() || !tool_calls.is_empty() {
+                    let stored_tcs: Vec<crate::storage::StoredToolCall> = tool_calls
+                        .iter()
+                        .map(|tc| crate::storage::StoredToolCall {
+                            id: tc.id.clone(),
+                            name: tc.name.clone(),
+                            arguments: tc.input.to_string(),
+                        })
+                        .collect();
+                    entry.messages.push(Message {
+                        role: "assistant".to_string(),
+                        content: turn_text.clone(),
+                        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                        tool_calls: if stored_tcs.is_empty() { None } else { Some(stored_tcs) },
+                        tool_call_id: None,
+                    });
+                }
+                entry.updated_at_ms = chrono::Utc::now().timestamp_millis();
+                let snapshot = entry.clone();
+                if let Err(e) = crate::storage::save_session(&snapshot) {
+                    error!("saving session {}: {}", session_id, e);
+                }
+            }
+        }
+
+        if tool_calls.is_empty() {
+            break;
+        }
+
+        // Execute each tool (auto-approved: headless agent, no human attached).
+        let mut results: Vec<crate::protocol::ToolResultEntry> = Vec::new();
+        for tc in &tool_calls {
+            let result_entry = match tool_registry.find(&tc.name) {
+                Some(tool) => match tool.execute(&tc.input, &ctx).await {
+                    Ok(s) => crate::protocol::ToolResultEntry {
+                        tool_call_id: tc.id.clone(),
+                        output: s,
+                        is_error: false,
+                    },
+                    Err(e) => crate::protocol::ToolResultEntry {
+                        tool_call_id: tc.id.clone(),
+                        output: format!("ERROR: {}", e),
+                        is_error: true,
+                    },
+                },
+                None => crate::protocol::ToolResultEntry {
+                    tool_call_id: tc.id.clone(),
+                    output: format!("ERROR: tool '{}' not found", tc.name),
+                    is_error: true,
+                },
+            };
+            results.push(result_entry);
+        }
+
+        {
+            let mut map = sessions.write().await;
+            if let Some(entry) = map.get_mut(session_id) {
+                for r in &results {
+                    entry.messages.push(Message {
+                        role: "tool".to_string(),
+                        content: r.output.clone(),
+                        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                        tool_calls: None,
+                        tool_call_id: Some(r.tool_call_id.clone()),
+                    });
+                }
+                entry.updated_at_ms = chrono::Utc::now().timestamp_millis();
+                let snapshot = entry.clone();
+                if let Err(e) = crate::storage::save_session(&snapshot) {
+                    error!("saving session {}: {}", session_id, e);
+                }
+            }
+        }
+    }
+
+    Ok(total_text)
+}
+
 /// Spawn a new headless agent session and run its initial message.
 async fn handle_swarm_spawn(
     w: &mut tokio::net::unix::OwnedWriteHalf,
     req_id: u64,
     sessions: &SessionMap,
     swarm: &SharedSwarm,
+    session_clients: &SessionClients,
     parent_session_id: Option<String>,
     initial_message: &str,
     model_override: Option<&str>,
@@ -623,42 +881,9 @@ async fn handle_swarm_spawn(
     })
     .await?;
 
-    // Run the initial prompt headlessly through the provider (no client
-    // connected to the new session). Accumulate the full assistant turn.
-    let provider_msgs = {
-        let s = sessions.read().await;
-        match s.get(&session_id) {
-            Some(entry) => entry.messages.clone(),
-            None => Vec::new(),
-        }
-    };
-
-    let model = {
-        let s = sessions.read().await;
-        s.get(&session_id).map(|e| e.model.clone()).unwrap_or(cfg.provider.default_model.clone())
-    };
-    let _ = model; // headless turn uses the per-session model already in the Session.
-
-    let mut assistant_text = String::new();
-    let result = crate::provider::send_message(&cfg, &provider_msgs, None, "").await;
-
-    match result {
-        Ok(events) => {
-            for ev in events {
-                if let Event::TextDelta { id: _, text } = &ev {
-                    assistant_text.push_str(text);
-                }
-            }
-        }
-        Err(e) => {
-            assistant_text = format!("ERROR: {}", e);
-        }
-    }
-
-    // Persist the assistant turn for the spawned session.
-    if !assistant_text.is_empty() {
-        persist_assistant(sessions, &session_id, &assistant_text).await;
-    }
+    // Run the agent headlessly with the full tool set (auto-approved — no
+    // human is attached). Returns the accumulated assistant text.
+    let assistant_text = run_headless_agent(&cfg, sessions, &session_id).await?;
 
     // Forward the completion report to the parent session (jancode's
     // report_back_to_session_id policy): queue a soft interrupt / send a
@@ -684,6 +909,19 @@ async fn handle_swarm_spawn(
         }
     }
 
+    // Push the completion report live to the parent's interactive client (if
+    // one is attached), independent of the swarm interrupt queue.
+    if let Some(parent_id) = &parent_session_id {
+        notify_session(
+            session_clients,
+            parent_id,
+            Some(&session_id),
+            crate::protocol::NotificationType::CompletionReport,
+            report.clone(),
+        )
+        .await;
+    }
+
     Ok(())
 }
 
@@ -691,6 +929,7 @@ async fn handle_swarm_spawn(
 async fn handle_swarm_dm(
     w: &mut tokio::net::unix::OwnedWriteHalf,
     swarm: &SharedSwarm,
+    session_clients: &SessionClients,
     from_session_id: Option<&str>,
     to_session_id: &str,
     message: &str,
@@ -706,6 +945,14 @@ async fn handle_swarm_dm(
             },
         );
     }
+    notify_session(
+        session_clients,
+        to_session_id,
+        from_session_id,
+        crate::protocol::NotificationType::Dm,
+        message.to_string(),
+    )
+    .await;
     send(
         &mut *w,
         &swarm::interrupt_event(
@@ -722,15 +969,19 @@ async fn handle_swarm_dm(
 async fn handle_swarm_broadcast(
     _w: &mut tokio::net::unix::OwnedWriteHalf,
     swarm: &SharedSwarm,
+    session_clients: &SessionClients,
     from_session_id: Option<&str>,
     message: &str,
 ) -> Result<()> {
+    let keys: Vec<String> = {
+        let sw = swarm.read().await;
+        sw.members.keys().cloned().collect()
+    };
     {
         let mut sw = swarm.write().await;
-        let keys: Vec<String> = sw.members.keys().cloned().collect();
-        for to in keys {
+        for to in &keys {
             sw.queue_interrupt(
-                &to,
+                to,
                 Interrupt {
                     from_session: from_session_id.map(String::from),
                     notification_type: crate::protocol::NotificationType::Broadcast,
@@ -738,6 +989,16 @@ async fn handle_swarm_broadcast(
                 },
             );
         }
+    }
+    for to in &keys {
+        notify_session(
+            session_clients,
+            to,
+            from_session_id,
+            crate::protocol::NotificationType::Broadcast,
+            message.to_string(),
+        )
+        .await;
     }
     info!(
         "broadcast from {:?} to all members: {}",

@@ -217,15 +217,35 @@ jancode run "Explain this code" --model <model-name> --tools
 
 ### Swarm (multi-agent)
 
+`connect` is the swarm entry point. Every interactive chat gets a swarm session
+id you can address agents with:
+
 ```bash
-# Spawn a headless agent
-jancode swarm spawn "Do some research" --label researcher
+# Start an interactive chat, note the printed swarm session id
+jancode connect
+# -> swarm session id: connect-... (spawn agents with `jancode swarm spawn --parent <id>`)
+```
+
+Spawn a headless agent with the same agent tools (read/write/edit/apply_patch/
+bash/plan/grep/glob/list_dir) and auto-approval:
+
+```bash
+# Spawn a child agent; it reports back to the parent's chat when done
+jancode swarm spawn "Edit the README and fix the typo" --label editor \
+  --parent <connect-session-id>
 
 # Manage swarm
 jancode swarm list
-jancode swarm dm --to <session_id> "Message"
+jancode swarm status --session <session_id>
+jancode swarm dm --to <connect-session-id> "Message"   # DMs surface in that chat
 jancode swarm stop <session_id>
 ```
+
+Headless agents plan, code, test and fix on their own; their completion report
+(and any DMs/broadcasts) surface in the parent's `connect` chat as
+`[report] from agent-...` / `[DM] from ...` notifications when the chat next
+reads from the daemon. Each one-shot `swarm` command returns after its
+response — the spawned agent keeps running headless in the daemon until done.
 
 ## Provider setup
 
