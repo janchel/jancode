@@ -567,6 +567,11 @@ pub async fn connect() -> Result<()> {
                     "apply_patch".to_string(),
                     "plan".to_string(),
                     "git".to_string(),
+                    "fetch_url".to_string(),
+                    "http_request".to_string(),
+                    "note".to_string(),
+                    "docker".to_string(),
+                    "sql".to_string(),
                 ])
             } else {
                 None
@@ -639,6 +644,25 @@ pub async fn connect() -> Result<()> {
                             } else {
                                 format!("{} {}", action, target)
                             }
+                        } else if c.name == "fetch_url" {
+                            c.input.get("url").and_then(|v| v.as_str()).unwrap_or_default().to_string()
+                        } else if c.name == "http_request" {
+                            let m = c.input.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
+                            let u = c.input.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                            format!("{} {}", m, u)
+                        } else if c.name == "note" {
+                            let a = c.input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                            let t = c.input.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                            if t.is_empty() { a.to_string() } else { format!("{} {}", a, t) }
+                        } else if c.name == "docker" {
+                            let a = c.input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                            let t = c.input.get("container").and_then(|v| v.as_str())
+                                .or_else(|| c.input.get("image").and_then(|v| v.as_str()))
+                                .unwrap_or("");
+                            if t.is_empty() { a.to_string() } else { format!("{} {}", a, t) }
+                        } else if c.name == "sql" {
+                            c.input.get("query").and_then(|v| v.as_str()).unwrap_or("")
+                                .chars().take(60).collect::<String>()
                         } else {
                             c.input.to_string()
                         };
@@ -740,6 +764,11 @@ pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool) -> Res
                 "apply_patch".to_string(),
                 "plan".to_string(),
                 "git".to_string(),
+                "fetch_url".to_string(),
+                "http_request".to_string(),
+                "note".to_string(),
+                "docker".to_string(),
+                "sql".to_string(),
             ])
         } else {
             None
@@ -808,6 +837,25 @@ pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool) -> Res
                         } else {
                             format!("{} {}", action, target)
                         }
+                    } else if c.name == "fetch_url" {
+                        c.input.get("url").and_then(|v| v.as_str()).unwrap_or_default().to_string()
+                    } else if c.name == "http_request" {
+                        let m = c.input.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
+                        let u = c.input.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                        format!("{} {}", m, u)
+                    } else if c.name == "note" {
+                        let a = c.input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                        let t = c.input.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                        if t.is_empty() { a.to_string() } else { format!("{} {}", a, t) }
+                    } else if c.name == "docker" {
+                        let a = c.input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                        let t = c.input.get("container").and_then(|v| v.as_str())
+                            .or_else(|| c.input.get("image").and_then(|v| v.as_str()))
+                            .unwrap_or("");
+                        if t.is_empty() { a.to_string() } else { format!("{} {}", a, t) }
+                    } else if c.name == "sql" {
+                        c.input.get("query").and_then(|v| v.as_str()).unwrap_or("")
+                            .chars().take(60).collect::<String>()
                     } else {
                         c.input.to_string()
                     };

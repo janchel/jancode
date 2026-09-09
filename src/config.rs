@@ -10,6 +10,17 @@ pub struct Config {
     pub server: ServerConfig,
     #[serde(default)]
     pub mcp: McpConfig,
+    #[serde(default)]
+    pub database: DatabaseConfig,
+}
+
+/// Optional database used by the `sql` tool. When a query runs without an
+/// explicit `db`, this URL is used. Supported schemes: `postgres://`,
+/// `mysql://`, or a `sqlite:`/plain file path.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DatabaseConfig {
+    #[serde(default)]
+    pub url: String,
 }
 
 /// MCP server config. Transport is currently `http-streamable` (the modern

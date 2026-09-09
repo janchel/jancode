@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod client;
+mod agents;
 mod config;
 mod mcp;
 mod memory;

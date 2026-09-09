@@ -137,6 +137,35 @@ jancode ships with these tools (plus any discovered via [MCP servers](#mcp-model
   (`status`/`log`/`diff`/`fetch`/remote/branch list) run freely. Conflict
   markers can be fixed with `read`/`edit`/`apply_patch`, then
   `git add` + `rebase --continue` (or `merge` commit) to finish.
+- `fetch_url` — fetch a URL and return its text content (read docs, check
+  pages, pull API data). Read-only, ungated.
+- `http_request` — raw HTTP calls (GET/POST/PUT/PATCH/DELETE/HEAD) with
+  headers, JSON or string body. GET/HEAD/OPTIONS run freely; other methods
+  require approval.
+- `docker` — manage local containers/images: `ps`, `images`, `logs`,
+  `inspect`, `stats` (read-only), and `exec`, `run`, `build`, `stop`, `rm`,
+  `pull`, `compose` (require approval).
+- `sql` — run queries against sqlite (file path), PostgreSQL, or MySQL
+  (connection URL) via the `psql`/`mysql`/`sqlite3` binaries. Read-only
+  statements (SELECT/WITH/SHOW/EXPLAIN/PRAGMA) are ungated; anything else
+  requires approval. Default target comes from `[database]` url in
+  `config.toml`.
+- `note` — persistent freeform notes in `.jancode-notes.md`
+  (`create` / `append` / `show` / `clear`). Ungated; it only touches its own
+  file.
+
+### Project instructions (AGENTS.md)
+
+Before each turn, jancode reads instruction files from `AGENTS.md`, `agents.md`,
+`CLAUDE.md`, and `.claude/CLAUDE.md` and injects them into the system prompt:
+
+- A **global** file at `~/.config/jancode/AGENTS.md` (machine-wide rules),
+- Every instruction file found while walking **up from the working directory**
+  to the filesystem root; the closest file wins on conflicts.
+
+Put build/test commands, project conventions, and operational rules there and
+the agent will follow them in every session, `run`, and swarm spawn in that
+directory.
 
 ### Approval (safe file changes)
 
@@ -149,10 +178,11 @@ resolve outside the working directory** (`read`, `list_dir`, `glob`,
   model, which will adapt (and the file is untouched).
 - Headless one-shots (`jancode run --tools`) and swarm agents auto-approve — no
   human is attached.
-- `bash` and `plan` are intentionally ungated: `bash` is the all-purpose power
-  tool, and `plan` only touches its own bookkeeping file. `git` gates only the
-  mutating actions (`add`/`commit`/`push`/`pull`/`checkout`/`merge`/`rebase`/
-  `reset`); read-only git actions (`status`/`log`/`diff`/`fetch`) run without
+- `bash`, `plan`, `note`, and `fetch_url` are intentionally ungated: `bash` is
+  the all-purpose power tool, `plan`/`note` only touch their own bookkeeping
+  files, and `fetch_url` only reads. Other tools gate selectively: `git`
+  mutating actions, `http_request` non-GET/HEAD methods, `docker`
+  state-changing actions, and non-read-only `sql` statements all require
   approval.
 
 The policy lives in `$JANCODE_HOME/config.toml` under `[server]`:
@@ -326,6 +356,10 @@ api_key_env = "OPENAI_API_KEY"
 default_model = "gpt-4o-mini"
 # Optional: pin the model catalog shown by /model instead of the live GET /models
 models = ["gpt-4o-mini", "gpt-4o", "gpt-5"]
+
+# Optional: default target for the `sql` tool (overrides pass `db` per call).
+[database]
+url = "sqlite:$JANCODE_HOME/scratch.db"   # or postgres://user:pass@host/db or mysql://...
 ```
 
 `/model` bulk-switches the model mid-chat; each message uses the session's

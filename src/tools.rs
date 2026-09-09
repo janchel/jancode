@@ -79,6 +79,9 @@ pub trait Tool: Send + Sync {
 /// Context passed to tools, mirroring jancode's ToolContext (working dir, etc.).
 pub struct ToolContext {
     pub working_dir: PathBuf,
+    /// Optional `[database] url` from config, used by the `sql` tool when a
+    /// query call omits its own `db`.
+    pub database_url: String,
 }
 
 impl ToolContext {
@@ -168,6 +171,11 @@ pub fn default_registry() -> ToolRegistry {
     r.register(ApplyPatchTool);
     r.register(PlanTool);
     r.register(GitTool);
+    r.register(WebFetchTool);
+    r.register(HttpRequestTool);
+    r.register(NoteTool);
+    r.register(DockerTool);
+    r.register(SqlTool);
     r
 }
 
@@ -1281,51 +1289,599 @@ impl Tool for GitTool {
 
 impl GitTool {
     async fn run_git(ctx: &ToolContext, args: Vec<String>) -> Result<String> {
-        let mut child = tokio::process::Command::new("git")
-            .args(&args)
-            .current_dir(&ctx.working_dir)
-            // Never open an interactive editor: rebase --continue / merge reuse
-            // the original or passed message. "true" is a no-op that exits 0.
-            .env("GIT_EDITOR", "true")
-            .env("GIT_MERGE_AUTOEDIT", "no")
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .context("failed to spawn git (is git installed?)")?;
+        // Never open an interactive editor: rebase --continue / merge reuse the
+        // original or passed message. "true" is a no-op editor that exits 0.
+        let env = [("GIT_EDITOR", "true"), ("GIT_MERGE_AUTOEDIT", "no")];
+        run_cli("git", ctx, args, 60, &env).await
+    }
+}
 
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            async {
-                let out = child.wait_with_output().await?;
-                Ok::<_, std::io::Error>(out)
-            },
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("git {} timed out after 60s", args[0]))??;
+/// Shared runner for external CLI tools (git/docker/psql/sqlite3/mysql),
+/// mirroring the git runner: cwd = working dir, piped stdout/stderr, timeout,
+/// and non-zero exits surfaced as formatted tool output rather than a hard
+/// error so the model can react to failure text.
+async fn run_cli(
+    exe: &str,
+    ctx: &ToolContext,
+    args: Vec<String>,
+    timeout_secs: u64,
+    env: &[(&str, &str)],
+) -> Result<String> {
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.args(&args).current_dir(&ctx.working_dir);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn {} (is it installed?)", exe))?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        if !output.status.success() {
-            let msg = if stderr.trim().is_empty() {
-                stdout.trim().to_string()
-            } else {
-                stderr.trim().to_string()
-            };
-            return Ok(format!("git {} failed (exit {}): {}", args[0], output.status.code().unwrap_or(-1), msg));
-        }
-        let mut out = stdout.trim().to_string();
-        if !stderr.trim().is_empty() {
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(stderr.trim());
-        }
-        if out.is_empty() {
-            Ok(format!("git {}: ok (no output)", args[0]))
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        async {
+            let out = child.wait_with_output().await?;
+            Ok::<_, std::io::Error>(out)
+        },
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("{} timed out after {}s", exe, timeout_secs))??;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if !output.status.success() {
+        let msg = if stderr.trim().is_empty() {
+            stdout.trim().to_string()
         } else {
-            Ok(out)
+            stderr.trim().to_string()
+        };
+        return Ok(format!("{} failed (exit {}): {}", exe, output.status.code().unwrap_or(-1), msg));
+    }
+    let mut out = stdout.trim().to_string();
+    if !stderr.trim().is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(stderr.trim());
+    }
+    if out.is_empty() {
+        Ok(format!("{}: ok (no output)", exe))
+    } else {
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fetch_url
+// ---------------------------------------------------------------------------
+
+pub struct WebFetchTool;
+
+#[async_trait]
+impl Tool for WebFetchTool {
+    fn name(&self) -> &str {
+        "fetch_url"
+    }
+
+    fn description(&self) -> &str {
+        "Fetch a URL (http/https) and return its text content. Use to read\n\
+         documentation, inspect a web page, or pull data from an API endpoint.\n\
+         Read-only and ungated."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "The URL to fetch." },
+                "max_chars": { "type": "integer", "default": 12000, "description": "Truncate the response to this many characters." }
+            },
+            "required": ["url"]
+        })
+    }
+
+    async fn execute(&self, input: &Value, _ctx: &ToolContext) -> Result<String> {
+        let url = input.get("url").and_then(|v| v.as_str()).context("missing 'url'")?;
+        let max_chars = input.get("max_chars").and_then(|v| v.as_u64()).unwrap_or(12000) as usize;
+        let client = reqwest::Client::builder()
+            .user_agent("jancode-agent/0.1")
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+        let resp = client.get(url).send().await.context("fetching URL")?;
+        if !resp.status().is_success() {
+            let status_code = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Ok(format!(
+                "HTTP {}: {}",
+                status_code,
+                body.chars().take(500).collect::<String>()
+            ));
+        }
+        let text = resp.text().await.context("reading response body")?;
+        let truncated: String = text.chars().take(max_chars).collect();
+        if truncated.len() < text.len() {
+            Ok(format!(
+                "{}\n\n[truncated: {} chars total, set max_chars higher to see more]",
+                truncated,
+                text.len()
+            ))
+        } else {
+            Ok(truncated)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// http_request
+// ---------------------------------------------------------------------------
+
+pub struct HttpRequestTool;
+
+#[async_trait]
+impl Tool for HttpRequestTool {
+    fn name(&self) -> &str {
+        "http_request"
+    }
+
+    fn description(&self) -> &str {
+        "Send a raw HTTP request (GET/POST/PUT/PATCH/DELETE/HEAD). Pass headers\n\
+         as an object, and a payload via 'json' (object) or 'body' (string).\n\
+         Returns status code and response body. Non-GET/HEAD methods require\n\
+         approval in interactive sessions."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "method": { "type": "string", "default": "GET", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"], "description": "HTTP method." },
+                "url": { "type": "string", "description": "Full URL including scheme." },
+                "headers": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Extra request headers as a string->string map." },
+                "json": { "type": "object", "description": "JSON payload to send as the request body." },
+                "body": { "type": "string", "description": "Raw string body (used when json is not given)." },
+                "timeout_ms": { "type": "integer", "default": 30000, "description": "Request timeout in milliseconds." }
+            },
+            "required": ["url"]
+        })
+    }
+
+    async fn execute(&self, input: &Value, _ctx: &ToolContext) -> Result<String> {
+        let url = input.get("url").and_then(|v| v.as_str()).context("missing 'url'")?;
+        let method = input.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_uppercase();
+        let method = reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|_| anyhow::anyhow!("invalid method: {}", method))?;
+        let timeout_ms = input.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(30000);
+
+        let client = reqwest::Client::builder()
+            .user_agent("jancode-agent/0.1")
+            .timeout(std::time::Duration::from_millis(timeout_ms))
+            .build()?;
+
+        let mut req = client.request(method.clone(), url);
+        if let Some(headers) = input.get("headers").and_then(|v| v.as_object()) {
+            for (k, v) in headers {
+                if let Some(val) = v.as_str() {
+                    req = req.header(k.clone(), val);
+                }
+            }
+        }
+        if let Some(j) = input.get("json") {
+            req = req.json(j);
+        } else if let Some(b) = input.get("body").and_then(|v| v.as_str()) {
+            req = req.body(b.to_string());
+        }
+
+        let resp = req.send().await.with_context(|| format!("{} {}", method, url))?;
+        let status = resp.status();
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body = resp.text().await.unwrap_or_default();
+        let truncated: String = body.chars().take(40000).collect();
+        let header_line = if ct.is_empty() { String::new() } else { format!("content-type: {}\n", ct) };
+        if truncated.len() < body.len() {
+            Ok(format!(
+                "HTTP {} {}\n{}{}\n\n[truncated: {} bytes total]",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or(""),
+                header_line,
+                truncated,
+                body.len()
+            ))
+        } else {
+            Ok(format!("HTTP {} {}\n{}{}", status.as_u16(), status.canonical_reason().unwrap_or(""), header_line, truncated))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// note
+// ---------------------------------------------------------------------------
+
+pub struct NoteTool;
+
+#[async_trait]
+impl Tool for NoteTool {
+    fn name(&self) -> &str {
+        "note"
+    }
+
+    fn description(&self) -> &str {
+        "Maintain persistent freeform notes in .jancode-notes.md in the working\n\
+         directory. Actions: 'create' (overwrite with content, optional title),\n\
+         'append' (add content), 'show' (print the file), 'clear' (empty it).\n\
+         Use it to record decisions, requirements, links, or progress that must\n\
+         survive across sessions — read your notes at the start of a task."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["create", "append", "show", "clear"], "description": "What to do." },
+                "title": { "type": "string", "description": "Optional section heading for create/append." },
+                "content": { "type": "string", "description": "Note body for create/append." }
+            },
+            "required": ["action"]
+        })
+    }
+
+    async fn execute(&self, input: &Value, ctx: &ToolContext) -> Result<String> {
+        let action = input.get("action").and_then(|v| v.as_str()).context("missing 'action'")?;
+        let file = ctx.working_dir.join(".jancode-notes.md");
+        match action {
+            "create" => {
+                let content = input.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let mut text = String::new();
+                if let Some(t) = input.get("title").and_then(|v| v.as_str()) {
+                    if !t.is_empty() {
+                        text.push_str(&format!("## {}\n\n", t));
+                    }
+                }
+                text.push_str(content);
+                tokio::fs::write(&file, text).await.with_context(|| format!("writing {}", file.display()))?;
+                Ok("notes updated (create)".to_string())
+            }
+            "append" => {
+                let content = input.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let mut text = tokio::fs::read_to_string(&file).await.unwrap_or_default();
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                if let Some(t) = input.get("title").and_then(|v| v.as_str()) {
+                    if !t.is_empty() {
+                        text.push_str(&format!("\n## {}\n\n", t));
+                    }
+                }
+                text.push_str(content);
+                tokio::fs::write(&file, text).await.with_context(|| format!("writing {}", file.display()))?;
+                Ok("notes updated (append)".to_string())
+            }
+            "show" => {
+                let text = tokio::fs::read_to_string(&file).await.with_context(|| format!("notes are empty: {}", file.display()))?;
+                Ok(text)
+            }
+            "clear" => {
+                tokio::fs::write(&file, "").await.with_context(|| format!("writing {}", file.display()))?;
+                Ok("notes cleared".to_string())
+            }
+            _ => Ok(format!("unknown note action: {}", action)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// docker
+// ---------------------------------------------------------------------------
+
+pub struct DockerTool;
+
+const DOCKER_ACTIONS: &str =
+    "ps, images, logs, inspect, stats, exec, run, build, stop, rm, pull, compose";
+
+#[async_trait]
+impl Tool for DockerTool {
+    fn name(&self) -> &str {
+        "docker"
+    }
+
+    fn description(&self) -> &str {
+        "Manage local docker containers/images. Actions:\n\
+         - ps: list containers; images: list images; stats: live usage\n\
+         - logs: show container logs (--tail); inspect: container details\n\
+         - exec: run a command inside a container (container + command)\n\
+         - run: start a container (image, name, ports, detach, command)\n\
+         - build: docker build -t tag path\n\
+         - stop: stop a container; rm: remove a container; pull: pull an image\n\
+         - compose: docker compose <command> (e.g. up -d, down, ps, logs)\n\
+         State-changing actions (exec/run/build/stop/rm/pull/compose) require\n\
+         approval; read-only actions run freely."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["ps", "images", "logs", "inspect", "stats", "exec", "run", "build", "stop", "rm", "pull", "compose"], "description": "docker operation." },
+                "container": { "type": "string", "description": "Container name or id (logs/inspect/exec/stop/rm)." },
+                "image": { "type": "string", "description": "Image name (run/pull)." },
+                "command": { "type": "string", "description": "Command to run inside the container (exec) or the container command (run)." },
+                "name": { "type": "string", "description": "Container name to assign (run, --name)." },
+                "ports": { "type": "string", "description": "Port mapping for run, e.g. '8080:80'." },
+                "detach": { "type": "boolean", "description": "Run container in the background (run, -d)." },
+                "remove": { "type": "boolean", "description": "Remove the container when it exits (run, --rm)." },
+                "tag": { "type": "string", "description": "Image tag for build (-t)." },
+                "build_path": { "type": "string", "description": "Build context path (build, default '.')." },
+                "force": { "type": "boolean", "description": "Force removal (rm, -f) or compose recreate." },
+                "tail": { "type": "integer", "description": "Log lines to show (logs, default 50)." },
+                "compose_command": { "type": "string", "description": "Sub-command for compose, e.g. 'up -d', 'down', 'ps', 'logs' (default 'ps')." }
+            },
+            "required": ["action"]
+        })
+    }
+
+    async fn execute(&self, input: &Value, ctx: &ToolContext) -> Result<String> {
+        let action = input.get("action").and_then(|v| v.as_str()).context("missing 'action'")?;
+        let arg = |name: &str| -> Result<Vec<String>, anyhow::Error> {
+            let v = input.get(name).and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+            Ok(v.map(|s| s.to_string()).into_iter().collect())
+        };
+
+        let args: Vec<String> = match action {
+            "ps" => vec!["ps".into(), "-a".into()],
+            "images" => vec!["images".into()],
+            "stats" => vec!["stats".into(), "--no-stream".into()],
+            "logs" => {
+                let mut a = vec!["logs".into(), "--tail".into()];
+                let tail = input.get("tail").and_then(|v| v.as_u64()).unwrap_or(50).to_string();
+                a.push(tail);
+                let container = arg("container")?;
+                if container.is_empty() {
+                    return Ok("docker logs: missing 'container'".to_string());
+                }
+                a.extend(container);
+                a
+            }
+            "inspect" => {
+                let container = arg("container")?;
+                if container.is_empty() {
+                    return Ok("docker inspect: missing 'container'".to_string());
+                }
+                vec!["inspect".into(), container[0].clone()]
+            }
+            "exec" => {
+                let container = arg("container")?;
+                let command = arg("command")?;
+                if container.is_empty() || command.is_empty() {
+                    return Ok("docker exec: need 'container' and 'command'".to_string());
+                }
+                vec!["exec".into(), container[0].clone(), "sh".into(), "-lc".into(), command[0].clone()]
+            }
+            "run" => {
+                let image = arg("image")?;
+                if image.is_empty() {
+                    return Ok("docker run: missing 'image'".to_string());
+                }
+                let mut a: Vec<String> = vec!["run".into()];
+                if input.get("detach").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    a.push("-d".into());
+                }
+                if input.get("remove").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    a.push("--rm".into());
+                }
+                if let Some(name) = input.get("name").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                    a.push("--name".into());
+                    a.push(name.to_string());
+                }
+                if let Some(ports) = input.get("ports").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                    a.push("-p".into());
+                    a.push(ports.to_string());
+                }
+                a.push(image[0].clone());
+                if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+                    if !cmd.trim().is_empty() {
+                        a.extend(cmd.split_whitespace().map(|s| s.to_string()));
+                    }
+                }
+                a
+            }
+            "build" => {
+                let tag = input.get("tag").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+                let path = input.get("build_path").and_then(|v| v.as_str()).unwrap_or(".").to_string();
+                let mut a = vec!["build".into()];
+                if let Some(t) = tag {
+                    a.push("-t".into());
+                    a.push(t.to_string());
+                }
+                a.push(path);
+                a
+            }
+            "stop" => {
+                let container = arg("container")?;
+                if container.is_empty() {
+                    return Ok("docker stop: missing 'container'".to_string());
+                }
+                vec!["stop".into(), container[0].clone()]
+            }
+            "rm" => {
+                let container = arg("container")?;
+                if container.is_empty() {
+                    return Ok("docker rm: missing 'container'".to_string());
+                }
+                let mut a = vec!["rm".into()];
+                if input.get("force").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    a.push("-f".into());
+                }
+                a.push(container[0].clone());
+                a
+            }
+            "pull" => {
+                let image = arg("image")?;
+                if image.is_empty() {
+                    return Ok("docker pull: missing 'image'".to_string());
+                }
+                vec!["pull".into(), image[0].clone()]
+            }
+            "compose" => {
+                let sub = input.get("compose_command").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("ps");
+                vec!["compose".into(), sub.to_string()]
+            }
+            _ => return Ok(format!("unknown docker action: {} (available: {})", action, DOCKER_ACTIONS)),
+        };
+
+        DockerTool::run_docker(ctx, args).await
+    }
+}
+
+impl DockerTool {
+    async fn run_docker(ctx: &ToolContext, args: Vec<String>) -> Result<String> {
+        run_cli("docker", ctx, args, 120, &[]).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sql
+// ---------------------------------------------------------------------------
+
+pub struct SqlTool;
+
+#[async_trait]
+impl Tool for SqlTool {
+    fn name(&self) -> &str {
+        "sql"
+    }
+
+    fn description(&self) -> &str {
+        "Run a SQL query against a database. 'db' is optional and can be:\n\
+         - a sqlite file path (e.g. 'app.db' or 'sqlite:/abs/path.db')\n\
+         - a postgres://user:pass@host/db URL (uses the psql binary)\n\
+         - a mysql://user:pass@host/db URL (uses the mysql binary)\n\
+         When 'db' is omitted the config [database] url is used. Read-only\n\
+         queries (SELECT/WITH/SHOW/EXPLAIN/DESCRIBE/PRAGMA) run freely; any\n\
+         other statement (INSERT/UPDATE/DELETE/DDL) requires approval."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "The SQL statement to execute." },
+                "db": { "type": "string", "description": "Connection target (sqlite path, postgres://, or mysql:// URL). Defaults to config [database] url." }
+            },
+            "required": ["query"]
+        })
+    }
+
+    async fn execute(&self, input: &Value, ctx: &ToolContext) -> Result<String> {
+        let query = input.get("query").and_then(|v| v.as_str()).context("missing 'query'")?;
+        let db = match input.get("db").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            Some(d) => d.to_string(),
+            None if !ctx.database_url.is_empty() => ctx.database_url.clone(),
+            None => return Ok("sql: no database configured — pass 'db' (sqlite path, postgres://, or mysql:// URL) or set [database] url in config.toml".to_string()),
+        };
+
+        let trim_query = query.trim();
+        let mut split_at = trim_query.len();
+        for (i, ch) in trim_query.char_indices() {
+            if ch == ';' {
+                split_at = i;
+                break;
+            }
+        }
+        let first_stmt = &trim_query[..split_at];
+
+        let output = if db.starts_with("postgres://") || db.starts_with("postgresql://") {
+            let args = vec![
+                "-X".to_string(),
+                "-q".to_string(),
+                "-A".to_string(),
+                "-F".to_string(),
+                "|".to_string(),
+                "-c".to_string(),
+                first_stmt.to_string(),
+                db,
+            ];
+            run_cli("psql", ctx, args, 30, &[]).await?
+        } else if db.starts_with("mysql://") {
+            Self::run_mysql(ctx, &db, first_stmt).await?
+        } else {
+            let path = db.strip_prefix("sqlite:").unwrap_or(&db);
+            let full = ctx.resolve_path(path);
+            let args = vec![
+                "-header".to_string(),
+                "-separator".to_string(),
+                "|".to_string(),
+                full.display().to_string(),
+                first_stmt.to_string(),
+            ];
+            run_cli("sqlite3", ctx, args, 30, &[]).await?
+        };
+
+        let truncated: String = output.chars().take(20000).collect();
+        if truncated.len() < output.len() {
+            Ok(format!("{}\n\n[truncated: {} bytes total]", truncated, output.len()))
+        } else {
+            Ok(truncated)
+        }
+    }
+}
+
+impl SqlTool {
+    async fn run_mysql(ctx: &ToolContext, url: &str, stmt: &str) -> Result<String> {
+        let (host, user, pass, db) = parse_mysql_url(url)
+            .ok_or_else(|| anyhow::anyhow!("invalid mysql URL — expected mysql://user:pass@host[:port]/dbname"))?;
+        if db.is_empty() {
+            return Ok("sql: mysql URL needs a database name (mysql://user:pass@host/db)".to_string());
+        }
+        let mut args = vec![
+            "--batch".to_string(),
+            "-h".to_string(),
+            host,
+            "-u".to_string(),
+            user,
+            "-e".to_string(),
+            stmt.to_string(),
+            db,
+        ];
+        let env: Vec<(&str, &str)> = if pass.is_empty() {
+            Vec::new()
+        } else {
+            // MYSQL_PWD avoids exposing the password in the process list.
+            vec![("MYSQL_PWD", pass.as_str())]
+        };
+        run_cli("mysql", ctx, args, 30, &env).await
+    }
+}
+
+fn parse_mysql_url(url: &str) -> Option<(String, String, String, String)> {
+    let rest = url.strip_prefix("mysql://")?;
+    let (auth, hostport) = match rest.split_once('@') {
+        Some((a, h)) => (a, h),
+        None => (rest, rest),
+    };
+    let (user, pass) = match auth.split_once(':') {
+        Some((u, p)) => (u.to_string(), p.to_string()),
+        None => (auth.to_string(), String::new()),
+    };
+    let (hostpart, db) = match hostport.split_once('/') {
+        Some((h, d)) => (h, d.split('?').next().unwrap_or("").to_string()),
+        None => (hostport, String::new()),
+    };
+    let host = hostpart.split(':').next().unwrap_or(hostpart).to_string();
+    Some((host, user, pass, db))
+}
+
+/// Heuristic: is this statement read-only (approval-free)? Leading keywords
+/// that only read data / metadata.
+pub fn sql_is_read_only(query: &str) -> bool {
+    let q = query.trim_start().to_uppercase();
+    ["SELECT", "WITH", "SHOW", "EXPLAIN", "DESCRIBE", "DESC", "PRAGMA"]
+        .iter()
+        .any(|kw| q.starts_with(kw))
 }
 
 #[cfg(test)]
@@ -1361,5 +1917,31 @@ mod tests {
         assert_eq!(files[0].hunks.len(), 1);
         assert_eq!(files[1].old_path, None);
         assert_eq!(files[1].new_path.as_deref(), Some("new.txt"));
+    }
+
+    #[test]
+    fn sql_read_only_detection() {
+        assert!(sql_is_read_only("SELECT * FROM users"));
+        assert!(sql_is_read_only("  select id from users limit 5"));
+        assert!(sql_is_read_only("WITH recent AS (SELECT 1) SELECT * FROM recent"));
+        assert!(sql_is_read_only("SHOW TABLES"));
+        assert!(sql_is_read_only("EXPLAIN SELECT 1"));
+        assert!(sql_is_read_only("PRAGMA table_info(users)"));
+        assert!(!sql_is_read_only("INSERT INTO users VALUES (1)"));
+        assert!(!sql_is_read_only("update users set name='x'"));
+        assert!(!sql_is_read_only("DELETE FROM users"));
+        assert!(!sql_is_read_only("CREATE TABLE t (id int)"));
+        assert!(!sql_is_read_only("DROP TABLE users"));
+    }
+
+    #[test]
+    fn parses_mysql_url() {
+        let (host, user, pass, db) = parse_mysql_url("mysql://alice:s3cret@db.internal:3306/appdb").unwrap();
+        assert_eq!(host, "db.internal");
+        assert_eq!(user, "alice");
+        assert_eq!(pass, "s3cret");
+        assert_eq!(db, "appdb");
+        assert!(parse_mysql_url("mysql://:3306/nodb").is_some());
+        assert!(parse_mysql_url("postgres://a:b@h/d").is_none());
     }
 }

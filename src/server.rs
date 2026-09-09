@@ -227,6 +227,7 @@ async fn handle_client(
 
                 let ctx = crate::tools::ToolContext {
                     working_dir: std::path::PathBuf::from(&working_dir),
+                    database_url: cfg.database.url.clone(),
                 };
 
                 let mut done_sent = false;
@@ -266,8 +267,10 @@ async fn handle_client(
                         .collect::<Vec<_>>()
                         .join("\n");
 
+                        let instructions = crate::agents::load_instructions(&working_dir);
+
                         let result = crate::provider::send_message(
-                        &cfg, &session_model, &msgs, tool_defs_ref, &memory_context,
+                        &cfg, &session_model, &msgs, tool_defs_ref, &memory_context, &instructions,
                     ).await;
 
                     match result {
@@ -519,6 +522,48 @@ struct ApprovalGate {
 /// Decide whether a tool call must be gated behind approval.
 fn gate_tool(name: &str, input: &Value, ctx: &ToolContext) -> Option<ApprovalGate> {
     match name {
+        "fetch_url" => None,
+        "http_request" => {
+            let method = input.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_uppercase();
+            if matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") {
+                None
+            } else {
+                Some(ApprovalGate {
+                    path: None,
+                    reason: format!("HTTP {} to {}", method, input.get("url").and_then(|v| v.as_str()).unwrap_or("<url>")),
+                })
+            }
+        }
+        "note" => None, // own bookkeeping file, like plan
+        "docker" => {
+            let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            let read_only = matches!(action, "ps" | "images" | "logs" | "inspect" | "stats");
+            if read_only {
+                None
+            } else {
+                let target = input
+                    .get("container")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| input.get("image").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                Some(ApprovalGate {
+                    path: None,
+                    reason: format!("docker {} {}", action, target).trim().to_string(),
+                })
+            }
+        }
+        "sql" => {
+            let query = input.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            if crate::tools::sql_is_read_only(query) {
+                None
+            } else {
+                let preview: String = query.chars().take(60).collect();
+                Some(ApprovalGate {
+                    path: None,
+                    reason: format!("run SQL: {}", preview),
+                })
+            }
+        }
         "git" => {
             // Read-only git actions never need approval; anything that mutates
             // the repo (add/commit/push/pull/checkout/branch -D/stash
@@ -747,7 +792,10 @@ async fn run_headless_agent(
     };
     let ctx = crate::tools::ToolContext {
         working_dir: std::path::PathBuf::from(&working_dir),
+        database_url: cfg.database.url.clone(),
     };
+
+    let instructions = crate::agents::load_instructions(&working_dir);
 
     const MAX_TOOL_LOOPS: u32 = 20;
     let mut total_text = String::new();
@@ -776,7 +824,7 @@ async fn run_headless_agent(
                 .unwrap_or_else(|| cfg.provider.default_model.clone())
         };
 
-        let events = match crate::provider::send_message(cfg, &session_model, &msgs, tool_defs_ref, "").await {
+        let events = match crate::provider::send_message(cfg, &session_model, &msgs, tool_defs_ref, "", &instructions).await {
             Ok(events) => events,
             Err(e) => {
                 let msg = format!("ERROR: {}", e);
@@ -1161,7 +1209,7 @@ mod tests {
 
     #[test]
     fn gate_logic() {
-        let ctx = ToolContext { working_dir: std::path::PathBuf::from("/work/proj") };
+        let ctx = ToolContext { working_dir: std::path::PathBuf::from("/work/proj"), database_url: String::new() };
         // write/edit/apply_patch always gate.
         assert!(gate_tool("write", &serde_json::json!({"path": "x.rs"}), &ctx).is_some());
         assert!(gate_tool("edit", &serde_json::json!({"path": "x.rs"}), &ctx).is_some());
@@ -1197,5 +1245,26 @@ mod tests {
         assert!(gate_tool("git", &serde_json::json!({"action": "merge", "branch": "main"}), &ctx).is_some());
         assert!(gate_tool("git", &serde_json::json!({"action": "rebase", "branch": "origin/main"}), &ctx).is_some());
         assert!(gate_tool("git", &serde_json::json!({"action": "reset", "mode": "hard", "ref": "HEAD~1"}), &ctx).is_some());
+        // Web + notes.
+        assert!(gate_tool("fetch_url", &serde_json::json!({"url": "https://example.com"}), &ctx).is_none());
+        assert!(gate_tool("note", &serde_json::json!({"action": "clear"}), &ctx).is_none());
+        // http_request: read methods ungated, mutating gated.
+        assert!(gate_tool("http_request", &serde_json::json!({"method": "GET", "url": "https://a.com"}), &ctx).is_none());
+        assert!(gate_tool("http_request", &serde_json::json!({"method": "HEAD", "url": "https://a.com"}), &ctx).is_none());
+        assert!(gate_tool("http_request", &serde_json::json!({"method": "post", "url": "https://a.com", "json": {}}), &ctx).is_some());
+        assert!(gate_tool("http_request", &serde_json::json!({"method": "DELETE", "url": "https://a.com/x"}), &ctx).is_some());
+        // docker: reads ungated, state changes gated.
+        assert!(gate_tool("docker", &serde_json::json!({"action": "ps"}), &ctx).is_none());
+        assert!(gate_tool("docker", &serde_json::json!({"action": "logs", "container": "web"}), &ctx).is_none());
+        assert!(gate_tool("docker", &serde_json::json!({"action": "inspect", "container": "web"}), &ctx).is_none());
+        assert!(gate_tool("docker", &serde_json::json!({"action": "exec", "container": "web", "command": "ls"}), &ctx).is_some());
+        assert!(gate_tool("docker", &serde_json::json!({"action": "run", "image": "nginx"}), &ctx).is_some());
+        assert!(gate_tool("docker", &serde_json::json!({"action": "rm", "container": "web", "force": true}), &ctx).is_some());
+        assert!(gate_tool("docker", &serde_json::json!({"action": "build", "tag": "x"}), &ctx).is_some());
+        // sql: reads ungated, writes gated.
+        assert!(gate_tool("sql", &serde_json::json!({"query": "SELECT 1"}), &ctx).is_none());
+        assert!(gate_tool("sql", &serde_json::json!({"query": "show tables"}), &ctx).is_none());
+        assert!(gate_tool("sql", &serde_json::json!({"query": "INSERT INTO t VALUES (1)"}), &ctx).is_some());
+        assert!(gate_tool("sql", &serde_json::json!({"query": "DELETE FROM t"}), &ctx).is_some());
     }
 }
