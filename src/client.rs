@@ -566,6 +566,7 @@ pub async fn connect() -> Result<()> {
                     "agentgrep".to_string(),
                     "apply_patch".to_string(),
                     "plan".to_string(),
+                    "git".to_string(),
                 ])
             } else {
                 None
@@ -605,6 +606,39 @@ pub async fn connect() -> Result<()> {
                             c.input.get("action").and_then(|v| v.as_str())
                                 .map(|s| s.to_string())
                                 .unwrap_or_default()
+                        } else if c.name == "git" {
+                            let action = c.input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                            let target: String = if matches!(action, "checkout" | "branch" | "push") {
+                                c.input.get("branch").and_then(|v| v.as_str())
+                                    .or_else(|| c.input.get("refspec").and_then(|v| v.as_str()))
+                                    .unwrap_or_default().to_string()
+                            } else if matches!(action, "merge" | "rebase") {
+                                match c.input.get("branch").and_then(|v| v.as_str()) {
+                                    Some(b) => b.to_string(),
+                                    None => {
+                                        if action == "rebase"
+                                            && c.input.get("rebase_continue").and_then(|v| v.as_bool()).unwrap_or(false)
+                                        {
+                                            "--continue".to_string()
+                                        } else {
+                                            String::new()
+                                        }
+                                    }
+                                }
+                            } else if action == "reset" {
+                                c.input.get("ref").and_then(|v| v.as_str())
+                                    .map(|s| format!("{} {}", c.input.get("mode").and_then(|v| v.as_str()).unwrap_or("mixed"), s))
+                                    .unwrap_or_default()
+                            } else if action == "add" || action == "diff" {
+                                c.input.get("path").and_then(|v| v.as_str()).unwrap_or_default().to_string()
+                            } else {
+                                String::new()
+                            };
+                            if target.is_empty() {
+                                action.to_string()
+                            } else {
+                                format!("{} {}", action, target)
+                            }
                         } else {
                             c.input.to_string()
                         };
@@ -705,6 +739,7 @@ pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool) -> Res
                 "agentgrep".to_string(),
                 "apply_patch".to_string(),
                 "plan".to_string(),
+                "git".to_string(),
             ])
         } else {
             None
@@ -740,6 +775,39 @@ pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool) -> Res
                         c.input.get("path").and_then(|v| v.as_str())
                             .map(|s| s.to_string())
                             .unwrap_or_default()
+} else if c.name == "git" {
+                        let action = c.input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                        let target: String = if matches!(action, "checkout" | "push") {
+                            c.input.get("branch").and_then(|v| v.as_str())
+                                .or_else(|| c.input.get("refspec").and_then(|v| v.as_str()))
+                                .unwrap_or_default().to_string()
+                        } else if matches!(action, "merge" | "rebase") {
+                            match c.input.get("branch").and_then(|v| v.as_str()) {
+                                Some(b) => b.to_string(),
+                                None => {
+                                    if action == "rebase"
+                                        && c.input.get("rebase_continue").and_then(|v| v.as_bool()).unwrap_or(false)
+                                    {
+                                        "--continue".to_string()
+                                    } else {
+                                        String::new()
+                                    }
+                                }
+                            }
+                        } else if action == "reset" {
+                            c.input.get("ref").and_then(|v| v.as_str())
+                                .map(|s| format!("{} {}", c.input.get("mode").and_then(|v| v.as_str()).unwrap_or("mixed"), s))
+                                .unwrap_or_default()
+                        } else if action == "add" {
+                            c.input.get("path").and_then(|v| v.as_str()).unwrap_or_default().to_string()
+                        } else {
+                            String::new()
+                        };
+                        if target.is_empty() {
+                            action.to_string()
+                        } else {
+                            format!("{} {}", action, target)
+                        }
                     } else {
                         c.input.to_string()
                     };

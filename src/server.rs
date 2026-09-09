@@ -519,6 +519,52 @@ struct ApprovalGate {
 /// Decide whether a tool call must be gated behind approval.
 fn gate_tool(name: &str, input: &Value, ctx: &ToolContext) -> Option<ApprovalGate> {
     match name {
+        "git" => {
+            // Read-only git actions never need approval; anything that mutates
+            // the repo (add/commit/push/pull/checkout/branch -D/stash
+            // save|pop|drop) requires approval in interactive mode.
+            let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            let mut mutating = matches!(
+                action,
+                "add"
+                    | "commit"
+                    | "push"
+                    | "pull"
+                    | "checkout"
+                    | "branch"
+                    | "stash"
+                    | "merge"
+                    | "rebase"
+                    | "reset"
+            );
+            if action == "branch"
+                && !input
+                    .get("delete_branch")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            {
+                mutating = false; // plain "git branch <name>" just creates a pointer
+            }
+            if action == "stash" {
+                let sa = input.get("stash_action").and_then(|v| v.as_str());
+                mutating = !matches!(sa, None | Some("list"));
+            }
+            if mutating {
+                let detail = input
+                    .get("branch")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| input.get("refspec").and_then(|v| v.as_str()))
+                    .or_else(|| input.get("ref").and_then(|v| v.as_str()))
+                    .or_else(|| input.get("message").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                Some(ApprovalGate {
+                    path: None,
+                    reason: format!("git {} {}", action, detail).trim().to_string(),
+                })
+            } else {
+                None
+            }
+        }
         "write" | "edit" => {
             let p = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
             let full = ctx.resolve_path(p);
@@ -1131,5 +1177,25 @@ mod tests {
         // bash / plan are ungated.
         assert!(gate_tool("bash", &serde_json::json!({"command": "ls"}), &ctx).is_none());
         assert!(gate_tool("plan", &serde_json::json!({"action": "show"}), &ctx).is_none());
+        // Read-only git actions are ungated.
+        assert!(gate_tool("git", &serde_json::json!({"action": "status"}), &ctx).is_none());
+        assert!(gate_tool("git", &serde_json::json!({"action": "log"}), &ctx).is_none());
+        assert!(gate_tool("git", &serde_json::json!({"action": "diff"}), &ctx).is_none());
+        assert!(gate_tool("git", &serde_json::json!({"action": "remote", "branch": "x"}), &ctx).is_none());
+        assert!(gate_tool("git", &serde_json::json!({"action": "fetch"}), &ctx).is_none());
+        assert!(gate_tool("git", &serde_json::json!({"action": "stash", "stash_action": "list"}), &ctx).is_none());
+        // Creating a branch pointer at HEAD is ungated.
+        assert!(gate_tool("git", &serde_json::json!({"action": "branch", "branch": "topic"}), &ctx).is_none());
+        // Mutating git actions are gated.
+        assert!(gate_tool("git", &serde_json::json!({"action": "add", "path": "all"}), &ctx).is_some());
+        assert!(gate_tool("git", &serde_json::json!({"action": "commit", "message": "x"}), &ctx).is_some());
+        assert!(gate_tool("git", &serde_json::json!({"action": "push"}), &ctx).is_some());
+        assert!(gate_tool("git", &serde_json::json!({"action": "pull"}), &ctx).is_some());
+        assert!(gate_tool("git", &serde_json::json!({"action": "checkout", "branch": "x"}), &ctx).is_some());
+        assert!(gate_tool("git", &serde_json::json!({"action": "branch", "branch": "old", "delete_branch": true}), &ctx).is_some());
+        assert!(gate_tool("git", &serde_json::json!({"action": "stash", "stash_action": "pop"}), &ctx).is_some());
+        assert!(gate_tool("git", &serde_json::json!({"action": "merge", "branch": "main"}), &ctx).is_some());
+        assert!(gate_tool("git", &serde_json::json!({"action": "rebase", "branch": "origin/main"}), &ctx).is_some());
+        assert!(gate_tool("git", &serde_json::json!({"action": "reset", "mode": "hard", "ref": "HEAD~1"}), &ctx).is_some());
     }
 }
