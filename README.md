@@ -263,6 +263,9 @@ jancode swarm spawn "Create style.css with a red color rule" --parent $SID --lab
 jancode swarm spawn "Create index.html with a red heading" --parent $SID --label html-maker &
 jancode swarm spawn "Create style.css with a red color rule" --parent $SID --label css-maker &
 
+# Pin a model for a specific agent (per-spawn override)
+jancode swarm spawn "Refactor the parser" --parent $SID --model free-stack
+
 # Manage swarm
 jancode swarm list                       # all members
 jancode swarm status --session $SID      # one member
