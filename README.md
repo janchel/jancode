@@ -129,10 +129,14 @@ jancode ships with these tools (plus any discovered via [MCP servers](#mcp-model
   (`create` / `append` / `complete` / `show`) so multi-step work stays on track
   across turns.
 - `git` — manage the repo in the working directory: `status`, `branch`,
-  `checkout`, `diff`, `log`, `add`, `commit`, `push`, `pull`, `remote`,
-  `stash`. Mutations (`add`/`commit`/`push`/`pull`/`checkout`) require
-  approval; read-only actions (`status`/`log`/`diff`/`branch` list/`remote`)
-  run freely.
+  `checkout`, `diff`, `log`, `add`, `commit`, `push`, `pull`, `fetch`,
+  `merge`, `rebase`, `reset`, `remote`, `stash`. Handles local sync (merge/
+  rebase/reset, including resolving conflicts from the remote) and remote
+  push/pull. Mutations (`add`/`commit`/`push`/`pull`/`checkout`/`merge`/
+  `rebase`/`reset`) require approval; read-only actions
+  (`status`/`log`/`diff`/`fetch`/remote/branch list) run freely. Conflict
+  markers can be fixed with `read`/`edit`/`apply_patch`, then
+  `git add` + `rebase --continue` (or `merge` commit) to finish.
 
 ### Approval (safe file changes)
 
@@ -147,8 +151,9 @@ resolve outside the working directory** (`read`, `list_dir`, `glob`,
   human is attached.
 - `bash` and `plan` are intentionally ungated: `bash` is the all-purpose power
   tool, and `plan` only touches its own bookkeeping file. `git` gates only the
-  mutating actions (`add`/`commit`/`push`/`pull`/`checkout`); read-only git
-  actions run without approval.
+  mutating actions (`add`/`commit`/`push`/`pull`/`checkout`/`merge`/`rebase`/
+  `reset`); read-only git actions (`status`/`log`/`diff`/`fetch`) run without
+  approval.
 
 The policy lives in `$JANCODE_HOME/config.toml` under `[server]`:
 

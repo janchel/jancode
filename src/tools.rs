@@ -1052,7 +1052,7 @@ impl Tool for PlanTool {
 pub struct GitTool;
 
 const GIT_ACTIONS: &str =
-    "status, branch, checkout, diff, log, add, commit, push, pull, remote, stash";
+    "status, branch, checkout, diff, log, add, commit, push, pull, fetch, merge, rebase, reset, remote, stash";
 
 #[async_trait]
 impl Tool for GitTool {
@@ -1071,11 +1071,17 @@ impl Tool for GitTool {
          - commit: commit staged changes with message\n\
          - push: push commits (remote, refspec; force=true to overwrite)\n\
          - pull: pull from remote (refspec optional)\n\
+         - fetch: update remote-tracking refs without merging (refspec optional)\n\
+         - merge: merge <branch> into the current branch (allow_unrelated to use\n\
+           --allow-unrelated-histories; abort=true to cancel a conflicted merge)\n\
+         - rebase: replay current branch onto <branch> (abort/continue to resolve\n\
+           conflicts step by step)\n\
+         - reset: move HEAD to <ref> (default HEAD) with mode soft|mixed|hard\n\
          - remote: list remotes\n\
          - stash: list/save/pop/drop via stash_action\n\
          Use status/diff/log before committing, commit with a clear message,\n\
-         then push. Mutations (add/commit/push/pull/checkout) ask for approval\n\
-         in the interactive chat."
+         then push. Mutations (add/commit/push/pull/merge/rebase/reset) ask for\n\
+         approval in the interactive chat."
     }
 
     fn parameters(&self) -> Value {
@@ -1084,19 +1090,24 @@ impl Tool for GitTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["status", "branch", "checkout", "diff", "log", "add", "commit", "push", "pull", "remote", "stash"],
+                    "enum": ["status", "branch", "checkout", "diff", "log", "add", "commit", "push", "pull", "fetch", "merge", "rebase", "reset", "remote", "stash"],
                     "description": "git subcommand to run."
                 },
                 "path": { "type": "string", "description": "File/pattern to add or limit diff to; 'all' stages everything." },
-                "branch": { "type": "string", "description": "Branch name (branch/checkout)." },
+                "branch": { "type": "string", "description": "Branch/ref to switch to, merge/rebase from, or report on." },
                 "create_branch": { "type": "boolean", "description": "With checkout: create then switch." },
                 "delete_branch": { "type": "boolean", "description": "With branch: delete the branch." },
-                "message": { "type": "string", "description": "Commit message (commit)." },
+                "message": { "type": "string", "description": "Commit message (commit) or stash message (stash save)." },
                 "staged": { "type": "boolean", "description": "With diff: show only staged changes (--cached)." },
                 "max": { "type": "integer", "description": "With log: number of commits (default 10)." },
                 "remote": { "type": "string", "description": "Remote name (default origin)." },
-                "refspec": { "type": "string", "description": "Refspec/remote branch for push/pull (e.g. main or main:main)." },
+                "refspec": { "type": "string", "description": "Refspec/remote branch for push/pull/fetch (e.g. main or main:main)." },
                 "force": { "type": "boolean", "description": "With push: force overwrite (use with care)." },
+                "mode": { "type": "string", "enum": ["soft", "mixed", "hard"], "description": "With reset: how far to move HEAD and the index/working tree." },
+                "ref": { "type": "string", "description": "With reset: where to move HEAD (default HEAD, e.g. HEAD~1, a commit hash, or origin/main)." },
+                "abort": { "type": "boolean", "description": "With merge/rebase: cancel the operation and return to the pre-operation state." },
+                "rebase_continue": { "type": "boolean", "description": "With rebase: continue after resolving a conflict (stage fixes, then run)." },
+                "allow_unrelated": { "type": "boolean", "description": "With merge: allow merging unrelated histories (--allow-unrelated-histories)." },
                 "stash_action": { "type": "string", "enum": ["list", "save", "pop", "drop"], "description": "Which stash operation to run when action=stash." }
             },
             "required": ["action"]
@@ -1190,6 +1201,60 @@ impl Tool for GitTool {
                 }
                 git(args).await
             }
+            "fetch" => {
+                let remote = input.get("remote").and_then(|v| v.as_str()).unwrap_or("origin");
+                let mut args = vec!["fetch", remote];
+                if let Some(rs) = input.get("refspec").and_then(|v| v.as_str()) {
+                    if !rs.is_empty() {
+                        args.push(rs);
+                    }
+                }
+                git(args).await
+            }
+            "merge" => {
+                if input.get("abort").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    return git(vec!["merge", "--abort"]).await;
+                }
+                let branch = input
+                    .get("branch")
+                    .and_then(|v| v.as_str())
+                    .context("missing 'branch' to merge")?;
+                let mut args = vec!["merge"];
+                if input.get("allow_unrelated").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    args.push("--allow-unrelated-histories");
+                }
+                args.push(branch);
+                git(args).await
+            }
+            "rebase" => {
+                if input.get("abort").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    return git(vec!["rebase", "--abort"]).await;
+                }
+                if input.get("rebase_continue").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    return git(vec!["rebase", "--continue"]).await;
+                }
+                let branch = input
+                    .get("branch")
+                    .and_then(|v| v.as_str())
+                    .context("missing 'branch' to rebase onto")?;
+                git(vec!["rebase", branch]).await
+            }
+            "reset" => {
+                let mode = input.get("mode").and_then(|v| v.as_str()).unwrap_or("mixed");
+                if !matches!(mode, "soft" | "mixed" | "hard") {
+                    return Ok(format!(
+                        "reset mode must be soft, mixed, or hard (got: {})",
+                        mode
+                    ));
+                }
+                let flag = format!("--{}", mode);
+                let mut args = vec!["reset", &flag];
+                let r = input.get("ref").and_then(|v| v.as_str()).unwrap_or("HEAD");
+                if !r.is_empty() {
+                    args.push(r);
+                }
+                git(args).await
+            }
             "remote" => git(vec!["remote", "-v"]).await,
             "stash" => {
                 let sa = input
@@ -1219,6 +1284,10 @@ impl GitTool {
         let mut child = tokio::process::Command::new("git")
             .args(&args)
             .current_dir(&ctx.working_dir)
+            // Never open an interactive editor: rebase --continue / merge reuse
+            // the original or passed message. "true" is a no-op that exits 0.
+            .env("GIT_EDITOR", "true")
+            .env("GIT_MERGE_AUTOEDIT", "no")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()

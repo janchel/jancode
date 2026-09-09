@@ -533,6 +533,9 @@ fn gate_tool(name: &str, input: &Value, ctx: &ToolContext) -> Option<ApprovalGat
                     | "checkout"
                     | "branch"
                     | "stash"
+                    | "merge"
+                    | "rebase"
+                    | "reset"
             );
             if action == "branch"
                 && !input
@@ -551,6 +554,7 @@ fn gate_tool(name: &str, input: &Value, ctx: &ToolContext) -> Option<ApprovalGat
                     .get("branch")
                     .and_then(|v| v.as_str())
                     .or_else(|| input.get("refspec").and_then(|v| v.as_str()))
+                    .or_else(|| input.get("ref").and_then(|v| v.as_str()))
                     .or_else(|| input.get("message").and_then(|v| v.as_str()))
                     .unwrap_or("");
                 Some(ApprovalGate {
@@ -1178,6 +1182,7 @@ mod tests {
         assert!(gate_tool("git", &serde_json::json!({"action": "log"}), &ctx).is_none());
         assert!(gate_tool("git", &serde_json::json!({"action": "diff"}), &ctx).is_none());
         assert!(gate_tool("git", &serde_json::json!({"action": "remote", "branch": "x"}), &ctx).is_none());
+        assert!(gate_tool("git", &serde_json::json!({"action": "fetch"}), &ctx).is_none());
         assert!(gate_tool("git", &serde_json::json!({"action": "stash", "stash_action": "list"}), &ctx).is_none());
         // Creating a branch pointer at HEAD is ungated.
         assert!(gate_tool("git", &serde_json::json!({"action": "branch", "branch": "topic"}), &ctx).is_none());
@@ -1189,5 +1194,8 @@ mod tests {
         assert!(gate_tool("git", &serde_json::json!({"action": "checkout", "branch": "x"}), &ctx).is_some());
         assert!(gate_tool("git", &serde_json::json!({"action": "branch", "branch": "old", "delete_branch": true}), &ctx).is_some());
         assert!(gate_tool("git", &serde_json::json!({"action": "stash", "stash_action": "pop"}), &ctx).is_some());
+        assert!(gate_tool("git", &serde_json::json!({"action": "merge", "branch": "main"}), &ctx).is_some());
+        assert!(gate_tool("git", &serde_json::json!({"action": "rebase", "branch": "origin/main"}), &ctx).is_some());
+        assert!(gate_tool("git", &serde_json::json!({"action": "reset", "mode": "hard", "ref": "HEAD~1"}), &ctx).is_some());
     }
 }
