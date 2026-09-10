@@ -6,7 +6,7 @@ use crate::tools::{is_outside, ToolContext};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -671,10 +671,20 @@ async fn handle_message_turn(
                                 "deny" => (false, Some(g.reason.clone())),
                                 _ => {
                                     if interactive {
-                                        // Check if this file path was already approved in this turn
-                                        // Normalize the path to handle variations like "index.html" vs "./index.html"
+                                        // Resolve path to absolute using working directory, then normalize
+                                        // This ensures "index.html", "./index.html", "/abs/index.html" all map to same cache key
                                         let path_key = g.path.clone().unwrap_or_default();
-                                        let norm_key = normalize_path_key(&path_key);
+                                        let resolved_path = if !path_key.is_empty() {
+                                            let p = Path::new(&path_key);
+                                            if p.is_relative() {
+                                                ctx.working_dir.join(p).display().to_string()
+                                            } else {
+                                                path_key
+                                            }
+                                        } else {
+                                            String::new()
+                                        };
+                                        let norm_key = normalize_path_key(&resolved_path);
                                         if !norm_key.is_empty() && approved_paths.contains(&norm_key) {
                                             info!("auto-approving {} (already approved in this turn): {}", tc.name, g.reason);
                                             (true, None)
