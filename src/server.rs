@@ -543,6 +543,29 @@ async fn handle_message_turn(
     // in this turn, so repeated edits to the same file don't re-prompt.
     let mut approved_paths: HashSet<String> = HashSet::new();
 
+    /// Extract file paths from an apply_patch patch string.
+    /// Returns a list of normalized absolute paths for files being modified.
+    let extract_patch_paths = |patch: &str| -> Vec<String> {
+        let mut paths = Vec::new();
+        for line in patch.lines() {
+            if line.starts_with("*** Update File:") || line.starts_with("--- a/") || line.starts_with("+++ b/") {
+                if let Some(path_part) = line.split(':').nth(1).or_else(|| line.split('/').nth(1)) {
+                    let path = path_part.trim().trim_start_matches("a/").trim_start_matches("b/");
+                    if !path.is_empty() {
+                        let p = Path::new(path);
+                        let absolute = if p.is_relative() {
+                            ctx.working_dir.join(p).display().to_string()
+                        } else {
+                            path.to_string()
+                        };
+                        paths.push(normalize_path_key(&absolute));
+                    }
+                }
+            }
+        }
+        paths
+    };
+
     let mut done_sent = false;
     let mut loop_iteration = 0u32;
     const MAX_TOOL_LOOPS: u32 = 20;
@@ -717,6 +740,16 @@ async fn handle_message_turn(
                                             let ok = matches!(decision, Ok(Ok(true)));
                                             if ok && !norm_key.is_empty() {
                                                 approved_paths.insert(norm_key);
+                                            }
+                                            // Also extract paths from apply_patch patches to populate cache
+                                            if ok && tc.name == "apply_patch" {
+                                                if let Some(patch) = tc.input.get("patch").and_then(|v| v.as_str()) {
+                                                    for p in extract_patch_paths(patch) {
+                                                        if !p.is_empty() {
+                                                            approved_paths.insert(p);
+                                                        }
+                                                    }
+                                                }
                                             }
                                             (ok, if ok { None } else { Some(g.reason.clone()) })
                                         }
