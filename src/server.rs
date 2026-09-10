@@ -486,18 +486,23 @@ fn gate_tool(name: &str, input: &Value, ctx: &ToolContext) -> Option<ApprovalGat
 /// by resolving to a canonical form without touching the filesystem.
 fn normalize_path_key(path: &str) -> String {
     use std::path::{Path, PathBuf};
+    let is_absolute = Path::new(path).is_absolute();
     let mut components = Vec::new();
     for comp in Path::new(path).components() {
         match comp {
             std::path::Component::Normal(name) => components.push(name.to_string_lossy().into_owned()),
-            std::path::Component::ParentDir => { components.pop(); }
+            std::path::Component::ParentDir => { if !components.is_empty() { components.pop(); } }
             std::path::Component::CurDir => {}
             std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                components.push(comp.as_os_str().to_string_lossy().into_owned());
+                // Skip RootDir/Prefix here; we'll prepend "/" if the path was absolute
             }
         }
     }
-    components.join("/")
+    let mut result = components.join("/");
+    if is_absolute {
+        result = format!("/{}", result);
+    }
+    result
 }
 
 /// Run one full `Request::Message` turn for a session: stream the provider
