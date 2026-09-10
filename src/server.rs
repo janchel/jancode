@@ -5,9 +5,9 @@ use crate::swarm::{self, Interrupt, SwarmState};
 use crate::tools::{is_outside, ToolContext};
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::RwLock;
@@ -478,7 +478,26 @@ fn gate_tool(name: &str, input: &Value, ctx: &ToolContext) -> Option<ApprovalGat
             }
         }
         _ => None,
+}
     }
+
+/// Normalize a path string for use as a cache key.
+/// Handles variations like "index.html", "./index.html", "dir/../index.html"
+/// by resolving to a canonical form without touching the filesystem.
+fn normalize_path_key(path: &str) -> String {
+    use std::path::{Path, PathBuf};
+    let mut components = Vec::new();
+    for comp in Path::new(path).components() {
+        match comp {
+            std::path::Component::Normal(name) => components.push(name.to_string_lossy().into_owned()),
+            std::path::Component::ParentDir => { components.pop(); }
+            std::path::Component::CurDir => {}
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                components.push(comp.as_os_str().to_string_lossy().into_owned());
+            }
+        }
+    }
+    components.join("/")
 }
 
 /// Run one full `Request::Message` turn for a session: stream the provider
@@ -514,6 +533,10 @@ async fn handle_message_turn(
         working_dir: std::path::PathBuf::from(&working_dir),
         database_url: cfg.database.url.clone(),
     };
+
+    // Per-turn approval cache: tracks file paths the user has already approved
+    // in this turn, so repeated edits to the same file don't re-prompt.
+    let mut approved_paths: HashSet<String> = HashSet::new();
 
     let mut done_sent = false;
     let mut loop_iteration = 0u32;
@@ -648,34 +671,46 @@ async fn handle_message_turn(
                                 "deny" => (false, Some(g.reason.clone())),
                                 _ => {
                                     if interactive {
-                                        send(w, &Event::ApprovalRequired {
-                                            id,
-                                            tool_call_id: tc.id.clone(),
-                                            tool_name: tc.name.clone(),
-                                            path: g.path.clone(),
-                                            reason: g.reason.clone(),
-                                        })
-                                        .await?;
-                                        info!("asking approval for {} ({})", tc.name, g.reason);
-                                        // The read loop routes ApprovalResponse
-                                        // here over `approvals`.
-                                        let key = format!("{}:{}", id, tc.id);
-                                        let (tx, rx) = tokio::sync::oneshot::channel();
-                                        approvals.write().await.insert(key.clone(), tx);
-                                        let decision = tokio::time::timeout(
-                                            std::time::Duration::from_secs(300),
-                                            rx,
-                                        )
-                                        .await;
-                                        approvals.write().await.remove(&key);
-                                        let ok = matches!(decision, Ok(Ok(true)));
-                                        (ok, if ok { None } else { Some(g.reason.clone()) })
+                                        // Check if this file path was already approved in this turn
+                                        // Normalize the path to handle variations like "index.html" vs "./index.html"
+                                        let path_key = g.path.clone().unwrap_or_default();
+                                        let norm_key = normalize_path_key(&path_key);
+                                        if !norm_key.is_empty() && approved_paths.contains(&norm_key) {
+                                            info!("auto-approving {} (already approved in this turn): {}", tc.name, g.reason);
+                                            (true, None)
+                                        } else {
+                                            send(w, &Event::ApprovalRequired {
+                                                id,
+                                                tool_call_id: tc.id.clone(),
+                                                tool_name: tc.name.clone(),
+                                                path: g.path.clone(),
+                                                reason: g.reason.clone(),
+                                            })
+                                            .await?;
+                                            info!("asking approval for {} ({})", tc.name, g.reason);
+                                            // The read loop routes ApprovalResponse
+                                            // here over `approvals`.
+                                            let key = format!("{}:{}", id, tc.id);
+                                            let (tx, rx) = tokio::sync::oneshot::channel();
+                                            approvals.write().await.insert(key.clone(), tx);
+                                            let decision = tokio::time::timeout(
+                                                std::time::Duration::from_secs(300),
+                                                rx,
+                                            )
+                                            .await;
+                                            approvals.write().await.remove(&key);
+                                            let ok = matches!(decision, Ok(Ok(true)));
+                                            if ok && !norm_key.is_empty() {
+                                                approved_paths.insert(norm_key);
+                                            }
+                                            (ok, if ok { None } else { Some(g.reason.clone()) })
+                                        }
                                     } else {
                                         info!("auto-approving {} in non-interactive mode: {}", tc.name, g.reason);
                                         (true, None)
                                     }
                                 }
-                            },
+                            }
                         };
                         let result_entry = if approved {
                             match tool.execute(&tc.input, &ctx).await {
