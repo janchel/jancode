@@ -96,20 +96,117 @@ struct AccumulatedToolCall {
 /// tool calls, and a terminal Done). Supports function-calling when `tools`
 /// is provided. `model` is the model to use for this request (session model,
 /// CLI override, or the config default).
+/// How long the provider may go without sending any body bytes before we give
+/// up. This is a stall detector, not a total deadline: a slow-but-alive stream
+/// (long context, tool loops) is allowed to run however long it takes.
+/// Overridable with `JANCODE_STREAM_STALL_SECS` for diagnosis/tests.
+const STREAM_STALL_DEFAULT: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn stream_stall() -> std::time::Duration {
+    std::env::var("JANCODE_STREAM_STALL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(STREAM_STALL_DEFAULT)
+}
+
+/// Perform the POST and consume the streamed SSE body, reassembling it as a
+/// string. Unlike `.text()`, which runs a single total deadline over the whole
+/// exchange and trips on long-context generations that stream slowly, this
+/// reads chunk-by-chunk and only fails when nothing arrives for `stream_stall`.
+/// A stall is surfaced as an `Elapsed` error so the retry logic treats it as
+/// transient.
+async fn do_chat_request(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    req: &ChatRequest,
+) -> Result<String> {
+    let mut resp = client
+        .post(url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(req)
+        .send()
+        .await
+        .context("sending chat request")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = tokio::time::timeout(std::time::Duration::from_secs(30), resp.text())
+            .await
+            .unwrap_or_else(|_| Ok("(reading error body timed out)".to_string()))
+            .unwrap_or_default();
+        tracing::error!("provider error {}: {}", status, text);
+        anyhow::bail!("provider error {}: {}", status, text);
+    }
+
+    // Incremental read: append bytes to a raw buffer, splitting on newlines so
+    // the reassembled body has identical line semantics to `.text()`. Each
+    // chunk waits up to the stall window; a steady stream never hits the clock.
+    let stall = stream_stall();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut out = String::new();
+    loop {
+        let chunk = tokio::time::timeout(stall, resp.chunk())
+            .await
+            .map_err(|elapsed| {
+                anyhow::Error::new(elapsed).context(format!(
+                    "provider stream stalled: no data for {}s",
+                    stall.as_secs()
+                ))
+            })?;
+        let chunk = chunk.context("reading response body")?;
+        let Some(bytes) = chunk else { break };
+        buf.extend_from_slice(&bytes);
+        while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=pos).collect();
+            out.push_str(&String::from_utf8_lossy(&line[..line.len() - 1]));
+            out.push('\n');
+        }
+    }
+    if !buf.is_empty() {
+        out.push_str(&String::from_utf8_lossy(&buf));
+    }
+    Ok(out)
+}
+
+/// True when the failure is a transient transport problem worth retrying once:
+/// connection refused/reset, body-read stall, no-data stream stall, or a
+/// dropped connection. HTTP status errors and serialization failures are not
+/// retried.
+fn is_retryable_transport_error(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        if cause.downcast_ref::<tokio::time::error::Elapsed>().is_some() {
+            return true;
+        }
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .map(|re| re.is_timeout() || re.is_connect() || re.is_body())
+            .unwrap_or(false)
+    })
+}
+
 pub async fn send_message(
     cfg: &Config,
     model: &str,
     session_messages: &[crate::storage::Message],
     tools: Option<&[crate::tools::ToolDefinition]>,
     memory_context: &str,
+    instructions: &str,
 ) -> Result<Vec<Event>> {
     let api_key = resolve_api_key(cfg)?;
     let base_url = cfg.provider.base_url.trim_end_matches('/');
     let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(12 * 60 * 60))
+        .connect_timeout(std::time::Duration::from_secs(30))
         .build()?;
 
     let mut system = "You are a helpful AI coding agent running with full local filesystem access on the user's machine. You have tools to explore the codebase: list_dir (list a directory), glob (find files by pattern), read (read file contents), agentgrep (search file contents), bash (run shell commands), write (create/overwrite files), and edit (replace text in a file). When the user asks you to analyze or inspect a project, USE these tools to explore the working directory yourself before responding — do not ask the user for file paths or tell them you lack access. Start by calling list_dir on '.' or the current directory to discover the structure.".to_string();
+    if !instructions.is_empty() {
+        system.push_str("\n\n# Project instructions (AGENTS.md)\n");
+        system.push_str("Follow the project instructions below. They come from the repository's AGENTS.md/CLAUDE.md files and describe the project's conventions, build/test commands, and operating rules. They take precedence over generic guidance, but never override the user's direct request.\n");
+        system.push_str(instructions);
+    }
     if !memory_context.is_empty() {
         system.push_str("\n\nProject memory (facts the user has told you before; trust them unless they conflict with what you see):\n");
         system.push_str(memory_context);
@@ -179,22 +276,6 @@ pub async fn send_message(
             tracing::info!("  tool: {} - {}", td.function.name, td.function.description.chars().take(60).collect::<String>());
         }
     }
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&req)
-        .send()
-        .await
-        .context("sending chat request")?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        tracing::error!("provider error {}: {}", status, text);
-        anyhow::bail!("provider error {}: {}", status, text);
-    }
-
     let mut events = Vec::new();
     let mut full = String::new();
 
@@ -202,8 +283,26 @@ pub async fn send_message(
     // when the turn finishes.
     let mut pending: Vec<AccumulatedToolCall> = Vec::new();
 
-    let body = resp.text().await.context("reading response body")?;
-    tracing::info!("provider response body ({} bytes): {}", body.len(), body);
+    // Retry once when the failure is a transient transport problem (timeout,
+    // dropped connection, or body-read stall). The whole request is re-issued;
+    // this is safe because the provider call is just a generation, not a
+    // mutation. Non-transport errors (HTTP 4xx/5xx etc.) are surfaced as-is.
+    let body = {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match do_chat_request(&client, &url, &api_key, &req).await {
+                Ok(body) => break body,
+                Err(e) if attempt == 1 && is_retryable_transport_error(&e) => {
+                    tracing::warn!("provider transport failure: {:?}; retrying once", e);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    };
+    tracing::info!("provider response: {} lines, {} bytes", body.lines().count(), body.len());
+    tracing::debug!("provider response body: {}", body);
     for line in body.lines() {
         process_line(line, &mut events, &mut full, &mut pending);
     }

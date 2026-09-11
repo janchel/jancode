@@ -10,6 +10,17 @@ pub struct Config {
     pub server: ServerConfig,
     #[serde(default)]
     pub mcp: McpConfig,
+    #[serde(default)]
+    pub database: DatabaseConfig,
+}
+
+/// Optional database used by the `sql` tool. When a query runs without an
+/// explicit `db`, this URL is used. Supported schemes: `postgres://`,
+/// `mysql://`, or a `sqlite:`/plain file path.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DatabaseConfig {
+    #[serde(default)]
+    pub url: String,
 }
 
 /// MCP server config. Transport is currently `http-streamable` (the modern
@@ -36,6 +47,10 @@ fn default_mcp_transport() -> String {
     "http-streamable".to_string()
 }
 
+/// Stall detection for provider streaming. The provider reads chunk-by-chunk;
+/// if no chunk arrives for this duration we surface an `Elapsed` error and retry
+/// once (so a stalled long-context generation doesn't block interactive turns).
+/// Can be overridden for tests with `JANCODE_STREAM_STALL_SECS`.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ProviderConfig {
     #[serde(default = "default_base_url")]
@@ -47,7 +62,7 @@ pub struct ProviderConfig {
     #[serde(default = "default_model")]
     pub default_model: String,
     /// Optional hardcoded model catalog shown by the `/model` picker. When
-    /// empty, jancode tries the provider's OpenAI-compatible `GET /models`
+    /// empty, jancode queries the provider's OpenAI-compatible `GET /models`
     /// endpoint instead.
     #[serde(default)]
     pub models: Vec<String>,

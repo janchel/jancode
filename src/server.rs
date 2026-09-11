@@ -5,9 +5,9 @@ use crate::swarm::{self, Interrupt, SwarmState};
 use crate::tools::{is_outside, ToolContext};
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::RwLock;
@@ -21,6 +21,15 @@ type SharedSwarm = Arc<RwLock<SwarmState>>;
 /// session_id -> the owning interactive client's socket (for live push of
 /// swarm notifications like DM / broadcast / completion reports).
 type SessionClients = Arc<RwLock<HashMap<String, Arc<tokio::net::UnixStream>>>>;
+/// Writer shared between the read loop and spawned turn tasks so a `Cancel`
+/// can be processed while a turn is still streaming. Serializes event lines.
+type Socket = Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>;
+/// request id -> in-flight turn task, so `Request::Cancel` can abort it.
+type InFlight = Arc<RwLock<HashMap<u64, tokio::task::JoinHandle<()>>>>;
+/// "&lt;msg_id&gt;:&lt;tool_call_id&gt;" -> approval channel, bridging the read
+/// loop (which sees `ApprovalResponse`) to the spawned turn awaiting the
+/// human's decision.
+type Approvals = Arc<RwLock<HashMap<String, tokio::sync::oneshot::Sender<bool>>>>;
 
 pub async fn run() -> Result<()> {
     let cfg = crate::config::load()?;
@@ -105,9 +114,12 @@ async fn handle_client(
         .and_then(|dup| tokio::net::UnixStream::from_std(dup).ok())
         .map(Arc::new);
     let stream = tokio::net::UnixStream::from_std(std_stream).context("rebuilding tokio stream")?;
-    let (r, mut w) = stream.into_split();
+    let (r, w) = stream.into_split();
+    let w: Socket = Arc::new(tokio::sync::Mutex::new(w));
     let mut lines = BufReader::new(r).lines();
-    let cfg = crate::config::load()?;
+    let cfg = Arc::new(crate::config::load()?);
+    let approvals: Approvals = Arc::new(RwLock::new(HashMap::new()));
+    let in_flight: InFlight = Arc::new(RwLock::new(HashMap::new()));
     // Sessions this client registered as the interactive owner for; cleaned up
     // on disconnect so stale socket handles don't accumulate.
     let mut registered_sessions: Vec<String> = Vec::new();
@@ -119,11 +131,11 @@ async fn handle_client(
         };
         match req {
             Request::Ping { id } => {
-                send(&mut w, &Event::Pong { id }).await?;
+                send(&w, &Event::Pong { id }).await?;
             }
             Request::McpProbe { id } => {
                 let servers = crate::mcp::probe(&cfg).await;
-                send(&mut w, &Event::McpInfo { id, servers }).await?;
+                send(&w, &Event::McpInfo { id, servers }).await?;
             }
             Request::GetHistory { id, session_id: _ } => {
                 let msgs: Vec<crate::protocol::Message> = {
@@ -137,7 +149,7 @@ async fn handle_client(
                         .collect()
                 };
                 send(
-                    &mut w,
+                    &w,
                     &Event::History {
                         id,
                         messages: msgs,
@@ -215,236 +227,57 @@ async fn handle_client(
                 // Automatically remember durable facts the user mentions.
                 let _ = crate::memory::auto_capture(&content, &working_dir);
 
-                send(&mut w, &Event::Ack { id }).await?;
-                send(&mut w, &Event::Status { id: Some(id), message: "Thinking...".to_string() }).await?;
+                send(&w, &Event::Ack { id }).await?;
+                send(&w, &Event::Status { id: Some(id), message: "Thinking...".to_string() }).await?;
 
-                // Build the tool definitions to send to the provider.
-                let tool_defs: Vec<crate::tools::ToolDefinition> = tool_registry
-                    .as_ref()
-                    .map(|r| r.all().iter().map(|t| t.to_definition()).collect())
-                    .unwrap_or_default();
-                let tool_defs_ref = if tool_defs.is_empty() { None } else { Some(tool_defs.as_slice()) };
-
-                let ctx = crate::tools::ToolContext {
-                    working_dir: std::path::PathBuf::from(&working_dir),
-                };
-
-                let mut done_sent = false;
-                let mut loop_iteration = 0u32;
-                const MAX_TOOL_LOOPS: u32 = 20;
-
-                // Tool-calling loop: send message, execute tools, append results, repeat.
-                loop {
-                    loop_iteration += 1;
-                    if loop_iteration > MAX_TOOL_LOOPS {
-                        error!("tool-calling loop exceeded {} iterations, breaking", MAX_TOOL_LOOPS);
-                        send(&mut w, &Event::Error {
-                            id: Some(id),
-                            message: format!("exceeded maximum tool-calling iterations ({})", MAX_TOOL_LOOPS),
-                        }).await?;
-                        break;
-                    }
-                    // Get current conversation for provider.
-                    let msgs: Vec<crate::storage::Message> = {
-                        let s = sessions.read().await;
-                        s.get(&session_id_s).map(|e| e.messages.clone()).unwrap_or_default()
-                    };
-
-                    let session_model = {
-                        let s = sessions.read().await;
-                        s.get(&session_id_s)
-                            .map(|e| e.model.clone())
-                            .unwrap_or_else(|| cfg.provider.default_model.clone())
-                    };
-
-                    // Build memory context: recent facts relevant to the working
-                    // dir are appended to the system prompt automatically.
-                    let query = if msgs.len() >= 1 { content.clone() } else { String::new() };
-                    let memory_context = crate::memory::retrieve(&query, &working_dir, 5)
-                        .into_iter()
-                        .map(|n| format!("- {}", n.text))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-
-                        let result = crate::provider::send_message(
-                        &cfg, &session_model, &msgs, tool_defs_ref, &memory_context,
-                    ).await;
-
-                    match result {
-                        Ok(events) => {
-                            let mut assistant_text = String::new();
-                            let mut tool_calls: Vec<crate::protocol::ToolCall> = Vec::new();
-
-                            for ev in &events {
-                                match ev {
-                                    Event::TextDelta { id: _, text } => {
-                                        assistant_text.push_str(text);
-                                        send(&mut w, ev).await?;
-                                    }
-                                    Event::ToolCall { id: _, calls } => {
-                                        for c in calls {
-                                            send(&mut w, &Event::ToolCall {
-                                                id: Some(id),
-                                                calls: vec![c.clone()],
-                                            }).await?;
-                                        }
-                                        tool_calls.extend(calls.clone());
-                                    }
-                                    Event::Done { id: _ } => {}
-                                    _ => {
-                                        send(&mut w, ev).await?;
-                                    }
-                                }
-                            }
-
-                            // Persist assistant text + tool calls, then execute tools.
-                            {
-                                let mut map = sessions.write().await;
-                                if let Some(entry) = map.get_mut(&session_id_s) {
-                                    if !assistant_text.is_empty() || !tool_calls.is_empty() {
-                                        let stored_tcs: Vec<crate::storage::StoredToolCall> = tool_calls
-                                            .iter()
-                                            .map(|tc| crate::storage::StoredToolCall {
-                                                id: tc.id.clone(),
-                                                name: tc.name.clone(),
-                                                arguments: tc.input.to_string(),
-                                            })
-                                            .collect();
-                                        entry.messages.push(Message {
-                                            role: "assistant".to_string(),
-                                            content: assistant_text.clone(),
-                                            timestamp_ms: chrono::Utc::now().timestamp_millis(),
-                                            tool_calls: if stored_tcs.is_empty() { None } else { Some(stored_tcs) },
-                                            tool_call_id: None,
-                                        });
-                                    }
-                                    entry.updated_at_ms = chrono::Utc::now().timestamp_millis();
-                                    let snapshot = entry.clone();
-                                    if let Err(e) = crate::storage::save_session(&snapshot) {
-                                        error!("saving session {}: {}", session_id_s, e);
-                                    }
-                                }
-                            }
-
-                            // If no tool calls, done.
-                            if tool_calls.is_empty() {
-                                send(&mut w, &Event::Done { id: Some(id) }).await?;
-                                done_sent = true;
-                                break;
-                            }
-
-                            // Execute each tool and append results as assistant messages.
-                            let mut results: Vec<crate::protocol::ToolResultEntry> = Vec::new();
-                            for tc in &tool_calls {
-                                send(&mut w, &Event::Status { id: Some(id), message: format!("Executing tool: {}...", tc.name) }).await?;
-                                if let Some(tool) = tool_registry.as_ref().and_then(|r| r.find(&tc.name)) {
-                                    // Approval gate: file modifications and reads
-                                    // outside the workspace require consent.
-                                    let gate = gate_tool(&tc.name, &tc.input, &ctx);
-                                    let (approved, deny_reason) = match &gate {
-                                        None => (true, None),
-                                        Some(g) => match cfg.server.approve_mode.as_str() {
-                                            "auto" => (true, None),
-                                            "deny" => (false, Some(g.reason.clone())),
-                                            _ => {
-                                                if interactive {
-                                                    send(&mut w, &Event::ApprovalRequired {
-                                                        id,
-                                                        tool_call_id: tc.id.clone(),
-                                                        tool_name: tc.name.clone(),
-                                                        path: g.path.clone(),
-                                                        reason: g.reason.clone(),
-                                                    }).await?;
-                                                    info!("asking approval for {} ({})", tc.name, g.reason);
-                                                    let ok = await_approval(&mut lines, id, &tc.id).await;
-                                                    (ok, if ok { None } else { Some(g.reason.clone()) })
-                                                } else {
-                                                    info!("auto-approving {} in non-interactive mode: {}", tc.name, g.reason);
-                                                    (true, None)
-                                                }
-                                            }
-                                        },
-                                    };
-                                    let result_entry = if approved {
-                                        match tool.execute(&tc.input, &ctx).await {
-                                            Ok(s) => crate::protocol::ToolResultEntry {
-                                                tool_call_id: tc.id.clone(),
-                                                output: s,
-                                                is_error: false,
-                                            },
-                                            Err(e) => crate::protocol::ToolResultEntry {
-                                                tool_call_id: tc.id.clone(),
-                                                output: format!("ERROR: {}", e),
-                                                is_error: true,
-                                            },
-                                        }
-                                    } else {
-                                        warn!("tool denied: {} ({})", tc.name, deny_reason.as_deref().unwrap_or("no approval"));
-                                        crate::protocol::ToolResultEntry {
-                                            tool_call_id: tc.id.clone(),
-                                            output: format!("APPROVAL_DENIED: {}", deny_reason.as_deref().unwrap_or("no approval")),
-                                            is_error: true,
-                                        }
-                                    };
-                                    send(&mut w, &Event::ToolResult {
-                                        id: Some(id),
-                                        results: vec![result_entry.clone()],
-                                    }).await?;
-                                    results.push(result_entry);
-                                } else {
-                                    let err_result = crate::protocol::ToolResultEntry {
-                                        tool_call_id: tc.id.clone(),
-                                        output: format!("ERROR: tool '{}' not found", tc.name),
-                                        is_error: true,
-                                    };
-                                    send(&mut w, &Event::ToolResult {
-                                        id: Some(id),
-                                        results: vec![err_result.clone()],
-                                    }).await?;
-                                    results.push(err_result);
-                                }
-                            }
-
-                            // Append tool results to session conversation.
-                            {
-                                let mut map = sessions.write().await;
-                                if let Some(entry) = map.get_mut(&session_id_s) {
-                                    for r in &results {
-                                        entry.messages.push(Message {
-                                            role: "tool".to_string(),
-                                            content: r.output.clone(),
-                                            timestamp_ms: chrono::Utc::now().timestamp_millis(),
-                                            tool_calls: None,
-                                            tool_call_id: Some(r.tool_call_id.clone()),
-                                        });
-                                    }
-                                    entry.updated_at_ms = chrono::Utc::now().timestamp_millis();
-                                    let snapshot = entry.clone();
-                                    if let Err(e) = crate::storage::save_session(&snapshot) {
-                                        error!("saving session {}: {}", session_id_s, e);
-                                    }
-                                }
-                            }
-
-                            // Loop continues — next iteration sends the tool results to provider.
-                        }
+                // Spawn the turn as its own task so the read loop stays free to
+                // accept `Request::Cancel` (aborts this turn) and
+                // `Request::ApprovalResponse` (forwards to the gated tool)
+                // while the provider streams. This branch returns immediately;
+                // `handle_message_turn` does the heavy work.
+                let turn_w = w.clone();
+                let turn_sessions = sessions.clone();
+                let turn_approvals = approvals.clone();
+                let turn_in_flight = in_flight.clone();
+                let turn_cfg = cfg.clone();
+                let handle = tokio::spawn(async move {
+                    match handle_message_turn(
+                        &turn_w,
+                        turn_sessions,
+                        &turn_approvals,
+                        &turn_cfg,
+                        id,
+                        session_id_s,
+                        working_dir,
+                        content,
+                        tool_registry,
+                        interactive,
+                    )
+                    .await
+                    {
                         Err(e) => {
-                            eprintln!("provider error: {}", e);
-                            tracing::error!("provider call failed: {}", e);
-                            send(&mut w, &Event::Error {
-                                id: Some(id),
-                                message: e.to_string(),
-                            }).await?;
-                            break;
+                            let _ = send(&turn_w, &Event::Error { id: Some(id), message: e.to_string() }).await;
+                            let _ = send(&turn_w, &Event::Done { id: Some(id) }).await;
                         }
+                        Ok(()) => {}
                     }
-                }
-
-                if !done_sent {
-                    send(&mut w, &Event::Done { id: Some(id) }).await?;
+                    turn_in_flight.write().await.remove(&id);
+                });
+                in_flight.write().await.insert(id, handle);
+            }
+            Request::Cancel { id, session_id: _ } => {
+                if let Some(handle) = in_flight.write().await.remove(&id) {
+                    handle.abort();
+                    info!("cancelled in-flight request {} (aborted turn)", id);
+                    let _ = send(&w, &Event::Done { id: Some(id) }).await;
                 }
             }
-            Request::Cancel { .. } => {}
+            Request::ApprovalResponse { id, tool_call_id, approved, .. } => {
+                let key = format!("{}:{}", id, tool_call_id);
+                if let Some(tx) = approvals.write().await.remove(&key) {
+                    let _ = tx.send(approved);
+                }
+            }
 
             // ---- Swarm / multi-agent (jancode-style, in-process) ----
             Request::SwarmSpawn {
@@ -455,7 +288,7 @@ async fn handle_client(
                 label,
             } => {
                 handle_swarm_spawn(
-                    &mut w, id, &sessions, &swarm, &session_clients, parent_session_id,
+                    &w, id, &sessions, &swarm, &session_clients, parent_session_id,
                     &initial_message, model.as_deref(), label.as_deref(),
                 )
                 .await?;
@@ -467,7 +300,7 @@ async fn handle_client(
                 message,
             } => {
                 handle_swarm_dm(
-                    &mut w, &swarm, &session_clients, from_session_id.as_deref(),
+                    &w, &swarm, &session_clients, from_session_id.as_deref(),
                     &to_session_id, &message,
                 )
                 .await?;
@@ -478,7 +311,7 @@ async fn handle_client(
                 message,
             } => {
                 handle_swarm_broadcast(
-                    &mut w, &swarm, &session_clients, from_session_id.as_deref(), &message,
+                    &w, &swarm, &session_clients, from_session_id.as_deref(), &message,
                 )
                 .await?;
             }
@@ -487,24 +320,27 @@ async fn handle_client(
                 session_id,
                 force,
             } => {
-                handle_swarm_stop(&mut w, &swarm, id, &session_id, force).await?;
+                handle_swarm_stop(&w, &swarm, id, &session_id, force).await?;
             }
             Request::SwarmStatus { id, session_id } => {
-                handle_swarm_status(&mut w, &swarm, id, session_id.as_deref()).await?;
+                handle_swarm_status(&w, &swarm, id, session_id.as_deref()).await?;
             }
             Request::SwarmList { id } => {
-                handle_swarm_list(&mut w, &swarm, id).await?;
+                handle_swarm_list(&w, &swarm, id).await?;
             }
-            Request::ApprovalResponse { .. } => {}
         }
     }
     // Client disconnected: drop our socket registrations so notifications stop
-    // flowing to a dead handle (the sessions stay as swarm members).
+    // flowing to a dead handle (the sessions stay as swarm members), and abort
+    // any in-flight turns so their tasks don't linger after the writer dies.
     {
         let mut map = session_clients.write().await;
         for sid in &registered_sessions {
             map.remove(sid);
         }
+    }
+    for (_, h) in in_flight.write().await.drain() {
+        h.abort();
     }
     Ok(())
 }
@@ -519,6 +355,48 @@ struct ApprovalGate {
 /// Decide whether a tool call must be gated behind approval.
 fn gate_tool(name: &str, input: &Value, ctx: &ToolContext) -> Option<ApprovalGate> {
     match name {
+        "fetch_url" => None,
+        "http_request" => {
+            let method = input.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_uppercase();
+            if matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") {
+                None
+            } else {
+                Some(ApprovalGate {
+                    path: None,
+                    reason: format!("HTTP {} to {}", method, input.get("url").and_then(|v| v.as_str()).unwrap_or("<url>")),
+                })
+            }
+        }
+        "note" => None, // own bookkeeping file, like plan
+        "docker" => {
+            let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            let read_only = matches!(action, "ps" | "images" | "logs" | "inspect" | "stats");
+            if read_only {
+                None
+            } else {
+                let target = input
+                    .get("container")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| input.get("image").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                Some(ApprovalGate {
+                    path: None,
+                    reason: format!("docker {} {}", action, target).trim().to_string(),
+                })
+            }
+        }
+        "sql" => {
+            let query = input.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            if crate::tools::sql_is_read_only(query) {
+                None
+            } else {
+                let preview: String = query.chars().take(60).collect();
+                Some(ApprovalGate {
+                    path: None,
+                    reason: format!("run SQL: {}", preview),
+                })
+            }
+        }
         "git" => {
             // Read-only git actions never need approval; anything that mutates
             // the repo (add/commit/push/pull/checkout/branch -D/stash
@@ -600,40 +478,370 @@ fn gate_tool(name: &str, input: &Value, ctx: &ToolContext) -> Option<ApprovalGat
             }
         }
         _ => None,
+}
     }
+
+/// Normalize a path string for use as a cache key.
+/// Handles variations like "index.html", "./index.html", "dir/../index.html"
+/// by resolving to a canonical form without touching the filesystem.
+fn normalize_path_key(path: &str) -> String {
+    use std::path::{Path, PathBuf};
+    let is_absolute = Path::new(path).is_absolute();
+    let mut components = Vec::new();
+    for comp in Path::new(path).components() {
+        match comp {
+            std::path::Component::Normal(name) => components.push(name.to_string_lossy().into_owned()),
+            std::path::Component::ParentDir => { if !components.is_empty() { components.pop(); } }
+            std::path::Component::CurDir => {}
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                // Skip RootDir/Prefix here; we'll prepend "/" if the path was absolute
+            }
+        }
+    }
+    let mut result = components.join("/");
+    if is_absolute {
+        result = format!("/{}", result);
+    }
+    result
 }
 
-/// Read the socket until an `ApprovalResponse` matching this message + tool call
-/// arrives (up to 5 minutes), then return the user's decision. Times out -> deny.
-async fn await_approval(
-    lines: &mut tokio::io::Lines<tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>>,
-    msg_id: u64,
-    tool_call_id: &str,
-) -> bool {
-    let timeout = std::time::Duration::from_secs(300);
-    let res = tokio::time::timeout(
-        timeout,
-        async {
-            while let Some(line) = lines.next_line().await? {
-                if let Ok(req) = serde_json::from_str::<Request>(&line) {
-                    if let Request::ApprovalResponse {
-                        id,
-                        tool_call_id: tcid,
-                        approved,
-                        ..
-                    } = req
-                    {
-                        if id == msg_id && tcid == tool_call_id {
-                            return Ok::<bool, std::io::Error>(approved);
-                        }
+/// Run one full `Request::Message` turn for a session: stream the provider
+/// response, execute any tool calls (with approval gating), append results, and
+/// loop until the model stops calling tools. Lives in its own task so the read
+/// loop can accept `Request::Cancel` (which aborts us) and
+/// `Request::ApprovalResponse` (delivered through `approvals`) concurrently.
+#[allow(clippy::too_many_arguments)]
+async fn handle_message_turn(
+    w: &Socket,
+    sessions: SessionMap,
+    approvals: &Approvals,
+    cfg: &crate::config::Config,
+    id: u64,
+    session_id_s: String,
+    working_dir: String,
+    content: String,
+    tool_registry: Option<crate::tools::ToolRegistry>,
+    interactive: bool,
+) -> Result<()> {
+    // Build the tool definitions to send to the provider.
+    let tool_defs: Vec<crate::tools::ToolDefinition> = tool_registry
+        .as_ref()
+        .map(|r| r.all().iter().map(|t| t.to_definition()).collect())
+        .unwrap_or_default();
+    let tool_defs_ref = if tool_defs.is_empty() {
+        None
+    } else {
+        Some(tool_defs.as_slice())
+    };
+
+    let ctx = crate::tools::ToolContext {
+        working_dir: std::path::PathBuf::from(&working_dir),
+        database_url: cfg.database.url.clone(),
+    };
+
+    // Per-turn approval cache: tracks file paths the user has already approved
+    // in this turn, so repeated edits to the same file don't re-prompt.
+    let mut approved_paths: HashSet<String> = HashSet::new();
+
+    /// Extract file paths from an apply_patch patch string.
+    /// Returns a list of normalized absolute paths for files being modified.
+    let extract_patch_paths = |patch: &str| -> Vec<String> {
+        let mut paths = Vec::new();
+        for line in patch.lines() {
+            if line.starts_with("*** Update File:") || line.starts_with("--- a/") || line.starts_with("+++ b/") {
+                if let Some(path_part) = line.split(':').nth(1).or_else(|| line.split('/').nth(1)) {
+                    let path = path_part.trim().trim_start_matches("a/").trim_start_matches("b/");
+                    if !path.is_empty() {
+                        let p = Path::new(path);
+                        let absolute = if p.is_relative() {
+                            ctx.working_dir.join(p).display().to_string()
+                        } else {
+                            path.to_string()
+                        };
+                        paths.push(normalize_path_key(&absolute));
                     }
                 }
             }
-            Ok::<bool, std::io::Error>(false)
-        },
-    )
-    .await;
-    res.map(|r| r.unwrap_or(false)).unwrap_or(false)
+        }
+        paths
+    };
+
+    let mut done_sent = false;
+    let mut loop_iteration = 0u32;
+    const MAX_TOOL_LOOPS: u32 = 20;
+
+    // Tool-calling loop: send message, execute tools, append results, repeat.
+    loop {
+        loop_iteration += 1;
+        if loop_iteration > MAX_TOOL_LOOPS {
+            error!("tool-calling loop exceeded {} iterations, breaking", MAX_TOOL_LOOPS);
+            send(w, &Event::Error {
+                id: Some(id),
+                message: format!("exceeded maximum tool-calling iterations ({})", MAX_TOOL_LOOPS),
+            })
+            .await?;
+            break;
+        }
+
+        // Get current conversation for the provider.
+        let msgs: Vec<crate::storage::Message> = {
+            let s = sessions.read().await;
+            s.get(&session_id_s).map(|e| e.messages.clone()).unwrap_or_default()
+        };
+
+        let session_model = {
+            let s = sessions.read().await;
+            s.get(&session_id_s)
+                .map(|e| e.model.clone())
+                .unwrap_or_else(|| cfg.provider.default_model.clone())
+        };
+
+        // Memory context: durable facts relevant to the working dir are
+        // appended to the system prompt automatically.
+        let query = if msgs.len() >= 1 { content.clone() } else { String::new() };
+        let memory_context = crate::memory::retrieve(&query, &working_dir, 5)
+            .into_iter()
+            .map(|n| format!("- {}", n.text))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let instructions = crate::agents::load_instructions(&working_dir);
+
+        let result = crate::provider::send_message(
+            cfg, &session_model, &msgs, tool_defs_ref, &memory_context, &instructions,
+        )
+        .await;
+
+        match result {
+            Ok(events) => {
+                let mut assistant_text = String::new();
+                let mut tool_calls: Vec<crate::protocol::ToolCall> = Vec::new();
+
+                for ev in &events {
+                    match ev {
+                        Event::TextDelta { id: _, text } => {
+                            assistant_text.push_str(text);
+                            send(w, ev).await?;
+                        }
+                        Event::ToolCall { id: _, calls } => {
+                            for c in calls {
+                                send(w, &Event::ToolCall {
+                                    id: Some(id),
+                                    calls: vec![c.clone()],
+                                })
+                                .await?;
+                            }
+                            tool_calls.extend(calls.clone());
+                        }
+                        Event::Done { id: _ } => {}
+                        _ => {
+                            send(w, ev).await?;
+                        }
+                    }
+                }
+
+                // Persist assistant text + tool calls, then execute tools.
+                {
+                    let mut map = sessions.write().await;
+                    if let Some(entry) = map.get_mut(&session_id_s) {
+                        if !assistant_text.is_empty() || !tool_calls.is_empty() {
+                            let stored_tcs: Vec<crate::storage::StoredToolCall> = tool_calls
+                                .iter()
+                                .map(|tc| crate::storage::StoredToolCall {
+                                    id: tc.id.clone(),
+                                    name: tc.name.clone(),
+                                    arguments: tc.input.to_string(),
+                                })
+                                .collect();
+                            entry.messages.push(Message {
+                                role: "assistant".to_string(),
+                                content: assistant_text.clone(),
+                                timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                                tool_calls: if stored_tcs.is_empty() {
+                                    None
+                                } else {
+                                    Some(stored_tcs)
+                                },
+                                tool_call_id: None,
+                            });
+                        }
+                        entry.updated_at_ms = chrono::Utc::now().timestamp_millis();
+                        let snapshot = entry.clone();
+                        if let Err(e) = crate::storage::save_session(&snapshot) {
+                            error!("saving session {}: {}", session_id_s, e);
+                        }
+                    }
+                }
+
+                // If no tool calls, done.
+                if tool_calls.is_empty() {
+                    send(w, &Event::Done { id: Some(id) }).await?;
+                    done_sent = true;
+                    break;
+                }
+
+                // Execute each tool and append results as assistant messages.
+                let mut results: Vec<crate::protocol::ToolResultEntry> = Vec::new();
+                for tc in &tool_calls {
+                    send(w, &Event::Status {
+                        id: Some(id),
+                        message: format!("Executing tool: {}...", tc.name),
+                    })
+                    .await?;
+                    if let Some(tool) = tool_registry.as_ref().and_then(|r| r.find(&tc.name)) {
+                        // Approval gate: mutations and reads outside the
+                        // workspace require consent.
+                        let gate = gate_tool(&tc.name, &tc.input, &ctx);
+                        let (approved, deny_reason) = match &gate {
+                            None => (true, None),
+                            Some(g) => match cfg.server.approve_mode.as_str() {
+                                "auto" => (true, None),
+                                "deny" => (false, Some(g.reason.clone())),
+                                _ => {
+                                    if interactive {
+                                        // Resolve path to absolute using working directory, then normalize
+                                        // This ensures "index.html", "./index.html", "/abs/index.html" all map to same cache key
+                                        let path_key = g.path.clone().unwrap_or_default();
+                                        let resolved_path = if !path_key.is_empty() {
+                                            let p = Path::new(&path_key);
+                                            if p.is_relative() {
+                                                ctx.working_dir.join(p).display().to_string()
+                                            } else {
+                                                path_key
+                                            }
+                                        } else {
+                                            String::new()
+                                        };
+                                        let norm_key = normalize_path_key(&resolved_path);
+                                        if !norm_key.is_empty() && approved_paths.contains(&norm_key) {
+                                            info!("auto-approving {} (already approved in this turn): {}", tc.name, g.reason);
+                                            (true, None)
+                                        } else {
+                                            send(w, &Event::ApprovalRequired {
+                                                id,
+                                                tool_call_id: tc.id.clone(),
+                                                tool_name: tc.name.clone(),
+                                                path: g.path.clone(),
+                                                reason: g.reason.clone(),
+                                            })
+                                            .await?;
+                                            info!("asking approval for {} ({})", tc.name, g.reason);
+                                            // The read loop routes ApprovalResponse
+                                            // here over `approvals`.
+                                            let key = format!("{}:{}", id, tc.id);
+                                            let (tx, rx) = tokio::sync::oneshot::channel();
+                                            approvals.write().await.insert(key.clone(), tx);
+                                            let decision = tokio::time::timeout(
+                                                std::time::Duration::from_secs(300),
+                                                rx,
+                                            )
+                                            .await;
+                                            approvals.write().await.remove(&key);
+                                            let ok = matches!(decision, Ok(Ok(true)));
+                                            if ok && !norm_key.is_empty() {
+                                                approved_paths.insert(norm_key);
+                                            }
+                                            // Also extract paths from apply_patch patches to populate cache
+                                            if ok && tc.name == "apply_patch" {
+                                                if let Some(patch) = tc.input.get("patch").and_then(|v| v.as_str()) {
+                                                    for p in extract_patch_paths(patch) {
+                                                        if !p.is_empty() {
+                                                            approved_paths.insert(p);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            (ok, if ok { None } else { Some(g.reason.clone()) })
+                                        }
+                                    } else {
+                                        info!("auto-approving {} in non-interactive mode: {}", tc.name, g.reason);
+                                        (true, None)
+                                    }
+                                }
+                            }
+                        };
+                        let result_entry = if approved {
+                            match tool.execute(&tc.input, &ctx).await {
+                                Ok(s) => crate::protocol::ToolResultEntry {
+                                    tool_call_id: tc.id.clone(),
+                                    output: s,
+                                    is_error: false,
+                                },
+                                Err(e) => crate::protocol::ToolResultEntry {
+                                    tool_call_id: tc.id.clone(),
+                                    output: format!("ERROR: {}", e),
+                                    is_error: true,
+                                },
+                            }
+                        } else {
+                            warn!("tool denied: {} ({})", tc.name, deny_reason.as_deref().unwrap_or("no approval"));
+                            crate::protocol::ToolResultEntry {
+                                tool_call_id: tc.id.clone(),
+                                output: format!("APPROVAL_DENIED: {}", deny_reason.as_deref().unwrap_or("no approval")),
+                                is_error: true,
+                            }
+                        };
+                        send(w, &Event::ToolResult {
+                            id: Some(id),
+                            results: vec![result_entry.clone()],
+                        })
+                        .await?;
+                        results.push(result_entry);
+                    } else {
+                        let err_result = crate::protocol::ToolResultEntry {
+                            tool_call_id: tc.id.clone(),
+                            output: format!("ERROR: tool '{}' not found", tc.name),
+                            is_error: true,
+                        };
+                        send(w, &Event::ToolResult {
+                            id: Some(id),
+                            results: vec![err_result.clone()],
+                        })
+                        .await?;
+                        results.push(err_result);
+                    }
+                }
+
+                // Append tool results to session conversation.
+                {
+                    let mut map = sessions.write().await;
+                    if let Some(entry) = map.get_mut(&session_id_s) {
+                        for r in &results {
+                            entry.messages.push(Message {
+                                role: "tool".to_string(),
+                                content: r.output.clone(),
+                                timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                                tool_calls: None,
+                                tool_call_id: Some(r.tool_call_id.clone()),
+                            });
+                        }
+                        entry.updated_at_ms = chrono::Utc::now().timestamp_millis();
+                        let snapshot = entry.clone();
+                        if let Err(e) = crate::storage::save_session(&snapshot) {
+                            error!("saving session {}: {}", session_id_s, e);
+                        }
+                    }
+                }
+
+                // Loop continues — next iteration sends the tool results to provider.
+            }
+            Err(e) => {
+                eprintln!("provider error: {}", e);
+                tracing::error!("provider call failed: {}", e);
+                send(w, &Event::Error {
+                    id: Some(id),
+                    message: e.to_string(),
+                })
+                .await?;
+                break;
+            }
+        }
+    }
+
+    if !done_sent {
+        send(w, &Event::Done { id: Some(id) }).await?;
+    }
+    Ok(())
 }
 
 /// Append the assistant turn for this session (if any text was produced) and
@@ -664,8 +872,9 @@ async fn persist_assistant(sessions: &SessionMap, session_id: &str, text: &str) 
     }
 }
 
-async fn send(w: &mut tokio::net::unix::OwnedWriteHalf, ev: &Event) -> Result<()> {
+async fn send(w: &Socket, ev: &Event) -> Result<()> {
     let data = serde_json::to_string(ev)?;
+    let mut w = w.lock().await;
     w.write_all(data.as_bytes()).await?;
     w.write_all(b"\n").await?;
     w.flush().await?;
@@ -747,7 +956,10 @@ async fn run_headless_agent(
     };
     let ctx = crate::tools::ToolContext {
         working_dir: std::path::PathBuf::from(&working_dir),
+        database_url: cfg.database.url.clone(),
     };
+
+    let instructions = crate::agents::load_instructions(&working_dir);
 
     const MAX_TOOL_LOOPS: u32 = 20;
     let mut total_text = String::new();
@@ -776,7 +988,7 @@ async fn run_headless_agent(
                 .unwrap_or_else(|| cfg.provider.default_model.clone())
         };
 
-        let events = match crate::provider::send_message(cfg, &session_model, &msgs, tool_defs_ref, "").await {
+        let events = match crate::provider::send_message(cfg, &session_model, &msgs, tool_defs_ref, "", &instructions).await {
             Ok(events) => events,
             Err(e) => {
                 let msg = format!("ERROR: {}", e);
@@ -882,7 +1094,7 @@ async fn run_headless_agent(
 
 /// Spawn a new headless agent session and run its initial message.
 async fn handle_swarm_spawn(
-    w: &mut tokio::net::unix::OwnedWriteHalf,
+    w: &Socket,
     req_id: u64,
     sessions: &SessionMap,
     swarm: &SharedSwarm,
@@ -934,7 +1146,7 @@ async fn handle_swarm_spawn(
         sw.update_status(&session_id, "running", Some(initial_message.to_string()));
     }
 
-    send(&mut *w, &Event::Spawned {
+    send(w, &Event::Spawned {
         id: req_id,
         new_session_id: session_id.clone(),
         label: label.map(String::from),
@@ -987,7 +1199,7 @@ async fn handle_swarm_spawn(
 
 /// Deliver a direct message to another session as a soft interrupt.
 async fn handle_swarm_dm(
-    w: &mut tokio::net::unix::OwnedWriteHalf,
+    w: &Socket,
     swarm: &SharedSwarm,
     session_clients: &SessionClients,
     from_session_id: Option<&str>,
@@ -1014,7 +1226,7 @@ async fn handle_swarm_dm(
     )
     .await;
     send(
-        &mut *w,
+        w,
         &swarm::interrupt_event(
             from_session_id,
             crate::protocol::NotificationType::Dm,
@@ -1027,7 +1239,7 @@ async fn handle_swarm_dm(
 
 /// Broadcast a message to every member of the swarm.
 async fn handle_swarm_broadcast(
-    _w: &mut tokio::net::unix::OwnedWriteHalf,
+    _w: &Socket,
     swarm: &SharedSwarm,
     session_clients: &SessionClients,
     from_session_id: Option<&str>,
@@ -1070,7 +1282,7 @@ async fn handle_swarm_broadcast(
 /// Stop a session. `force` is required to stop a session outside the caller's
 /// spawn subtree (mirrors jancode's stop permissions).
 async fn handle_swarm_stop(
-    w: &mut tokio::net::unix::OwnedWriteHalf,
+    w: &Socket,
     swarm: &SharedSwarm,
     id: u64,
     session_id: &str,
@@ -1085,7 +1297,7 @@ async fn handle_swarm_stop(
     };
     if !ok && !force {
         send(
-            &mut *w,
+            w,
             &Event::Error {
                 id: Some(id),
                 message: format!(
@@ -1102,14 +1314,14 @@ async fn handle_swarm_stop(
         sw.remove_member(session_id);
         sw.update_status(session_id, "stopped", None);
     }
-    send(&mut *w, &Event::Stopped { id, session_id: session_id.to_string() }).await?;
+    send(w, &Event::Stopped { id, session_id: session_id.to_string() }).await?;
     Ok(())
 
 }
 
 /// Return the live status of one member, or the requesting session itself.
 async fn handle_swarm_status(
-    w: &mut tokio::net::unix::OwnedWriteHalf,
+    w: &Socket,
     swarm: &SharedSwarm,
     id: u64,
     session_id: Option<&str>,
@@ -1120,7 +1332,7 @@ async fn handle_swarm_status(
     if let Some(sid) = target {
         if let Some(m) = sw.get_member(sid) {
             send(
-                &mut *w,
+                w,
                 &Event::MemberStatus {
                     id,
                     session_id: sid.to_string(),
@@ -1134,7 +1346,7 @@ async fn handle_swarm_status(
         }
     }
     send(
-        &mut *w,
+        w,
         &Event::Error {
             id: Some(id),
             message: "session not found".to_string(),
@@ -1146,12 +1358,12 @@ async fn handle_swarm_status(
 
 /// Return the full member roster.
 async fn handle_swarm_list(
-    w: &mut tokio::net::unix::OwnedWriteHalf,
+    w: &Socket,
     swarm: &SharedSwarm,
     id: u64,
 ) -> Result<()> {
     let sw = swarm.read().await;
-    send(&mut *w, &Event::MemberList { id, members: sw.member_list() }).await?;
+    send(w, &Event::MemberList { id, members: sw.member_list() }).await?;
     Ok(())
 }
 
@@ -1161,7 +1373,7 @@ mod tests {
 
     #[test]
     fn gate_logic() {
-        let ctx = ToolContext { working_dir: std::path::PathBuf::from("/work/proj") };
+        let ctx = ToolContext { working_dir: std::path::PathBuf::from("/work/proj"), database_url: String::new() };
         // write/edit/apply_patch always gate.
         assert!(gate_tool("write", &serde_json::json!({"path": "x.rs"}), &ctx).is_some());
         assert!(gate_tool("edit", &serde_json::json!({"path": "x.rs"}), &ctx).is_some());
@@ -1197,5 +1409,26 @@ mod tests {
         assert!(gate_tool("git", &serde_json::json!({"action": "merge", "branch": "main"}), &ctx).is_some());
         assert!(gate_tool("git", &serde_json::json!({"action": "rebase", "branch": "origin/main"}), &ctx).is_some());
         assert!(gate_tool("git", &serde_json::json!({"action": "reset", "mode": "hard", "ref": "HEAD~1"}), &ctx).is_some());
+        // Web + notes.
+        assert!(gate_tool("fetch_url", &serde_json::json!({"url": "https://example.com"}), &ctx).is_none());
+        assert!(gate_tool("note", &serde_json::json!({"action": "clear"}), &ctx).is_none());
+        // http_request: read methods ungated, mutating gated.
+        assert!(gate_tool("http_request", &serde_json::json!({"method": "GET", "url": "https://a.com"}), &ctx).is_none());
+        assert!(gate_tool("http_request", &serde_json::json!({"method": "HEAD", "url": "https://a.com"}), &ctx).is_none());
+        assert!(gate_tool("http_request", &serde_json::json!({"method": "post", "url": "https://a.com", "json": {}}), &ctx).is_some());
+        assert!(gate_tool("http_request", &serde_json::json!({"method": "DELETE", "url": "https://a.com/x"}), &ctx).is_some());
+        // docker: reads ungated, state changes gated.
+        assert!(gate_tool("docker", &serde_json::json!({"action": "ps"}), &ctx).is_none());
+        assert!(gate_tool("docker", &serde_json::json!({"action": "logs", "container": "web"}), &ctx).is_none());
+        assert!(gate_tool("docker", &serde_json::json!({"action": "inspect", "container": "web"}), &ctx).is_none());
+        assert!(gate_tool("docker", &serde_json::json!({"action": "exec", "container": "web", "command": "ls"}), &ctx).is_some());
+        assert!(gate_tool("docker", &serde_json::json!({"action": "run", "image": "nginx"}), &ctx).is_some());
+        assert!(gate_tool("docker", &serde_json::json!({"action": "rm", "container": "web", "force": true}), &ctx).is_some());
+        assert!(gate_tool("docker", &serde_json::json!({"action": "build", "tag": "x"}), &ctx).is_some());
+        // sql: reads ungated, writes gated.
+        assert!(gate_tool("sql", &serde_json::json!({"query": "SELECT 1"}), &ctx).is_none());
+        assert!(gate_tool("sql", &serde_json::json!({"query": "show tables"}), &ctx).is_none());
+        assert!(gate_tool("sql", &serde_json::json!({"query": "INSERT INTO t VALUES (1)"}), &ctx).is_some());
+        assert!(gate_tool("sql", &serde_json::json!({"query": "DELETE FROM t"}), &ctx).is_some());
     }
 }
