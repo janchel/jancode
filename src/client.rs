@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use std::io::Write;
 use std::process::Command;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, stdin};
 use tracing::info;
 
 /// Handle a `jancode swarm <subcommand>` CLI call.
@@ -225,12 +225,16 @@ pub async fn connect() -> Result<()> {
     let mut current_model: Option<String> = None;
     let mut models_cache: Option<Vec<String>> = None;
     let mut sessions_cache: Vec<crate::storage::Session> = Vec::new();
+
+    // Async stdin reader for non-blocking input
+    let mut stdin = BufReader::new(stdin());
+
     loop {
         let prompt_label = current_model.as_deref().unwrap_or(&default_model);
         print!("{}> ", prompt_label);
         std::io::stdout().flush()?;
         let mut raw_input = String::new();
-        let n = std::io::stdin().read_line(&mut raw_input)?;
+        let n = stdin.read_line(&mut raw_input).await?;
         if n == 0 {
             // EOF (Ctrl+D): quit the chat cleanly instead of looping forever.
             println!();
@@ -358,7 +362,7 @@ pub async fn connect() -> Result<()> {
                 print!("select model number: ");
                 std::io::stdout().flush()?;
                 let mut pick = String::new();
-                std::io::stdin().read_line(&mut pick)?;
+                stdin.read_line(&mut pick).await?;
                 match pick.trim().parse::<usize>() {
                     Ok(0) => {
                         current_model = None;
@@ -715,7 +719,7 @@ pub async fn connect() -> Result<()> {
                             eprint!("allow? [y/N] ");
                             std::io::stdout().flush()?;
                             let mut ans = String::new();
-                            let _ = std::io::stdin().read_line(&mut ans);
+                            let _ = stdin.read_line(&mut ans).await;
                             let approved = matches!(ans.trim().to_lowercase().as_str(), "y" | "yes");
                             let resp = Request::ApprovalResponse {
                                 id,
