@@ -762,12 +762,19 @@ async fn handle_message_turn(
                                             }
                                             // Also extract paths from apply_patch patches to populate cache
                                             if ok && tc.name == "apply_patch" {
+                                                info!("apply_patch approved, extracting paths from patch");
                                                 if let Some(patch) = tc.input.get("patch").and_then(|v| v.as_str()) {
-                                                    for p in extract_patch_paths(patch) {
-                                                        if !p.is_empty() {
-                                                            approved_paths.insert(p);
+                                                    let extracted = extract_patch_paths(patch);
+                                                    info!("extract_patch_paths returned: {:?}", extracted);
+                                                    for p in extracted {
+                                                        let p_clone = p.clone();
+                                                        if !p_clone.is_empty() {
+                                                            approved_paths.insert(p_clone.clone());
+                                                            info!("inserted patch path into cache: {}", p_clone);
                                                         }
                                                     }
+                                                } else {
+                                                    info!("apply_patch has no patch field in input");
                                                 }
                                             }
                                             (ok, if ok { None } else { Some(g.reason.clone()) })
