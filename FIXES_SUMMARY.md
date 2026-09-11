@@ -137,75 +137,8 @@ To view logs: Run `jancode serve` in one terminal, `jancode connect` in another.
 
 | File | Lines Changed | Purpose |
 |------|---------------|---------|
-| `src/storage.rs` | +15 | Add `approved_paths` to Session, async I/O |
-| `src/server.rs` | +80 | Per-session cache, path normalization, apply_patch extraction, debug logging |
-| `src/provider.rs` | +20 | Updated system prompt for exploration order |
+| `src/storage.rs` | +10 | Add `approved_paths` to Session, async I/O |
+| `src/server.rs` | +50 | Per-session cache, path normalization, apply_patch extraction, debug logging |
+| `src/provider.rs` | +15 | Updated system prompt for exploration order |
 
 Total: ~65 lines added, 10 deleted
-
----
-
-## Phase 1: Async Session I/O (tokio::fs)
-- **File**: `src/storage.rs`, `src/server.rs`, `src/client.rs`
-- **Changes**: All functions now `async`, uses `tokio::fs` instead of `std::fs`
-- Replaced blocking I/O with async: `create_dir_all`, `write`, `read_to_string`, `rename`, `read_dir`
-- **Result**: Non-blocking session persistence, no runtime blocking on I/O
-
-### Phase 2: Async stdin (tokio::io)
-- **File**: `src/client.rs`
-- **Changes**: 
-  - Added `tokio::io::stdin()` with `AsyncBufReadExt`
-  - Created `BufReader::new(stdin())` at `connect()` start
-  - Replaced 3 blocking `std::io::stdin().read_line()` with async `.read_line().await`
-  - Locations: main input loop, model selection, approval prompt
-
-### Phase 3: Parallel Read-Only Tools (Planned)
-- **File**: `src/server.rs`
-- **Plan**: Parallel execution for read-only tools (`read`, `glob`, `fetch_url`, `sql` SELECT)
-- Safe parallelization: read-only tools only, no write-after-read conflicts
-
-### Phase 4: Session Copy Optimization (Planned)
-- **File**: `src/server.rs`
-- **Plan**: Use `Arc<Vec<Message>>` for shared immutable history, copy-on-write
-
----
-
-## Latest Updates (Sept 2026)
-
-### Stronger System Prompt (`src/provider.rs`)
-- **File**: `src/provider.rs`
-- **Changes**: Added CRITICAL RULES with explicit VIOLATION EXAMPLES (❌) and CORRECT WORKFLOW (✅)
-- Forceful language: "NEVER read all files in a directory", "ALWAYS start with list_dir"
-- Explicit DO/DON'T examples to prevent AI from reading all files upfront
-
-### Enhanced Approval Cache Debug Logging (`src/server.rs`)
-- **File**: `src/server.rs`
-- **Changes**: Added comprehensive debug logging:
-  - Cache load: `loaded approval cache for session <id>: N paths`
-  - Approval check: `approval check: tool=edit path_key=... norm_key=... cache_size=X cache_contains=true/false`
-  - Auto-approve: `auto-approving edit (already approved in this session): ...`
-  - Cache insertion: `inserted into approval cache: norm_key=... cache_size=X`
-  - Patch extraction: `extract_patch_paths: found path=... absolute=... norm=...`
-  - Patch cache insertion: `inserted patch path into cache: /abs/path/index.html`
-  - Cache save: `saving approval cache for session <id>: X paths`
-
-### apply_patch Cache Population Fix (`src/server.rs`)
-- **File**: `src/server.rs`
-- **Changes**: 
-  - `apply_patch` approval now extracts paths from patch and populates cache
-  - Debug logging for patch extraction and cache insertion
-  - Fixed borrow checker issues in logging
-
----
-
-## Files Changed Summary (Updated)
-
-| File | Lines Changed | Purpose |
-|------|---------------|---------|
-| `src/storage.rs` | +15 | Add `approved_paths` to Session, async I/O (Phase 1) |
-| `src/server.rs` | +80 | Per-session cache, path normalization, apply_patch extraction, debug logging, async I/O |
-| `src/provider.rs` | +20 | Stronger system prompt with CRITICAL RULES |
-| `src/client.rs` | +10 | Async stdin (Phase 2) |
-| `Cargo.toml` | +1 | reqwest `stream` feature |
-
-Total: ~140 lines added, 15 deleted

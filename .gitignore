@@ -16,7 +16,6 @@ changelog
 changelog*
 CHANGELOG.md
 CHANGELOG*
-FIXES_SUMMARY.md
 
 # Secrets & credentials — never commit these
 .env
