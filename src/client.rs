@@ -466,7 +466,7 @@ pub async fn connect() -> Result<()> {
         }
         if input == "/session" {
             let cwd = std::env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-            let all = crate::storage::list_sessions()
+            let all = crate::storage::list_sessions().await
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|s| s.working_dir == cwd)

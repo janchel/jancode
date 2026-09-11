@@ -43,7 +43,7 @@ pub async fn run() -> Result<()> {
     info!("jancode daemon listening on {}", socket_path.display());
 
     let sessions: SessionMap = Arc::new(RwLock::new(HashMap::new()));
-    for s in list_sessions()? {
+    for s in crate::storage::list_sessions().await? {
         sessions.write().await.insert(s.id.clone(), s);
     }
 
@@ -667,7 +667,7 @@ async fn handle_message_turn(
                         }
                         entry.updated_at_ms = chrono::Utc::now().timestamp_millis();
                         let snapshot = entry.clone();
-                        if let Err(e) = crate::storage::save_session(&snapshot) {
+                        if let Err(e) = crate::storage::save_session(&snapshot).await {
                             error!("saving session {}: {}", session_id_s, e);
                         }
                     }
@@ -817,7 +817,7 @@ async fn handle_message_turn(
                         }
                         entry.updated_at_ms = chrono::Utc::now().timestamp_millis();
                         let snapshot = entry.clone();
-                        if let Err(e) = crate::storage::save_session(&snapshot) {
+                        if let Err(e) = crate::storage::save_session(&snapshot).await {
                             error!("saving session {}: {}", session_id_s, e);
                         }
                     }
@@ -862,7 +862,7 @@ async fn persist_assistant(sessions: &SessionMap, session_id: &str, text: &str) 
         entry.updated_at_ms = chrono::Utc::now().timestamp_millis();
         let snapshot = entry.clone();
         drop(map);
-        if let Err(e) = save_session(&snapshot) {
+        if let Err(e) = crate::storage::save_session(&snapshot).await {
             error!("saving session {}: {}", session_id, e);
         } else {
             tracing::info!("saved session {} ({} messages)", session_id, snapshot.messages.len());
@@ -1033,7 +1033,7 @@ async fn run_headless_agent(
                 }
                 entry.updated_at_ms = chrono::Utc::now().timestamp_millis();
                 let snapshot = entry.clone();
-                if let Err(e) = crate::storage::save_session(&snapshot) {
+                if let Err(e) = crate::storage::save_session(&snapshot).await {
                     error!("saving session {}: {}", session_id, e);
                 }
             }
@@ -1082,7 +1082,7 @@ async fn run_headless_agent(
                 }
                 entry.updated_at_ms = chrono::Utc::now().timestamp_millis();
                 let snapshot = entry.clone();
-                if let Err(e) = crate::storage::save_session(&snapshot) {
+                if let Err(e) = crate::storage::save_session(&snapshot).await {
                     error!("saving session {}: {}", session_id, e);
                 }
             }
