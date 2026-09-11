@@ -545,8 +545,11 @@ async fn handle_message_turn(
     let mut approved_paths: HashSet<String> = {
         let mut map = sessions.write().await;
         if let Some(entry) = map.get_mut(&session_id_s) {
-            std::mem::take(&mut entry.approved_paths)
+            let paths = std::mem::take(&mut entry.approved_paths);
+            info!("loaded approval cache for session {}: {} paths", session_id_s, paths.len());
+            paths
         } else {
+            info!("no approval cache for session {}", session_id_s);
             HashSet::new()
         }
     };
@@ -566,7 +569,9 @@ async fn handle_message_turn(
                         } else {
                             path.to_string()
                         };
-                        paths.push(normalize_path_key(&absolute));
+                        let norm = normalize_path_key(&absolute);
+                        info!("extract_patch_paths: found path={} absolute={} norm={}", path, absolute, norm);
+                        paths.push(norm);
                     }
                 }
             }
@@ -710,6 +715,7 @@ async fn handle_message_turn(
                                         // Resolve path to absolute using working directory, then normalize
                                         // This ensures "index.html", "./index.html", "/abs/index.html" all map to same cache key
                                         let path_key = g.path.clone().unwrap_or_default();
+                                        let path_key_for_log = path_key.clone();
                                         let resolved_path = if !path_key.is_empty() {
                                             let p = Path::new(&path_key);
                                             if p.is_relative() {
@@ -721,8 +727,11 @@ async fn handle_message_turn(
                                             String::new()
                                         };
                                         let norm_key = normalize_path_key(&resolved_path);
+                                        let norm_key_log = norm_key.clone();
+                                        info!("approval check: tool={} path_key={} norm_key={} cache_size={} cache_contains={}", 
+                                            tc.name, path_key_for_log, norm_key_log, approved_paths.len(), approved_paths.contains(&norm_key));
                                         if !norm_key.is_empty() && approved_paths.contains(&norm_key) {
-                                            info!("auto-approving {} (already approved in this turn): {}", tc.name, g.reason);
+                                            info!("auto-approving {} (already approved in this session): {}", tc.name, g.reason);
                                             (true, None)
                                         } else {
                                             send(w, &Event::ApprovalRequired {
@@ -747,7 +756,9 @@ async fn handle_message_turn(
                                             approvals.write().await.remove(&key);
                                             let ok = matches!(decision, Ok(Ok(true)));
                                             if ok && !norm_key.is_empty() {
+                                                let norm_key_clone = norm_key.clone();
                                                 approved_paths.insert(norm_key);
+                                                info!("inserted into approval cache: norm_key={} cache_size={}", norm_key_clone, approved_paths.len());
                                             }
                                             // Also extract paths from apply_patch patches to populate cache
                                             if ok && tc.name == "apply_patch" {
@@ -854,6 +865,7 @@ async fn handle_message_turn(
     {
         let mut map = sessions.write().await;
         if let Some(entry) = map.get_mut(&session_id_s) {
+            info!("saving approval cache for session {}: {} paths", session_id_s, approved_paths.len());
             entry.approved_paths = approved_paths;
         }
     }
