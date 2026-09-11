@@ -79,6 +79,15 @@ pub struct ServerConfig {
     ///   - "deny":   always deny risky calls.
     #[serde(default = "default_approve_mode")]
     pub approve_mode: String,
+    /// How aggressively the `bash` tool is gated when its command references
+    /// files/directories outside the working directory. Values:
+    ///   - "off":    never gate `bash` (old behavior).
+    ///   - "basic":  gate on obvious escapes (absolute paths, `~`, `$HOME`,
+    ///               `..`, leading `cd` out of the workspace). Default.
+    ///   - "strict": also gate on any `cd`, `$PWD`/`$OLDPWD` tricks, and
+    ///               commands that read env vars pointing outside.
+    #[serde(default = "default_bash_gate")]
+    pub bash_gate: String,
 }
 
 fn default_base_url() -> String {
@@ -95,6 +104,10 @@ fn default_idle_timeout() -> u64 {
 
 fn default_approve_mode() -> String {
     "prompt".to_string()
+}
+
+fn default_bash_gate() -> String {
+    "basic".to_string()
 }
 
 pub fn jancode_dir() -> PathBuf {

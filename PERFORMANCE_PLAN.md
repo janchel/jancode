@@ -112,12 +112,12 @@ let msgs = sessions.read().await.get(&id).map(|e| e.messages.clone());
 
 ## Implementation Order
 
-| Phase | Tasks | Est. Time |
-|-------|-------|-----------|
-| 1 | Async file I/O (storage) | 1-2 hrs |
-| 2 | Async stdin (client) | 1 hr |
-| 3 | Parallel read-only tools | 2-3 hrs |
-| 4 | Session copy optimization | 2-3 hrs |
+| Phase | Tasks | Est. Time | Status |
+|-------|-------|-----------|--------|
+| 1 | Async file I/O (storage) | 1-2 hrs | ✅ Done |
+| 2 | Async stdin (client) | 1 hr | ✅ Done |
+| 3 | Parallel read-only tools | 2-3 hrs | ✅ Done |
+| 4 | Session copy optimization | 2-3 hrs | ⬜ Pending |
 
 ---
 

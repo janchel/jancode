@@ -19,6 +19,9 @@ jancode is deliberately lean compared to heavier agentic CLIs. It strips away th
 - **Plain JSON, no database** — sessions and state live in JSON files, not SQLite.
 - **One HTTP client** — a single OpenAI-compatible provider client replaces 10+ vendor-specific runtimes.
 - **Daemon with idle shutdown** — a lightweight server spawns lazily on demand and exits after minutes of inactivity. No permanent background process.
+- **Parallel tool execution** — read-only tools (`read`, `list_dir`, `glob`,
+  `agentgrep`, `fetch_url`) run concurrently in a single turn, so multi-tool
+  exploration is faster than running each tool one at a time.
 - **Quiet by default** — tool activity renders as one `[tool] <name> <target>`
   line; status and tool output are suppressed so the terminal stays readable.
 - **Local-first, no telemetry** — your prompts and sessions never leave the box
@@ -42,6 +45,29 @@ builds in release mode, installs to your prefix, writes a starter
 `config.toml` into `$JANCODE_HOME` (`~/.jancode` by default), and optionally
 registers a systemd service for always-on deployment.
 
+> **Toolchain requirement.** The repo's `Cargo.lock` uses lock file **version 4**,
+> which requires **cargo ≥ 1.78**. Distro packages are often older (e.g. Ubuntu
+> 22.04 ships cargo 1.75), so install Rust via **rustup** if your system cargo is
+> too old:
+>
+> ```bash
+> curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+> . "$HOME/.cargo/env"   # or open a new shell
+> ```
+
+> **Installing to `/usr/local/bin` needs `sudo` — use `sudo -E`.** Plain `sudo`
+> resets `$HOME` and `PATH`, so the script can't find the rustup toolchain in
+> `~/.cargo/bin` and falls back to the (older) distro cargo, which fails on the
+> v4 lock file. `-E` preserves your environment so the rustup cargo is used:
+>
+> ```bash
+> sudo -E ./install.sh
+> ```
+>
+> If you'd rather avoid sudo entirely, install under a user prefix:
+> `./install.sh --prefix "$HOME/.local"` (then add `$HOME/.local/bin` to your
+> `PATH`).
+
 | Flag | Meaning |
 | --- | --- |
 | `--prefix <dir>` | Install under `<dir>/bin` (default `/usr/local/bin`) |
@@ -60,13 +86,33 @@ cargo build --release
 
 ## Run daemon
 
+**You normally don't need to start the daemon yourself.** `jancode connect` and
+`jancode run` spawn it lazily on demand, and it auto-shuts down after
+`server.idle_timeout_secs` (default 300s) of inactivity — no permanent
+background process.
+
+If you want the daemon always-on as a service, use the installer's
+`--service` flag instead of running `serve` manually:
+
+```bash
+sudo -E ./install.sh --service=system   # systemd system service
+./install.sh --service=user             # systemd user service
+```
+
+then start it with:
+
+```bash
+sudo systemctl enable --now jancode     # system service
+systemctl --user enable --now jancode   # user service
+```
+
+The `serve` command below is only for **advanced/foreground** use — e.g. running
+the daemon under a custom process manager, or overriding the default data/socket
+paths. It is not required for normal use:
+
 ```bash
 JANCODE_HOME=/data JANCODE_RUNTIME_DIR=/run/jancode ./target/release/jancode serve
 ```
-
-The daemon auto-shuts down after `server.idle_timeout_secs` (default 300s) of
-inactivity, so `run`/`connect` re-spawn it lazily instead of leaving a
-permanent background process.
 
 ## Usage
 
@@ -184,6 +230,28 @@ resolve outside the working directory** (`read`, `list_dir`, `glob`,
   mutating actions, `http_request` non-GET/HEAD methods, `docker`
   state-changing actions, and non-read-only `sql` statements all require
   approval.
+
+  **`bash` is gated when it escapes the workspace.** Because `bash` can read or
+  search anywhere on the host, jancode scans the command and asks for approval
+  when it references files or directories **outside the working directory** —
+  absolute paths (`cat /etc/hosts`), home-dir shortcuts (`ls ~/sysadmin-mcp`,
+  `cat $HOME/.claude/...`), parent-directory walks (`cd ..`, `grep -r x ../`),
+  or a leading `cd` out of the workspace. In-workspace commands (`ls`, `cargo
+  test`, `grep -r alpha src`) run freely. This is a best-effort heuristic, not
+  a sandbox — it flags obvious escapes but can't parse arbitrary shell.
+
+  The aggressiveness of this scan is controlled by `[server] bash_gate`:
+
+  ```toml
+  [server]
+  bash_gate = "basic"   # "off" | "basic" (default) | "strict"
+  ```
+
+  - `"off"` — never gate `bash` (old behavior).
+  - `"basic"` — gate on obvious escapes: absolute paths, `~`, `$HOME`, `..`,
+    and a leading `cd` out of the workspace.
+  - `"strict"` — also gate on any `cd`, `$PWD`/`$OLDPWD` references, and
+    commands that read env vars pointing outside.
 
 The policy lives in `$JANCODE_HOME/config.toml` under `[server]`:
 
@@ -341,7 +409,8 @@ rm ~/.jancode/sessions/*.json   # or $JANCODE_HOME/sessions/*
 
 ## Provider setup
 
-Set an API key for your provider:
+Set an API key for your provider — either via an environment variable or
+directly in the config:
 
 ```bash
 export OPENAI_API_KEY=sk-...
@@ -352,6 +421,9 @@ Or edit `$JANCODE_HOME/config.toml` (defaults to `~/.jancode/config.toml`):
 ```toml
 [provider]
 base_url = "https://api.openai.com/v1"
+# Option A: inline key (easiest for single-user setups)
+# api_key = "sk-..."
+# Option B: name an env var to read the key from
 api_key_env = "OPENAI_API_KEY"
 default_model = "gpt-4o-mini"
 # Optional: pin the model catalog shown by /model instead of the live GET /models
@@ -362,8 +434,23 @@ models = ["gpt-4o-mini", "gpt-4o", "gpt-5"]
 url = "sqlite:$JANCODE_HOME/scratch.db"   # or postgres://user:pass@host/db or mysql://...
 ```
 
+The key is resolved in this order: `provider.api_key` (inline) → the env var
+named by `provider.api_key_env` → `OPENAI_API_KEY`. If none is set, jancode
+errors with a clear message.
+
 `/model` bulk-switches the model mid-chat; each message uses the session's
 current model (also honored in `run --model` and `swarm spawn --model`).
+
+### Streaming stall detection
+
+jancode reads provider responses chunk-by-chunk and only fails if **no chunk
+arrives for 120 seconds** (a "stall"), rather than imposing a total deadline.
+This lets long-context generations stream slowly without timing out. Override
+the threshold for diagnosis with the `JANCODE_STREAM_STALL_SECS` env var:
+
+```bash
+JANCODE_STREAM_STALL_SECS=300 jancode connect
+```
 
 ## Core mechanics
 
@@ -379,3 +466,23 @@ current model (also honored in `run --model` and `swarm spawn --model`).
   runs inside the daemon with no external orchestrator.
 - **Soft-interrupt notifications** — completion reports from swarm agents surface
   as non-blocking notifications while you work.
+
+## Performance
+
+jancode is built on an async (tokio) runtime end-to-end, so it stays responsive
+even under load:
+
+- **Async file I/O** — session persistence (`save_session`/`load_session`/
+  `list_sessions`) uses `tokio::fs`, so disk writes never block the runtime on
+  a turn.
+- **Async stdin** — the interactive client reads input with tokio's async
+  reader, so it doesn't block the daemon while you type.
+- **Parallel read-only tools** — in a single turn, independent (read-only)
+  tools (`read`, `list_dir`, `glob`, `agentgrep`, `fetch_url`) execute
+  concurrently via `futures::join_all`, then results are reassembled in the
+  original order. Mutating tools (`write`, `edit`, `apply_patch`, `bash`,
+  `git`, `docker`, `sql`, ...) still run sequentially to avoid write-after-read
+  conflicts.
+- **Streaming stall detection** — provider responses are read chunk-by-chunk
+  with a 120s no-data stall timeout (see [Provider setup](#provider-setup)),
+  so long generations don't hit a hard deadline.

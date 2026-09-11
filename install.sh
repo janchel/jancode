@@ -155,9 +155,17 @@ idle_timeout_secs = 300
 # outside the working directory). "prompt" is interactive-only; "auto" never
 # asks; "deny" always blocks.
 # approve_mode = "prompt"
+# How aggressively the `bash` tool is gated when its command references files
+# outside the working directory. "off" never gates; "basic" gates on obvious
+# escapes (absolute paths, ~, $HOME, .., cd out); "strict" also gates on any
+# cd / $PWD / $OLDPWD.
+# bash_gate = "basic"
 
 [provider]
 base_url = "https://api.openai.com/v1"
+# Option A: inline key (easiest for single-user setups)
+# api_key = "sk-..."
+# Option B: name an env var to read the key from
 api_key_env = "OPENAI_API_KEY"
 default_model = "gpt-4o-mini"
 

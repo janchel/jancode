@@ -16,6 +16,8 @@ changelog
 changelog*
 CHANGELOG.md
 CHANGELOG*
+PERFORMANCE_PLAN.md
+FIXES_SUMMARY.md
 
 # Secrets & credentials — never commit these
 .env

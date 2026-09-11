@@ -478,6 +478,20 @@ fn gate_tool(name: &str, input: &Value, ctx: &ToolContext) -> Option<ApprovalGat
                 None
             }
         }
+        "bash" => {
+            // `bash` is the all-purpose power tool, but it can read/search
+            // anywhere on the host. Gate it when the command references files
+            // or directories outside the working directory (absolute paths,
+            // `..`, `~`, `$HOME`, `cd` out of the workspace). The
+            // `[server] bash_gate` config controls how aggressive this is.
+            let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            crate::tools::bash_escapes_workspace(command, &ctx.working_dir, &ctx.bash_gate).map(|reason| {
+                ApprovalGate {
+                    path: None,
+                    reason: format!("bash may touch outside workspace: {}", reason),
+                }
+            })
+        }
         _ => None,
 }
     }
@@ -538,6 +552,7 @@ async fn handle_message_turn(
     let ctx = crate::tools::ToolContext {
         working_dir: std::path::PathBuf::from(&working_dir),
         database_url: cfg.database.url.clone(),
+        bash_gate: cfg.server.bash_gate.clone(),
     };
 
     // Per-session approval cache: tracks file paths the user has already approved
@@ -694,138 +709,195 @@ async fn handle_message_turn(
                 }
 
                 // Execute each tool and append results as assistant messages.
-                let mut results: Vec<crate::protocol::ToolResultEntry> = Vec::new();
+                // Phase 1: resolve approvals for every tool call (may await
+                // user input). Phase 2: execute — independent (read-only)
+                // tools run concurrently, dependent tools run sequentially.
+                struct PreparedCall<'a> {
+                    tc: &'a crate::protocol::ToolCall,
+                    tool: Option<&'a dyn crate::tools::Tool>,
+                    approved: bool,
+                    deny_reason: Option<String>,
+                }
+
+                let mut prepared: Vec<PreparedCall> = Vec::new();
                 for tc in &tool_calls {
                     send(w, &Event::Status {
                         id: Some(id),
                         message: format!("Executing tool: {}...", tc.name),
                     })
                     .await?;
-                    if let Some(tool) = tool_registry.as_ref().and_then(|r| r.find(&tc.name)) {
-                        // Approval gate: mutations and reads outside the
-                        // workspace require consent.
-                        let gate = gate_tool(&tc.name, &tc.input, &ctx);
-                        let (approved, deny_reason) = match &gate {
-                            None => (true, None),
-                            Some(g) => match cfg.server.approve_mode.as_str() {
-                                "auto" => (true, None),
-                                "deny" => (false, Some(g.reason.clone())),
-                                _ => {
-                                    if interactive {
-                                        // Resolve path to absolute using working directory, then normalize
-                                        // This ensures "index.html", "./index.html", "/abs/index.html" all map to same cache key
-                                        let path_key = g.path.clone().unwrap_or_default();
-                                        let path_key_for_log = path_key.clone();
-                                        let resolved_path = if !path_key.is_empty() {
-                                            let p = Path::new(&path_key);
-                                            if p.is_relative() {
-                                                ctx.working_dir.join(p).display().to_string()
-                                            } else {
-                                                path_key
-                                            }
+                    let tool = tool_registry.as_ref().and_then(|r| r.find(&tc.name));
+                    // Approval gate: mutations and reads outside the
+                    // workspace require consent.
+                    let gate = gate_tool(&tc.name, &tc.input, &ctx);
+                    let (approved, deny_reason) = match &gate {
+                        None => (true, None),
+                        Some(g) => match cfg.server.approve_mode.as_str() {
+                            "auto" => (true, None),
+                            "deny" => (false, Some(g.reason.clone())),
+                            _ => {
+                                if interactive {
+                                    // Resolve path to absolute using working directory, then normalize
+                                    // This ensures "index.html", "./index.html", "/abs/index.html" all map to same cache key
+                                    let path_key = g.path.clone().unwrap_or_default();
+                                    let path_key_for_log = path_key.clone();
+                                    let resolved_path = if !path_key.is_empty() {
+                                        let p = Path::new(&path_key);
+                                        if p.is_relative() {
+                                            ctx.working_dir.join(p).display().to_string()
                                         } else {
-                                            String::new()
-                                        };
-                                        let norm_key = normalize_path_key(&resolved_path);
-                                        let norm_key_log = norm_key.clone();
-                                        info!("approval check: tool={} path_key={} norm_key={} cache_size={} cache_contains={}", 
-                                            tc.name, path_key_for_log, norm_key_log, approved_paths.len(), approved_paths.contains(&norm_key));
-                                        if !norm_key.is_empty() && approved_paths.contains(&norm_key) {
-                                            info!("auto-approving {} (already approved in this session): {}", tc.name, g.reason);
-                                            (true, None)
-                                        } else {
-                                            send(w, &Event::ApprovalRequired {
-                                                id,
-                                                tool_call_id: tc.id.clone(),
-                                                tool_name: tc.name.clone(),
-                                                path: g.path.clone(),
-                                                reason: g.reason.clone(),
-                                            })
-                                            .await?;
-                                            info!("asking approval for {} ({})", tc.name, g.reason);
-                                            // The read loop routes ApprovalResponse
-                                            // here over `approvals`.
-                                            let key = format!("{}:{}", id, tc.id);
-                                            let (tx, rx) = tokio::sync::oneshot::channel();
-                                            approvals.write().await.insert(key.clone(), tx);
-                                            let decision = tokio::time::timeout(
-                                                std::time::Duration::from_secs(300),
-                                                rx,
-                                            )
-                                            .await;
-                                            approvals.write().await.remove(&key);
-                                            let ok = matches!(decision, Ok(Ok(true)));
-                                            if ok && !norm_key.is_empty() {
-                                                let norm_key_clone = norm_key.clone();
-                                                approved_paths.insert(norm_key);
-                                                info!("inserted into approval cache: norm_key={} cache_size={}", norm_key_clone, approved_paths.len());
-                                            }
-                                            // Also extract paths from apply_patch patches to populate cache
-                                            if ok && tc.name == "apply_patch" {
-                                                info!("apply_patch approved, extracting paths from patch");
-                                                if let Some(patch) = tc.input.get("patch").and_then(|v| v.as_str()) {
-                                                    let extracted = extract_patch_paths(patch);
-                                                    info!("extract_patch_paths returned: {:?}", extracted);
-                                                    for p in extracted {
-                                                        let p_clone = p.clone();
-                                                        if !p_clone.is_empty() {
-                                                            approved_paths.insert(p_clone.clone());
-                                                            info!("inserted patch path into cache: {}", p_clone);
-                                                        }
-                                                    }
-                                                } else {
-                                                    info!("apply_patch has no patch field in input");
-                                                }
-                                            }
-                                            (ok, if ok { None } else { Some(g.reason.clone()) })
+                                            path_key
                                         }
                                     } else {
-                                        info!("auto-approving {} in non-interactive mode: {}", tc.name, g.reason);
+                                        String::new()
+                                    };
+                                    let norm_key = normalize_path_key(&resolved_path);
+                                    let norm_key_log = norm_key.clone();
+                                    info!("approval check: tool={} path_key={} norm_key={} cache_size={} cache_contains={}", 
+                                        tc.name, path_key_for_log, norm_key_log, approved_paths.len(), approved_paths.contains(&norm_key));
+                                    if !norm_key.is_empty() && approved_paths.contains(&norm_key) {
+                                        info!("auto-approving {} (already approved in this session): {}", tc.name, g.reason);
                                         (true, None)
+                                    } else {
+                                        send(w, &Event::ApprovalRequired {
+                                            id,
+                                            tool_call_id: tc.id.clone(),
+                                            tool_name: tc.name.clone(),
+                                            path: g.path.clone(),
+                                            reason: g.reason.clone(),
+                                        })
+                                        .await?;
+                                        info!("asking approval for {} ({})", tc.name, g.reason);
+                                        // The read loop routes ApprovalResponse
+                                        // here over `approvals`.
+                                        let key = format!("{}:{}", id, tc.id);
+                                        let (tx, rx) = tokio::sync::oneshot::channel();
+                                        approvals.write().await.insert(key.clone(), tx);
+                                        let decision = tokio::time::timeout(
+                                            std::time::Duration::from_secs(300),
+                                            rx,
+                                        )
+                                        .await;
+                                        approvals.write().await.remove(&key);
+                                        let ok = matches!(decision, Ok(Ok(true)));
+                                        if ok && !norm_key.is_empty() {
+                                            let norm_key_clone = norm_key.clone();
+                                            approved_paths.insert(norm_key);
+                                            info!("inserted into approval cache: norm_key={} cache_size={}", norm_key_clone, approved_paths.len());
+                                        }
+                                        // Also extract paths from apply_patch patches to populate cache
+                                        if ok && tc.name == "apply_patch" {
+                                            info!("apply_patch approved, extracting paths from patch");
+                                            if let Some(patch) = tc.input.get("patch").and_then(|v| v.as_str()) {
+                                                let extracted = extract_patch_paths(patch);
+                                                info!("extract_patch_paths returned: {:?}", extracted);
+                                                for p in extracted {
+                                                    let p_clone = p.clone();
+                                                    if !p_clone.is_empty() {
+                                                        approved_paths.insert(p_clone.clone());
+                                                        info!("inserted patch path into cache: {}", p_clone);
+                                                    }
+                                                }
+                                            } else {
+                                                info!("apply_patch has no patch field in input");
+                                            }
+                                        }
+                                        (ok, if ok { None } else { Some(g.reason.clone()) })
                                     }
+                                } else {
+                                    info!("auto-approving {} in non-interactive mode: {}", tc.name, g.reason);
+                                    (true, None)
                                 }
                             }
-                        };
-                        let result_entry = if approved {
-                            match tool.execute(&tc.input, &ctx).await {
-                                Ok(s) => crate::protocol::ToolResultEntry {
-                                    tool_call_id: tc.id.clone(),
+                        }
+                    };
+                    prepared.push(PreparedCall { tc, tool, approved, deny_reason });
+                }
+
+                // Phase 2a: run all approved, independent (read-only) tools
+                // concurrently, collecting results keyed by tool_call_id.
+                let mut independent_ids: Vec<String> = Vec::new();
+                let mut independent_futures: Vec<
+                    std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send>>,
+                > = Vec::new();
+                for pc in &prepared {
+                    if pc.approved {
+                        if let Some(tool) = pc.tool {
+                            if tool.is_independent() {
+                                independent_ids.push(pc.tc.id.clone());
+                                let input = pc.tc.input.clone();
+                                let ctx_owned = ctx.clone();
+                                independent_futures.push(Box::pin(async move {
+                                    tool.execute(&input, &ctx_owned).await
+                                }));
+                            }
+                        }
+                    }
+                }
+                let joined = futures::future::join_all(independent_futures).await;
+                let mut independent_results: HashMap<String, Result<String>> = HashMap::new();
+                for (id, res) in independent_ids.into_iter().zip(joined) {
+                    independent_results.insert(id, res);
+                }
+
+                // Phase 2b: assemble results in original order. Independent
+                // calls use the concurrent results; dependent / denied /
+                // missing tools run (or resolve) sequentially.
+                let mut results: Vec<crate::protocol::ToolResultEntry> = Vec::new();
+                for pc in &prepared {
+                    let result_entry = if !pc.approved {
+                        warn!("tool denied: {} ({})", pc.tc.name, pc.deny_reason.as_deref().unwrap_or("no approval"));
+                        crate::protocol::ToolResultEntry {
+                            tool_call_id: pc.tc.id.clone(),
+                            output: format!("APPROVAL_DENIED: {}", pc.deny_reason.as_deref().unwrap_or("no approval")),
+                            is_error: true,
+                        }
+                    } else if let Some(tool) = pc.tool {
+                        if tool.is_independent() {
+                            match independent_results.remove(&pc.tc.id) {
+                                Some(Ok(s)) => crate::protocol::ToolResultEntry {
+                                    tool_call_id: pc.tc.id.clone(),
                                     output: s,
                                     is_error: false,
                                 },
-                                Err(e) => crate::protocol::ToolResultEntry {
-                                    tool_call_id: tc.id.clone(),
+                                Some(Err(e)) => crate::protocol::ToolResultEntry {
+                                    tool_call_id: pc.tc.id.clone(),
                                     output: format!("ERROR: {}", e),
+                                    is_error: true,
+                                },
+                                None => crate::protocol::ToolResultEntry {
+                                    tool_call_id: pc.tc.id.clone(),
+                                    output: "ERROR: independent tool produced no result".to_string(),
                                     is_error: true,
                                 },
                             }
                         } else {
-                            warn!("tool denied: {} ({})", tc.name, deny_reason.as_deref().unwrap_or("no approval"));
-                            crate::protocol::ToolResultEntry {
-                                tool_call_id: tc.id.clone(),
-                                output: format!("APPROVAL_DENIED: {}", deny_reason.as_deref().unwrap_or("no approval")),
-                                is_error: true,
+                            match tool.execute(&pc.tc.input, &ctx).await {
+                                Ok(s) => crate::protocol::ToolResultEntry {
+                                    tool_call_id: pc.tc.id.clone(),
+                                    output: s,
+                                    is_error: false,
+                                },
+                                Err(e) => crate::protocol::ToolResultEntry {
+                                    tool_call_id: pc.tc.id.clone(),
+                                    output: format!("ERROR: {}", e),
+                                    is_error: true,
+                                },
                             }
-                        };
-                        send(w, &Event::ToolResult {
-                            id: Some(id),
-                            results: vec![result_entry.clone()],
-                        })
-                        .await?;
-                        results.push(result_entry);
+                        }
                     } else {
-                        let err_result = crate::protocol::ToolResultEntry {
-                            tool_call_id: tc.id.clone(),
-                            output: format!("ERROR: tool '{}' not found", tc.name),
+                        crate::protocol::ToolResultEntry {
+                            tool_call_id: pc.tc.id.clone(),
+                            output: format!("ERROR: tool '{}' not found", pc.tc.name),
                             is_error: true,
-                        };
-                        send(w, &Event::ToolResult {
-                            id: Some(id),
-                            results: vec![err_result.clone()],
-                        })
-                        .await?;
-                        results.push(err_result);
-                    }
+                        }
+                    };
+                    send(w, &Event::ToolResult {
+                        id: Some(id),
+                        results: vec![result_entry.clone()],
+                    })
+                    .await?;
+                    results.push(result_entry);
                 }
 
                 // Append tool results to session conversation.
@@ -993,6 +1065,7 @@ async fn run_headless_agent(
     let ctx = crate::tools::ToolContext {
         working_dir: std::path::PathBuf::from(&working_dir),
         database_url: cfg.database.url.clone(),
+        bash_gate: cfg.server.bash_gate.clone(),
     };
 
     let instructions = crate::agents::load_instructions(&working_dir);
@@ -1410,7 +1483,7 @@ mod tests {
 
     #[test]
     fn gate_logic() {
-        let ctx = ToolContext { working_dir: std::path::PathBuf::from("/work/proj"), database_url: String::new() };
+        let ctx = ToolContext { working_dir: std::path::PathBuf::from("/work/proj"), database_url: String::new(), bash_gate: "basic".to_string() };
         // write/edit/apply_patch always gate.
         assert!(gate_tool("write", &serde_json::json!({"path": "x.rs"}), &ctx).is_some());
         assert!(gate_tool("edit", &serde_json::json!({"path": "x.rs"}), &ctx).is_some());
@@ -1423,8 +1496,15 @@ mod tests {
         assert!(gate_tool("read", &serde_json::json!({"path": "/etc/passwd"}), &ctx).is_some());
         // Glob with an escaping base is gated.
         assert!(gate_tool("glob", &serde_json::json!({"pattern": "**", "path": "../"}), &ctx).is_some());
-        // bash / plan are ungated.
+        // bash: in-workspace commands are ungated, escapes are gated.
         assert!(gate_tool("bash", &serde_json::json!({"command": "ls"}), &ctx).is_none());
+        assert!(gate_tool("bash", &serde_json::json!({"command": "cargo test"}), &ctx).is_none());
+        assert!(gate_tool("bash", &serde_json::json!({"command": "grep -r alpha src"}), &ctx).is_none());
+        assert!(gate_tool("bash", &serde_json::json!({"command": "cat /etc/hosts"}), &ctx).is_some());
+        assert!(gate_tool("bash", &serde_json::json!({"command": "ls ~/sysadmin-mcp"}), &ctx).is_some());
+        assert!(gate_tool("bash", &serde_json::json!({"command": "cd .. && ls"}), &ctx).is_some());
+        assert!(gate_tool("bash", &serde_json::json!({"command": "cd /tmp && pwd"}), &ctx).is_some());
+        assert!(gate_tool("bash", &serde_json::json!({"command": "cat $HOME/.claude/settings.json"}), &ctx).is_some());
         assert!(gate_tool("plan", &serde_json::json!({"action": "show"}), &ctx).is_none());
         // Read-only git actions are ungated.
         assert!(gate_tool("git", &serde_json::json!({"action": "status"}), &ctx).is_none());
