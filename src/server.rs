@@ -210,6 +210,7 @@ async fn handle_client(
                         messages: Vec::new(),
                         created_at_ms: chrono::Utc::now().timestamp_millis(),
                         updated_at_ms: chrono::Utc::now().timestamp_millis(),
+                        approved_paths: HashSet::new(),
                     });
                     if let Some(ref m) = model {
                         entry.model = m.clone();
@@ -539,9 +540,16 @@ async fn handle_message_turn(
         database_url: cfg.database.url.clone(),
     };
 
-    // Per-turn approval cache: tracks file paths the user has already approved
-    // in this turn, so repeated edits to the same file don't re-prompt.
-    let mut approved_paths: HashSet<String> = HashSet::new();
+    // Per-session approval cache: tracks file paths the user has already approved
+    // across all turns in this session, so repeated edits to the same file don't re-prompt.
+    let mut approved_paths: HashSet<String> = {
+        let mut map = sessions.write().await;
+        if let Some(entry) = map.get_mut(&session_id_s) {
+            std::mem::take(&mut entry.approved_paths)
+        } else {
+            HashSet::new()
+        }
+    };
 
     /// Extract file paths from an apply_patch patch string.
     /// Returns a list of normalized absolute paths for files being modified.
@@ -841,6 +849,15 @@ async fn handle_message_turn(
     if !done_sent {
         send(w, &Event::Done { id: Some(id) }).await?;
     }
+
+    // Save approval cache back to session for next turn
+    {
+        let mut map = sessions.write().await;
+        if let Some(entry) = map.get_mut(&session_id_s) {
+            entry.approved_paths = approved_paths;
+        }
+    }
+
     Ok(())
 }
 
@@ -1123,6 +1140,7 @@ async fn handle_swarm_spawn(
             messages: Vec::new(),
             created_at_ms: chrono::Utc::now().timestamp_millis(),
             updated_at_ms: chrono::Utc::now().timestamp_millis(),
+            approved_paths: HashSet::new(),
         });
         entry.messages.push(Message {
             role: "user".to_string(),

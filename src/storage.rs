@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use tokio::fs;
 use uuid::Uuid;
 
@@ -20,6 +21,10 @@ pub struct Session {
     pub messages: Vec<Message>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// Per-session approval cache: file paths the user has approved in this session.
+    /// Persists across turns so repeated edits to the same file don't re-prompt.
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub approved_paths: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +57,7 @@ pub async fn create_session(working_dir: &str, model: &str) -> Result<Session> {
         messages: Vec::new(),
         created_at_ms: now,
         updated_at_ms: now,
+        approved_paths: HashSet::new(),
     };
     save_session(&session).await?;
     Ok(session)

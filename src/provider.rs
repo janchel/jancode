@@ -201,7 +201,11 @@ pub async fn send_message(
         .connect_timeout(std::time::Duration::from_secs(30))
         .build()?;
 
-    let mut system = "You are a helpful AI coding agent running with full local filesystem access on the user's machine. You have tools to explore the codebase: list_dir (list a directory), glob (find files by pattern), read (read file contents), agentgrep (search file contents), bash (run shell commands), write (create/overwrite files), and edit (replace text in a file). When the user asks you to analyze or inspect a project, USE these tools to explore the working directory yourself before responding — do not ask the user for file paths or tell them you lack access. Start by calling list_dir on '.' or the current directory to discover the structure.".to_string();
+    let mut system = "You are a helpful AI coding agent running with full local filesystem access on the user's machine. You have tools to explore the codebase: list_dir (list a directory), glob (find files by pattern), read (read file contents), agentgrep (search file contents), bash (run shell commands), write (create/overwrite files), and edit (replace text in a file). 
+
+IMPORTANT: Always start by exploring the directory structure. When the user asks you to analyze or inspect a project, you MUST first call list_dir on '.' or the current directory to discover the structure. Do NOT read files until you understand the directory layout. Use glob to find files by pattern, agentgrep to search content, and read only specific files you need.
+
+When the user asks you to modify something, first explore to understand the codebase, then make targeted changes. Do not read all files upfront — be selective and efficient.".to_string();
     if !instructions.is_empty() {
         system.push_str("\n\n# Project instructions (AGENTS.md)\n");
         system.push_str("Follow the project instructions below. They come from the repository's AGENTS.md/CLAUDE.md files and describe the project's conventions, build/test commands, and operating rules. They take precedence over generic guidance, but never override the user's direct request.\n");
