@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::collections::HashSet;
+use tokio::fs;
 use uuid::Uuid;
 
 use crate::config::sessions_dir;
@@ -20,6 +21,10 @@ pub struct Session {
     pub messages: Vec<Message>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// Per-session approval cache: file paths the user has approved in this session.
+    /// Persists across turns so repeated edits to the same file don't re-prompt.
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub approved_paths: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,8 +46,7 @@ pub struct Message {
 }
 
 #[allow(dead_code)]
-#[allow(dead_code)]
-pub fn create_session(working_dir: &str, model: &str) -> Result<Session> {
+pub async fn create_session(working_dir: &str, model: &str) -> Result<Session> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().timestamp_millis();
     let session = Session {
@@ -53,37 +57,38 @@ pub fn create_session(working_dir: &str, model: &str) -> Result<Session> {
         messages: Vec::new(),
         created_at_ms: now,
         updated_at_ms: now,
+        approved_paths: HashSet::new(),
     };
-    save_session(&session)?;
+    save_session(&session).await?;
     Ok(session)
 }
 
 #[allow(dead_code)]
-pub fn save_session(session: &Session) -> Result<()> {
+pub async fn save_session(session: &Session) -> Result<()> {
     let dir = sessions_dir();
-    fs::create_dir_all(&dir).context("creating sessions dir")?;
+    fs::create_dir_all(&dir).await.context("creating sessions dir")?;
     let path = dir.join(format!("{}.json", session.id));
     let tmp = dir.join(format!("{}.tmp", session.id));
     let data = serde_json::to_vec_pretty(session)?;
-    fs::write(&tmp, data).context("writing session tmp")?;
-    fs::rename(&tmp, &path).context("renaming session file")?;
+    fs::write(&tmp, data).await.context("writing session tmp")?;
+    fs::rename(&tmp, &path).await.context("renaming session file")?;
     Ok(())
 }
 
 #[allow(dead_code)]
-pub fn load_session(id: &str) -> Result<Option<Session>> {
+pub async fn load_session(id: &str) -> Result<Option<Session>> {
     let path = sessions_dir().join(format!("{}.json", id));
-    if !path.exists() {
+    if !fs::try_exists(&path).await.unwrap_or(false) {
         return Ok(None);
     }
-    let data = fs::read_to_string(&path).context("reading session")?;
+    let data = fs::read_to_string(&path).await.context("reading session")?;
     let session: Session = serde_json::from_str(&data).context("parsing session")?;
     Ok(Some(session))
 }
 
 #[allow(dead_code)]
-pub fn append_message(session_id: &str, role: &str, content: &str) -> Result<()> {
-    let mut session = load_session(session_id)?.ok_or_else(|| anyhow::anyhow!("session not found"))?;
+pub async fn append_message(session_id: &str, role: &str, content: &str) -> Result<()> {
+    let mut session = load_session(session_id).await?.ok_or_else(|| anyhow::anyhow!("session not found"))?;
     let msg = Message {
         role: role.to_string(),
         content: content.to_string(),
@@ -93,21 +98,21 @@ pub fn append_message(session_id: &str, role: &str, content: &str) -> Result<()>
     };
     session.messages.push(msg);
     session.updated_at_ms = Utc::now().timestamp_millis();
-    save_session(&session)?;
+    save_session(&session).await?;
     Ok(())
 }
 
-pub fn list_sessions() -> Result<Vec<Session>> {
+pub async fn list_sessions() -> Result<Vec<Session>> {
     let dir = sessions_dir();
-    if !dir.exists() {
+    if !fs::try_exists(&dir).await.unwrap_or(false) {
         return Ok(Vec::new());
     }
     let mut sessions = Vec::new();
-    for entry in fs::read_dir(&dir)? {
-        let entry = entry?;
+    let mut entries = fs::read_dir(&dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
         if path.extension().map(|e| e == "json").unwrap_or(false) {
-            let data = fs::read_to_string(&path)?;
+            let data = fs::read_to_string(&path).await?;
             if let Ok(session) = serde_json::from_str::<Session>(&data) {
                 sessions.push(session);
             }

@@ -74,14 +74,27 @@ pub trait Tool: Send + Sync {
         }
     }
     async fn execute(&self, input: &Value, ctx: &ToolContext) -> Result<String>;
+
+    /// Whether this tool is safe to run concurrently with other independent
+    /// tools. Read-only tools that don't mutate shared state (files, the
+    /// filesystem, external systems) return `true`; anything that writes,
+    /// edits, or has side effects returns `false` (the default).
+    fn is_independent(&self) -> bool {
+        false
+    }
 }
 
 /// Context passed to tools, mirroring jancode's ToolContext (working dir, etc.).
+#[derive(Clone)]
 pub struct ToolContext {
     pub working_dir: PathBuf,
     /// Optional `[database] url` from config, used by the `sql` tool when a
     /// query call omits its own `db`.
     pub database_url: String,
+    /// `[server] bash_gate` setting: "off" | "basic" | "strict". Controls how
+    /// aggressively the `bash` tool is gated for commands that reference paths
+    /// outside the working directory.
+    pub bash_gate: String,
 }
 
 impl ToolContext {
@@ -118,6 +131,125 @@ pub fn is_outside(base: &Path, target: &Path) -> bool {
     let base = normalize_path(base);
     let target = normalize_path(target);
     !target.starts_with(&base)
+}
+
+/// Heuristic: does a `bash` command reference files/directories outside the
+/// working directory? `bash` is a free-form shell string, so we can't parse it
+/// reliably — this is a conservative best-effort scan that flags obvious
+/// escapes (absolute paths, `..`, `~`, `$HOME`, `$PWD`-relative tricks) while
+/// letting ordinary in-workspace commands run ungated.
+///
+/// `mode` mirrors the `[server] bash_gate` config:
+/// - "off":    never gate (returns `None` always).
+/// - "basic":  gate on obvious escapes (absolute paths, `~`, `$HOME`, `..`,
+///   leading `cd` out of the workspace).
+/// - "strict": also gate on any `cd`, `$PWD`/`$OLDPWD` tricks, and commands
+///   that read env vars pointing outside.
+///
+/// Returns `Some(reason)` when the command looks like it touches something
+/// outside the workspace, `None` when it appears safe.
+pub fn bash_escapes_workspace(command: &str, _working_dir: &Path, mode: &str) -> Option<String> {
+    if mode == "off" {
+        return None;
+    }
+    let cmd = command.trim();
+
+    // Empty / trivial commands are safe.
+    if cmd.is_empty() {
+        return None;
+    }
+
+    // A leading `cd` that leaves the workspace is a strong signal.
+    // e.g. `cd ~/sysadmin-mcp && grep ...`, `cd /etc && cat hosts`.
+    let first = cmd.split_whitespace().next().unwrap_or("");
+    if first == "cd" {
+        let rest = cmd.strip_prefix("cd").unwrap_or("").trim();
+        // `cd` with no arg goes to $HOME — outside the workspace.
+        if rest.is_empty() {
+            return Some("cd to $HOME (outside workspace)".to_string());
+        }
+        let target = rest.split_whitespace().next().unwrap_or("");
+        if target.starts_with("~") || target.starts_with("$HOME") || target.starts_with("/") {
+            return Some(format!("cd to {} (outside workspace)", target));
+        }
+        // `cd ..` / `cd ../..` walks up from the workspace.
+        if target == ".." || target.starts_with("../") {
+            return Some(format!("cd to {} (outside workspace)", target));
+        }
+        // In strict mode, any `cd` is treated as potentially escaping.
+        if mode == "strict" {
+            return Some(format!("cd to {} (strict mode)", target));
+        }
+    }
+
+    // Scan every whitespace-delimited token for path escapes. We skip heredoc
+    // bodies (`<< 'EOF' ... EOF`) because their content is data (e.g. CSS/JS
+    // with `/*` comments), not paths.
+    let mut in_heredoc = false;
+    let mut heredoc_delim: Option<String> = None;
+    for tok in cmd.split_whitespace() {
+        // Detect heredoc start. Two forms:
+        //   `<< 'EOF'`  — `<<` and delimiter are separate tokens
+        //   `<<EOF`     — delimiter is glued to `<<`
+        if !in_heredoc {
+            if tok == "<<" || tok == "<<-" {
+                in_heredoc = true;
+                continue;
+            }
+            if tok.starts_with("<<") && tok.len() > 2 {
+                in_heredoc = true;
+                heredoc_delim = Some(tok[2..].trim_matches(['\'', '"']).to_string());
+                continue;
+            }
+        }
+        if in_heredoc {
+            // If we haven't captured the delimiter yet, this token is it.
+            if heredoc_delim.is_none() {
+                heredoc_delim = Some(tok.trim_matches(['\'', '"']).to_string());
+                continue;
+            }
+            // If we see the delimiter again, the heredoc body is over.
+            if let Some(d) = &heredoc_delim {
+                if tok == d {
+                    in_heredoc = false;
+                    heredoc_delim = None;
+                    continue;
+                }
+            }
+            // Inside the heredoc body: content is data, not a path.
+            continue;
+        }
+
+        // Skip shell operators, flags, and command names.
+        if tok.is_empty() || tok.starts_with("-") || tok.starts_with("$(") || tok.starts_with("`") {
+            continue;
+        }
+        // Absolute paths always point outside the workspace. But a bare `/`
+        // (e.g. `ls /` or a lone slash) is not a meaningful escape, and
+        // `/*`/`*/` are comment markers, not paths.
+        if tok.starts_with("/") && tok != "/" && !tok.starts_with("/*") && !tok.starts_with("*/") {
+            return Some(format!("references absolute path {}", tok));
+        }
+        // `~` / `$HOME` expand to the user's home, outside the workspace.
+        if tok.starts_with("~") || tok.starts_with("$HOME") {
+            return Some(format!("references {}", tok));
+        }
+        // `..` / `../...` walk up from the workspace.
+        if tok == ".." || tok.starts_with("../") {
+            return Some(format!("references {}", tok));
+        }
+        // `$PWD/..` or `$OLDPWD`-style escapes.
+        if tok.starts_with("$PWD/..") || tok.starts_with("$OLDPWD") {
+            return Some(format!("references {}", tok));
+        }
+        // In strict mode, any `$PWD`/`$OLDPWD` reference is treated as
+        // potentially escaping (the cwd could be anywhere).
+        if mode == "strict" && (tok.starts_with("$PWD") || tok.starts_with("$OLDPWD")) {
+            return Some(format!("references {} (strict mode)", tok));
+        }
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +400,10 @@ impl Tool for ReadTool {
         "Read a file from the filesystem. Returns the file contents. Use this to\n\
          inspect source code, configs, logs, or any text file you need to understand\n\
          before editing."
+    }
+
+    fn is_independent(&self) -> bool {
+        true
     }
 
     fn parameters(&self) -> Value {
@@ -450,6 +586,10 @@ impl Tool for ListDirTool {
          their types. This is the starting point for exploring a codebase."
     }
 
+    fn is_independent(&self) -> bool {
+        true
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -513,6 +653,10 @@ impl Tool for GlobTool {
          file paths relative to the current working directory."
     }
 
+    fn is_independent(&self) -> bool {
+        true
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -566,6 +710,10 @@ impl Tool for GrepTool {
     fn description(&self) -> &str {
         "Search file contents using a regex pattern. Returns matching lines with\n\
          file path and line number. Alias: 'grep'."
+    }
+
+    fn is_independent(&self) -> bool {
+        true
     }
 
     fn parameters(&self) -> Value {
@@ -1370,6 +1518,10 @@ impl Tool for WebFetchTool {
          Read-only and ungated."
     }
 
+    fn is_independent(&self) -> bool {
+        true
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -1899,6 +2051,47 @@ mod tests {
     }
 
     #[test]
+    fn bash_escape_detection() {
+        let base = Path::new("/work/proj");
+        // Safe: in-workspace commands.
+        assert!(bash_escapes_workspace("ls", &base, "basic").is_none());
+        assert!(bash_escapes_workspace("cargo test", &base, "basic").is_none());
+        assert!(bash_escapes_workspace("grep -r alpha src", &base, "basic").is_none());
+        assert!(bash_escapes_workspace("cat .env", &base, "basic").is_none());
+        assert!(bash_escapes_workspace("docker ps -a", &base, "basic").is_none());
+        assert!(bash_escapes_workspace("curl -s http://localhost:5000", &base, "basic").is_none());
+        // Escapes: absolute paths, home, `..`, `cd` out.
+        assert!(bash_escapes_workspace("cat /etc/hosts", &base, "basic").is_some());
+        assert!(bash_escapes_workspace("ls ~/sysadmin-mcp", &base, "basic").is_some());
+        assert!(bash_escapes_workspace("cat $HOME/.claude/settings.json", &base, "basic").is_some());
+        assert!(bash_escapes_workspace("cd .. && ls", &base, "basic").is_some());
+        assert!(bash_escapes_workspace("cd /tmp && pwd", &base, "basic").is_some());
+        assert!(bash_escapes_workspace("cd ~/sysadmin-mcp && grep -r alpha .", &base, "basic").is_some());
+        assert!(bash_escapes_workspace("grep -r alpha ../secrets", &base, "basic").is_some());
+        assert!(bash_escapes_workspace("ls $PWD/../..", &base, "basic").is_some());
+        // "off" never gates.
+        assert!(bash_escapes_workspace("cat /etc/hosts", &base, "off").is_none());
+        assert!(bash_escapes_workspace("ls ~/sysadmin-mcp", &base, "off").is_none());
+        // "strict" gates on any cd / $PWD / $OLDPWD.
+        assert!(bash_escapes_workspace("cd src && ls", &base, "strict").is_some());
+        assert!(bash_escapes_workspace("echo $PWD", &base, "strict").is_some());
+        assert!(bash_escapes_workspace("echo $OLDPWD", &base, "strict").is_some());
+        // "strict" still allows plain in-workspace commands.
+        assert!(bash_escapes_workspace("ls", &base, "strict").is_none());
+        assert!(bash_escapes_workspace("cargo test", &base, "strict").is_none());
+        // Heredoc bodies are data, not paths — must NOT be flagged even if
+        // they contain `/*` comments or absolute-looking text.
+        assert!(bash_escapes_workspace("cat >> styles.css << 'EOF'\n/* ==== Cart ==== */\n.cart-overlay { display: none }\nEOF", &base, "basic").is_none());
+        assert!(bash_escapes_workspace("cat > file.txt <<EOF\n/usr/share/notes\nEOF", &base, "basic").is_none());
+        // A bare `/` or comment markers are not escapes.
+        assert!(bash_escapes_workspace("ls /", &base, "basic").is_none());
+        assert!(bash_escapes_workspace("echo /* comment */", &base, "basic").is_none());
+        // `which`/`ls` on system paths is a read, but still an absolute path —
+        // keep gating it (it's a genuine outside-workspace read).
+        assert!(bash_escapes_workspace("ls /usr/bin/node*", &base, "basic").is_some());
+    }
+
+    #[test]
     fn parses_multi_file_patch() {
         let patch = "\
 --- a/a.txt
@@ -1932,6 +2125,21 @@ mod tests {
         assert!(!sql_is_read_only("DELETE FROM users"));
         assert!(!sql_is_read_only("CREATE TABLE t (id int)"));
         assert!(!sql_is_read_only("DROP TABLE users"));
+    }
+
+    #[test]
+    fn independent_tool_flags() {
+        let reg = default_registry();
+        // Read-only tools are safe to run concurrently.
+        for name in ["read", "list_dir", "glob", "agentgrep", "fetch_url"] {
+            let t = reg.find(name).expect(name);
+            assert!(t.is_independent(), "{} should be independent", name);
+        }
+        // Mutating / stateful tools must NOT be parallelized.
+        for name in ["write", "edit", "apply_patch", "bash", "git", "docker", "sql", "plan", "note", "http_request"] {
+            let t = reg.find(name).expect(name);
+            assert!(!t.is_independent(), "{} should NOT be independent", name);
+        }
     }
 
     #[test]
