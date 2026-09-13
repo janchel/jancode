@@ -133,6 +133,150 @@ pub fn is_outside(base: &Path, target: &Path) -> bool {
     !target.starts_with(&base)
 }
 
+/// Rewrite a leading `cd` in a bash command so the agent uses relative paths
+/// (matching the CLI-agent convention) WITHOUT changing what it does.
+///
+/// - If the command starts with `cd <absolute-path>` where the target is INSIDE
+///   the workspace, we rewrite the absolute path to its relative form (e.g.
+///   `cd /home/user/proj/src && make` -> `cd src && make`). This removes the
+///   absolute-path noise while keeping the exact same directory change.
+/// - If the target is already relative, or the command has no leading `cd`,
+///   nothing changes.
+/// - If the target resolves OUTSIDE the workspace, we leave the command
+///   completely untouched so the approval gate still sees the escape and can
+///   prompt for approval. This preserves the core security function.
+///
+/// Returns the rewritten command when a leading absolute-path `cd` inside the
+/// workspace was found, otherwise `None` (command unchanged).
+pub fn normalize_bash_cd(command: &str, working_dir: &Path) -> Option<String> {
+    let cmd = command.trim();
+    if cmd.is_empty() {
+        return None;
+    }
+    let first = cmd.split_whitespace().next().unwrap_or("");
+    if first != "cd" {
+        return None;
+    }
+    let rest = cmd.strip_prefix("cd").unwrap_or("").trim();
+    if rest.is_empty() {
+        return None; // `cd` with no arg = $HOME — leave for the gate.
+    }
+    let target = rest.split_whitespace().next().unwrap_or("");
+    if target.starts_with("~") || target.starts_with("$HOME") {
+        return None; // home — leave for the gate.
+    }
+    // Only rewrite an ABSOLUTE target that is inside the workspace down to a
+    // relative path. Relative targets are already fine.
+    if !target.starts_with("/") {
+        return None;
+    }
+    let abs_target = std::path::PathBuf::from(target);
+    if is_outside(working_dir, &abs_target) {
+        return None; // outside the workspace — leave for the gate.
+    }
+    // Compute the relative form of the absolute target from the workspace.
+    let rel = abs_target
+        .strip_prefix(working_dir)
+        .ok()?
+        .to_string_lossy()
+        .to_string();
+    let rel = if rel.is_empty() { ".".to_string() } else { rel };
+    // Rebuild: `cd <rel>` + everything after the target in the original
+    // command, preserved verbatim (including `&&`, `;`, etc.).
+    let remainder = rest[target.len()..].trim_start();
+    if remainder.is_empty() {
+        Some(format!("cd {}", rel))
+    } else {
+        Some(format!("cd {} {}", rel, remainder))
+    }
+}
+
+/// Extract the likely target file/directory path(s) for a mutating command
+/// (e.g. `sed -i`, `rm`, `mv file1 file2`, `touch a b`, `cat > out`). This is
+/// shown in the approval reason so the user knows what the command would change.
+/// It's best-effort: we skip the command name, flags (`-*`), sed/awk/perl
+/// expression bodies, shell operators, and redirection operators, and collect
+/// the remaining path-looking tokens.
+fn mutation_targets(command: &str, mut_cmd: &str) -> Vec<String> {
+    use std::path::Path;
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+
+    // sed / awk / perl take the file operand LAST (after `-e 'script'`).
+    // Expressions can contain spaces and slashes (e.g. `'s/a b/c d/'`), which
+    // splits them across tokens, so the safest extraction is the final token
+    // that isn't a flag or an operator — that's the target file.
+    if matches!(mut_cmd, "sed" | "awk" | "perl") {
+        // `tokens` is `Vec<&str>`; iterate as `&str` items.
+        let last = tokens
+            .iter()
+            .rev()
+            .map(|s| *s)
+            .find(|t| {
+                !t.starts_with('-')
+                    && *t != "&&" && *t != "||" && *t != ";" && *t != "|"
+                    && *t != ">" && *t != ">>" && *t != "2>" && *t != "1>" && *t != "<<"
+            })
+            .map(|t| t.trim_matches(['\'', '"']).to_string());
+        return last.filter(|t| is_likely_target(t)).into_iter().collect();
+    }
+
+    // For `mv a b` / `cp a b`, the destination is the last path; for
+    // `cat > out` / `>> out`, it's the token after the redirection; for
+    // `touch a b`, both are targets. General path-like scan:
+    let targets: Vec<&str> = tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &t)| {
+            if i == 0 && t == mut_cmd {
+                return None;
+            }
+            if t.starts_with('-') {
+                return None;
+            }
+            if matches!(t, "&&" | "||" | ";" | "|" | ">" | ">>" | "2>" | "1>" | "<<" | "<<-" | "if" | "then" | "else" | "fi") {
+                return None;
+            }
+            let prev = if i > 0 { tokens[i - 1] } else { "" };
+            if matches!(prev, ">" | ">>" | "2>" | "1>") {
+                return Some(t.trim_matches(['\'', '"']));
+            }
+            if is_likely_target(t) {
+                Some(t.trim_matches(['\'', '"']))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for t in targets {
+        if seen.insert(t.to_string()) {
+            out.push(t.to_string());
+        }
+    }
+    out
+}
+
+/// Best-effort: does this token look like a file path (something a mutating
+/// command would target)? We look for a file extension or a path separator,
+/// which distinguishes `styles.css` / `src/main.rs` from sed expressions and
+/// shell operators.
+fn is_likely_target(t: &str) -> bool {
+    let t = t.trim_matches(['\'', '"']);
+    if t.is_empty() {
+        return false;
+    }
+    if t.starts_with("s/") || t.starts_with("y/") || t.starts_with("p;") || t.starts_with('/') && t.len() > 1 {
+        return false; // sed/awk expression or an operator-ish `/something`
+    }
+    if t.contains('/') {
+        return true;
+    }
+    // A file extension (e.g. .css, .rs, .txt, .json) is a strong signal.
+    Path::new(t).extension().is_some()
+}
+
 /// Heuristic: does a `bash` command reference files/directories outside the
 /// working directory? `bash` is a free-form shell string, so we can't parse it
 /// reliably — this is a conservative best-effort scan that flags obvious
@@ -148,7 +292,7 @@ pub fn is_outside(base: &Path, target: &Path) -> bool {
 ///
 /// Returns `Some(reason)` when the command looks like it touches something
 /// outside the workspace, `None` when it appears safe.
-pub fn bash_escapes_workspace(command: &str, _working_dir: &Path, mode: &str) -> Option<String> {
+pub fn bash_escapes_workspace(command: &str, working_dir: &Path, mode: &str) -> Option<String> {
     if mode == "off" {
         return None;
     }
@@ -161,25 +305,83 @@ pub fn bash_escapes_workspace(command: &str, _working_dir: &Path, mode: &str) ->
 
     // A leading `cd` that leaves the workspace is a strong signal.
     // e.g. `cd ~/sysadmin-mcp && grep ...`, `cd /etc && cat hosts`.
+    // But a `cd` that targets a path INSIDE the workspace is harmless (the
+    // agent is just anchoring to the project root/subdir).
     let first = cmd.split_whitespace().next().unwrap_or("");
     if first == "cd" {
-        let rest = cmd.strip_prefix("cd").unwrap_or("").trim();
         // `cd` with no arg goes to $HOME — outside the workspace.
+        let rest = cmd.strip_prefix("cd").unwrap_or("").trim();
         if rest.is_empty() {
             return Some("cd to $HOME (outside workspace)".to_string());
         }
         let target = rest.split_whitespace().next().unwrap_or("");
-        if target.starts_with("~") || target.starts_with("$HOME") || target.starts_with("/") {
+        // `~` / `$HOME` always point at the home dir, outside the workspace.
+        if target.starts_with("~") || target.starts_with("$HOME") {
             return Some(format!("cd to {} (outside workspace)", target));
         }
-        // `cd ..` / `cd ../..` walks up from the workspace.
-        if target == ".." || target.starts_with("../") {
-            return Some(format!("cd to {} (outside workspace)", target));
-        }
-        // In strict mode, any `cd` is treated as potentially escaping.
+        // Resolve an absolute/relative target against the workspace and check
+        // whether it lands inside it. If so, the cd is safe.
+        let abs_target = if target.starts_with("/") {
+            std::path::PathBuf::from(target)
+        } else if let Some(rel) = target.strip_prefix("$PWD/") {
+            working_dir.join(rel)
+        } else {
+            working_dir.join(target)
+        };
+        // In strict mode, ANY cd is treated as potentially escaping (the cd
+        // could be used to reach anything even if it starts in-workspace).
         if mode == "strict" {
             return Some(format!("cd to {} (strict mode)", target));
         }
+        if is_outside(working_dir, &abs_target) {
+            if target == ".." || target.starts_with("../") || target.starts_with("/") {
+                return Some(format!("cd to {} (outside workspace)", target));
+            }
+            if mode == "strict" {
+                return Some(format!("cd to {} (strict mode)", target));
+            }
+        }
+        // Inside-workspace cd (absolute to the project, or a bare subdir
+        // resolved within it): fall through ungated.
+    }
+
+    // File-mutation commands modify in-workspace files, so they should require
+    // approval even though they don't "escape" the workspace. This prevents
+    // `bash sed -i 's/x/y/' styles.css` from silently rewriting source files
+    // (which is exactly what write/edit/apply_patch gate). We scan EVERY token
+    // (not just the first) so `cd ... && sed -i ...` is still caught.
+    let tokens: Vec<&str> = cmd.split_whitespace().collect();
+    let mutating = tokens.iter().any(|t| match *t {
+        "sed" => cmd.contains("-i") || cmd.contains("--in-place"),
+        "awk" => cmd.contains("-i") || cmd.contains("--in-place"),
+        "perl" => cmd.contains("-i"),
+        "rm" | "rmdir" | "mv" | "cp" | "install" | "truncate" | "unlink" | "dd" | "nano" | "vim" | "vi" | "ed" => true,
+        "tee" => true,
+        "touch" => true,
+        "mkdir" => true,
+        "chmod" | "chown" | "chattr" => true,
+        _ => false,
+    });
+    // Also flag shell redirection writing to a file (`>`, `>>`, `2>`, `1>`) —
+    // but only a write-destinating `cat > file` / `>>`; a lone `>` could be a
+    // comparison or shell redirection. We flag a standalone operator token.
+    let has_write_redirect = tokens.iter().any(|t| *t == ">" || *t == ">>" || *t == "2>" || *t == "1>");
+    if mutating || has_write_redirect {
+        // Gate in-workspace file mutation. Out-of-workspace mutations are
+        // separately flagged by the path-escape token scan below.
+        let c = tokens.iter().copied().find(|&t| {
+            matches!(t, "sed" | "awk" | "perl" | "rm" | "rmdir" | "mv" | "cp" | "install" | "truncate" | "unlink" | "dd" | "nano" | "vim" | "vi" | "ed" | "tee" | "touch" | "mkdir" | "chmod" | "chown" | "chattr")
+        }).unwrap_or("shell-redirect");
+        let targets = mutation_targets(cmd, c);
+        let targets_str = if targets.is_empty() {
+            String::new()
+        } else {
+            format!(" on {}", targets.join(", "))
+        };
+        return Some(format!(
+            "modifies file(s){} via {} (in-workspace writes require approval)",
+            targets_str, c
+        ));
     }
 
     // Scan every whitespace-delimited token for path escapes. We skip heredoc
@@ -224,11 +426,16 @@ pub fn bash_escapes_workspace(command: &str, _working_dir: &Path, mode: &str) ->
         if tok.is_empty() || tok.starts_with("-") || tok.starts_with("$(") || tok.starts_with("`") {
             continue;
         }
-        // Absolute paths always point outside the workspace. But a bare `/`
+        // Absolute paths escape the workspace UNLESS they point inside it
+        // (e.g. a command that names the project dir explicitly). A bare `/`
         // (e.g. `ls /` or a lone slash) is not a meaningful escape, and
         // `/*`/`*/` are comment markers, not paths.
         if tok.starts_with("/") && tok != "/" && !tok.starts_with("/*") && !tok.starts_with("*/") {
-            return Some(format!("references absolute path {}", tok));
+            let trimmed = tok.trim_end_matches('/');
+            if is_outside(working_dir, &std::path::Path::new(trimmed)) {
+                return Some(format!("references absolute path {}", tok));
+            }
+            // otherwise: absolute path inside the workspace — safe.
         }
         // `~` / `$HOME` expand to the user's home, outside the workspace.
         if tok.starts_with("~") || tok.starts_with("$HOME") {
@@ -352,9 +559,17 @@ impl Tool for BashTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(10000);
 
+        // Normalize a leading `cd <inside-workspace>` prefix to a relative,
+        // workspace-rooted invocation. This matches the CLI-agent convention
+        // (agents use relative paths from the launch folder). Commands that cd
+        // OUTSIDE the workspace are left untouched so the approval gate still
+        // sees the escape; by the time this runs, such commands have already
+        // been approved, but the rewrite must not mask an external cd.
+        let command = normalize_bash_cd(command, &ctx.working_dir).unwrap_or_else(|| command.to_string());
+
         let mut child = tokio::process::Command::new("bash")
             .arg("-c")
-            .arg(command)
+            .arg(&command)
             .current_dir(&ctx.working_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -2079,16 +2294,81 @@ mod tests {
         // "strict" still allows plain in-workspace commands.
         assert!(bash_escapes_workspace("ls", &base, "strict").is_none());
         assert!(bash_escapes_workspace("cargo test", &base, "strict").is_none());
-        // Heredoc bodies are data, not paths — must NOT be flagged even if
-        // they contain `/*` comments or absolute-looking text.
-        assert!(bash_escapes_workspace("cat >> styles.css << 'EOF'\n/* ==== Cart ==== */\n.cart-overlay { display: none }\nEOF", &base, "basic").is_none());
-        assert!(bash_escapes_workspace("cat > file.txt <<EOF\n/usr/share/notes\nEOF", &base, "basic").is_none());
+        // Heredoc bodies are data, not paths — must NOT be flagged for PATH escapes
+        // even if they contain `/*` comments or absolute-looking text. But a
+        // heredoc that WRITES a file (`cat > file` / `cat >> file`) is still a
+        // file mutation and IS gated.
+        assert!(bash_escapes_workspace("cat >> styles.css << 'EOF'\n/* ==== Cart ==== */\n.cart-overlay { display: none }\nEOF", &base, "basic").is_some());
+        assert!(bash_escapes_workspace("cat > file.txt <<EOF\n/usr/share/notes\nEOF", &base, "basic").is_some());
         // A bare `/` or comment markers are not escapes.
         assert!(bash_escapes_workspace("ls /", &base, "basic").is_none());
         assert!(bash_escapes_workspace("echo /* comment */", &base, "basic").is_none());
         // `which`/`ls` on system paths is a read, but still an absolute path —
         // keep gating it (it's a genuine outside-workspace read).
         assert!(bash_escapes_workspace("ls /usr/bin/node*", &base, "basic").is_some());
+    }
+
+    #[test]
+    fn bash_escape_workspace_aware() {
+        let base = Path::new("/home/user/proj");
+        // cd to the workspace itself (absolute) is NOT a path escape, BUT the
+        // `sed -i` mutation still requires approval.
+        assert!(bash_escapes_workspace("cd /home/user/proj && sed -i s/a/b/ x.css", &base, "basic").is_some());
+        // cd to a subdir inside the workspace is NOT an escape (basic mode).
+        assert!(bash_escapes_workspace("cd src && cargo build", &base, "basic").is_none());
+        // `sed -i` on a file inside the workspace is a MUTATION -> gated.
+        assert!(bash_escapes_workspace("sed -i s/a/b/ /home/user/proj/x.css", &base, "basic").is_some());
+        // Read-only sed (no -i) inside workspace is not a mutation.
+        assert!(bash_escapes_workspace("sed -n '1,5p' /home/user/proj/x.css", &base, "basic").is_none());
+        // cd to another project outside the workspace IS an escape.
+        assert!(bash_escapes_workspace("cd /home/user/other && ls", &base, "basic").is_some());
+        // cd .. is still an escape.
+        assert!(bash_escapes_workspace("cd .. && ls", &base, "basic").is_some());
+        // cd to absolute path OUTSIDE workspace is still an escape.
+        assert!(bash_escapes_workspace("cd /tmp && pwd", &base, "basic").is_some());
+        // strict still gates even an in-workspace cd.
+        assert!(bash_escapes_workspace("cd src && cargo build", &base, "strict").is_some());
+    }
+
+    #[test]
+    fn mutation_targets_extraction() {
+        assert_eq!(mutation_targets("sed -i 's/a/b/g' styles.css", "sed"), vec!["styles.css".to_string()]);
+        assert_eq!(mutation_targets("sed -i s/a/b/ src/main.rs", "sed"), vec!["src/main.rs".to_string()]);
+        assert_eq!(mutation_targets("rm -rf target", "rm"), Vec::<String>::new()); // "target" looks like a name, no ext/slash -> empty
+        assert_eq!(mutation_targets("touch a.css b.js", "touch"), vec!["a.css".to_string(), "b.js".to_string()]);
+        assert_eq!(mutation_targets("cat > out.txt << EOF", "shell-redirect"), vec!["out.txt".to_string()]);
+        assert_eq!(mutation_targets("cd /x/y && sed -i s/a/b/ f.css", "sed"), vec!["f.css".to_string()]);
+    }
+
+    #[test]
+    fn normalize_bash_cd_behavior() {
+        let base = Path::new("/home/user/proj");
+        // Absolute cd to the workspace root is rewritten to a relative `cd .`,
+        // preserving the directory change but removing the absolute path.
+        assert_eq!(
+            normalize_bash_cd("cd /home/user/proj && sed -i s/a/b/ styles.css", &base),
+            Some("cd . && sed -i s/a/b/ styles.css".to_string())
+        );
+        // Absolute cd to a workspace subdir is rewritten to a relative path.
+        assert_eq!(
+            normalize_bash_cd("cd /home/user/proj/src && make", &base),
+            Some("cd src && make".to_string())
+        );
+        // Already-relative cd is unchanged (None = no rewrite needed).
+        assert_eq!(normalize_bash_cd("cd src && cargo build", &base), None);
+        // Absolute cd to the workspace root alone -> `cd .`.
+        assert_eq!(normalize_bash_cd("cd /home/user/proj", &base), Some("cd .".to_string()));
+        // cd OUTSIDE the workspace is NOT rewritten (gate must still see it).
+        assert_eq!(normalize_bash_cd("cd /home/user/other && ls", &base), None);
+        // absolute path outside -> not rewritten.
+        assert_eq!(normalize_bash_cd("cd /tmp && pwd", &base), None);
+        // no leading cd -> not rewritten.
+        assert_eq!(normalize_bash_cd("sed -i s/a/b/ styles.css", &base), None);
+        // ~ / $HOME -> not rewritten (gate handles).
+        assert_eq!(normalize_bash_cd("cd ~/notes && ls", &base), None);
+        // empty / `cd` alone -> not rewritten.
+        assert_eq!(normalize_bash_cd("", &base), None);
+        assert_eq!(normalize_bash_cd("cd", &base), None);
     }
 
     #[test]

@@ -221,23 +221,31 @@ resolve outside the working directory** (`read`, `list_dir`, `glob`,
 
 - In `jancode connect` you get an interactive prompt: `[approval] <tool> —
   <reason>` then `allow? [y/N]`. Answering `n` sends `APPROVAL_DENIED` to the
-  model, which will adapt (and the file is untouched).
+  model, which will adapt (and the file is untouched). If the model keeps
+  retrying gated operations after repeated denials, jancode aborts the turn
+  early with a clear message instead of looping through the whole tool budget.
 - Headless one-shots (`jancode run --tools`) and swarm agents auto-approve — no
   human is attached.
-- `bash`, `plan`, `note`, and `fetch_url` are intentionally ungated: `bash` is
-  the all-purpose power tool, `plan`/`note` only touch their own bookkeeping
-  files, and `fetch_url` only reads. Other tools gate selectively: `git`
-  mutating actions, `http_request` non-GET/HEAD methods, `docker`
-  state-changing actions, and non-read-only `sql` statements all require
-  approval.
+- `plan`, `note`, and `fetch_url` are intentionally ungated: `plan`/`note` only
+  touch their own bookkeeping files, and `fetch_url` only reads. Other tools
+  gate selectively: `git` mutating actions, `http_request` non-GET/HEAD
+  methods, `docker` state-changing actions, and non-read-only `sql` statements
+  all require approval.
 
-  **`bash` is gated when it escapes the workspace.** Because `bash` can read or
-  search anywhere on the host, jancode scans the command and asks for approval
-  when it references files or directories **outside the working directory** —
-  absolute paths (`cat /etc/hosts`), home-dir shortcuts (`ls ~/sysadmin-mcp`,
-  `cat $HOME/.claude/...`), parent-directory walks (`cd ..`, `grep -r x ../`),
-  or a leading `cd` out of the workspace. In-workspace commands (`ls`, `cargo
-  test`, `grep -r alpha src`) run freely. This is a best-effort heuristic, not
+  **`bash` is gated when it escapes the workspace OR modifies files.** Because
+  `bash` can read, search, or write anywhere on the host, jancode scans the
+  command and asks for approval when it:
+  - references files or directories **outside the working directory** —
+    absolute paths (`cat /etc/hosts`), home-dir shortcuts (`ls ~/sysadmin-mcp`,
+    `cat $HOME/.claude/...`), parent-directory walks (`cd ..`, `grep -r x ../`),
+    or a leading `cd` out of the workspace; or
+  - **modifies files in place** — `sed -i`, `awk -i`, `perl -i`, `tee`,
+    `touch`, `rm`/`mv`/`cp`/`truncate`/`unlink`/`dd`, `mkdir`, `chmod`/`chown`,
+    or a write redirection (`>`, `>>`). The approval reason names the target
+    file(s), e.g. `modifies file(s) on styles.css via sed`.
+
+  In-workspace read-only commands (`ls`, `cargo test`, `grep -r alpha src`,
+  `sed -n '1,5p' file`) run freely. This is a best-effort heuristic, not
   a sandbox — it flags obvious escapes but can't parse arbitrary shell.
 
   The aggressiveness of this scan is controlled by `[server] bash_gate`:
@@ -248,8 +256,9 @@ resolve outside the working directory** (`read`, `list_dir`, `glob`,
   ```
 
   - `"off"` — never gate `bash` (old behavior).
-  - `"basic"` — gate on obvious escapes: absolute paths, `~`, `$HOME`, `..`,
-    and a leading `cd` out of the workspace.
+  - `"basic"` — gate on obvious escapes (absolute paths, `~`, `$HOME`, `..`,
+    a leading `cd` out of the workspace) **and on in-workspace file mutations**
+    (`sed -i`, `rm`, `mv`, `cp`, `touch`, `tee`, write redirection, ...).
   - `"strict"` — also gate on any `cd`, `$PWD`/`$OLDPWD` references, and
     commands that read env vars pointing outside.
 
@@ -264,6 +273,23 @@ approve_mode = "prompt"   # "prompt" | "auto" | "deny"
 - `"prompt"` (default) — interactive sessions ask; headless sessions auto-allow.
 - `"auto"` — always allow risky calls (no prompts).
 - `"deny"` — always block risky calls with `APPROVAL_DENIED`.
+
+### Workspace confinement
+
+Each session is anchored to the folder you launched it from (its **workspace**),
+following the same convention as other CLI agents (opencode, antigravity):
+
+- The agent is told to use **relative paths** from the workspace root and to
+  stay inside it. A leading `cd /abs/path` in a `bash` command that targets the
+  workspace itself is normalized to a relative form (e.g. `cd /home/u/proj/src`
+  → `cd src`) so commands read cleanly — but a `cd` that leaves the workspace
+  is left untouched so the approval gate still sees it.
+- Reads, edits, and bash commands that stay inside the workspace run freely
+  (subject to the mutation gate above); anything that touches a location
+  **outside** the workspace requires approval.
+- Running `jancode connect` in different folders gives each its own isolated
+  workspace, session history, and approval cache — you can work on multiple
+  projects independently.
 
 ### Automatic project memory
 
@@ -416,7 +442,9 @@ directly in the config:
 export OPENAI_API_KEY=sk-...
 ```
 
-Or edit `$JANCODE_HOME/config.toml` (defaults to `~/.jancode/config.toml`):
+Or edit `$JANCODE_HOME/config.toml` (defaults to `~/.jancode/config.toml`).
+
+### Single provider (legacy)
 
 ```toml
 [provider]
@@ -428,18 +456,71 @@ api_key_env = "OPENAI_API_KEY"
 default_model = "gpt-4o-mini"
 # Optional: pin the model catalog shown by /model instead of the live GET /models
 models = ["gpt-4o-mini", "gpt-4o", "gpt-5"]
+# Optional: cap the model's response length (sent as max_tokens). 0 = no cap.
+# max_tokens = 4096
+# Optional: context window in tokens. When set, jancode trims the oldest
+# conversation messages to fit this budget (reduces token usage / rate limits).
+# context_window = 32768
+```
 
-# Optional: default target for the `sql` tool (overrides pass `db` per call).
-[database]
-url = "sqlite:$JANCODE_HOME/scratch.db"   # or postgres://user:pass@host/db or mysql://...
+### Multiple providers
+
+Define named providers with `[[providers]]` and select the active one with
+`default_provider`. When `providers` is non-empty it takes precedence over the
+legacy `[provider]` table:
+
+```toml
+default_provider = "groq"
+
+[[providers]]
+name = "groq"
+base_url = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"
+default_model = "openai/gpt-oss-20b"
+tool_call_style = "openai"
+max_tokens = 4096
+context_window = 16000
+
+[[providers]]
+name = "lmstudio"
+base_url = "http://192.168.5.39:1234/v1"
+api_key = "dummy"
+default_model = "qwen2.5-coder-7b-instruct"
+tool_call_style = "flattened"
+```
+
+Each provider supports the same fields as `[provider]` (`base_url`, `api_key`/
+`api_key_env`, `default_model`, `models`, `tool_call_style`, `max_tokens`,
+`context_window`). Switch providers mid-chat with `/provider`:
+
+```
+/provider              # list providers
+/provider groq         # switch by name
+/provider 2            # switch by number
+/provider 0            # back to default
 ```
 
 The key is resolved in this order: `provider.api_key` (inline) → the env var
 named by `provider.api_key_env` → `OPENAI_API_KEY`. If none is set, jancode
 errors with a clear message.
 
+`max_tokens` caps how many tokens the model can generate per response (sent as
+`max_tokens` in the request). `context_window` sets a token budget for the
+conversation history — when the accumulated messages exceed it, jancode trims
+the oldest turns (keeping the system prompt and most recent messages) so the
+request stays within the model's context. This is especially useful on
+rate-limited providers like Groq, where smaller requests are less likely to hit
+tokens-per-minute limits.
+
 `/model` bulk-switches the model mid-chat; each message uses the session's
 current model (also honored in `run --model` and `swarm spawn --model`).
+
+### Optional: default `sql` target
+
+```toml
+[database]
+url = "sqlite:$JANCODE_HOME/scratch.db"   # or postgres://user:pass@host/db or mysql://...
+```
 
 ### Streaming stall detection
 
@@ -451,6 +532,13 @@ the threshold for diagnosis with the `JANCODE_STREAM_STALL_SECS` env var:
 ```bash
 JANCODE_STREAM_STALL_SECS=300 jancode connect
 ```
+
+Some routers (e.g. rebelstack) send **keepalive chunks** (`delta:{}`) that reset
+the per-chunk stall timer but never deliver a real response. jancode detects
+keepalive-only streams and, if nothing but keepalives arrive for the whole stall
+window, treats it as a stall and errors out (and retries) instead of hanging
+forever. A real-content chunk resets the keepalive timer, so a slow-but-alive
+stream still succeeds.
 
 ## Core mechanics
 

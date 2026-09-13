@@ -157,7 +157,7 @@ async fn handle_client(
                 )
                 .await?;
             }
-            Request::Message { id, session_id, content, tools, model, cwd, interactive } => {
+            Request::Message { id, session_id, content, tools, model, provider, cwd, interactive } => {
                 let session_id_s = session_id.unwrap_or_else(|| format!("session-{}", id));
                 let working_dir = cwd.clone().unwrap_or_else(|| {
                     std::env::current_dir().unwrap_or_default().to_string_lossy().to_string()
@@ -206,7 +206,9 @@ async fn handle_client(
                         id: session_id_s.clone(),
                         title: format!("session-{}", id),
                         working_dir: working_dir.clone(),
-                        model: model.clone().unwrap_or_else(|| cfg.provider.default_model.clone()),
+                        model: model.clone().unwrap_or_else(|| {
+                            crate::config::resolve_provider(cfg.as_ref(), provider.as_deref()).default_model.clone()
+                        }),
                         messages: Vec::new(),
                         created_at_ms: chrono::Utc::now().timestamp_millis(),
                         updated_at_ms: chrono::Utc::now().timestamp_millis(),
@@ -253,6 +255,7 @@ async fn handle_client(
                         content,
                         tool_registry,
                         interactive,
+                        provider,
                     )
                     .await
                     {
@@ -286,11 +289,12 @@ async fn handle_client(
                 parent_session_id,
                 initial_message,
                 model,
+                provider,
                 label,
             } => {
                 handle_swarm_spawn(
                     &w, id, &sessions, &swarm, &session_clients, parent_session_id,
-                    &initial_message, model.as_deref(), label.as_deref(),
+                    &initial_message, model.as_deref(), provider.as_deref(), label.as_deref(),
                 )
                 .await?;
             }
@@ -537,12 +541,25 @@ async fn handle_message_turn(
     content: String,
     tool_registry: Option<crate::tools::ToolRegistry>,
     interactive: bool,
+    provider: Option<String>,
 ) -> Result<()> {
-    // Build the tool definitions to send to the provider.
-    let tool_defs: Vec<crate::tools::ToolDefinition> = tool_registry
-        .as_ref()
-        .map(|r| r.all().iter().map(|t| t.to_definition()).collect())
-        .unwrap_or_default();
+    // Build the tool definitions to send to the provider. If the active
+    // provider/model doesn't support structured tool calling
+    // (`supports_tools = false`), we skip tools entirely so the model answers
+    // directly instead of emitting broken tool calls that loop.
+    let provider_cfg = crate::config::resolve_provider(cfg, provider.as_deref());
+    let tool_defs: Vec<crate::tools::ToolDefinition> = if provider_cfg.supports_tools {
+        tool_registry
+            .as_ref()
+            .map(|r| r.all().iter().map(|t| t.to_definition()).collect())
+            .unwrap_or_default()
+    } else {
+        tracing::info!(
+            "provider '{}' has supports_tools=false; running without tool calling",
+            provider_cfg.name
+        );
+        Vec::new()
+    };
     let tool_defs_ref = if tool_defs.is_empty() {
         None
     } else {
@@ -597,6 +614,32 @@ async fn handle_message_turn(
     let mut done_sent = false;
     let mut loop_iteration = 0u32;
     const MAX_TOOL_LOOPS: u32 = 20;
+    // Loop guard: if the model repeats the exact same tool call (same name +
+    // args) several times in a row — usually because it's emitting malformed
+    // arguments that keep failing — stop early with a clear message instead of
+    // burning through all 20 iterations.
+    let mut last_call_sig: Option<String> = None;
+    let mut repeat_count = 0u32;
+    const MAX_REPEAT: u32 = 3;
+    // Also track the total number of tool calls across the whole turn. If the
+    // model keeps calling tools without ever producing a final answer, cap it
+    // lower than MAX_TOOL_LOOPS so a wandering model (many DIFFERENT calls)
+    // doesn't burn the full budget. This catches the "exploring forever"
+    // pattern that identical-repeat detection misses.
+    let mut total_tool_calls = 0u32;
+    const MAX_TOTAL_TOOL_CALLS: u32 = 25;
+    // Progress check: track distinct tool calls seen and consecutive errors.
+    // If the model keeps hitting tool errors without producing new information,
+    // escalate to a clear terminal message instead of letting it spin.
+    let mut seen_calls: std::collections::HashSet<String> = HashSet::new();
+    let mut consecutive_errors = 0u32;
+    const MAX_CONSECUTIVE_ERRORS: u32 = 4;
+    // Total APPROVAL_DENIED results this turn. Unlike `consecutive_errors`,
+    // this is NOT reset by successful reads/bin reach between denials — the
+    // model retrying gated operations over and over (interleaved with reads)
+    // should abort quickly instead of burning the whole budget.
+    let mut denials_this_turn = 0u32;
+    const MAX_DENIALS_PER_TURN: u32 = 3;
 
     // Tool-calling loop: send message, execute tools, append results, repeat.
     loop {
@@ -621,7 +664,9 @@ async fn handle_message_turn(
             let s = sessions.read().await;
             s.get(&session_id_s)
                 .map(|e| e.model.clone())
-                .unwrap_or_else(|| cfg.provider.default_model.clone())
+                .unwrap_or_else(|| {
+                    crate::config::resolve_provider(cfg, provider.as_deref()).default_model.clone()
+                })
         };
 
         // Memory context: durable facts relevant to the working dir are
@@ -635,8 +680,16 @@ async fn handle_message_turn(
 
         let instructions = crate::agents::load_instructions(&working_dir);
 
+        // Signal the remaining tool budget so the model wraps up instead of
+        // exploring forever. MAX_TOTAL_TOOL_CALLS is the hard cap.
+        let remaining_budget = if MAX_TOTAL_TOOL_CALLS > total_tool_calls {
+            Some((MAX_TOTAL_TOOL_CALLS - total_tool_calls) as u32)
+        } else {
+            Some(0u32)
+        };
+
         let result = crate::provider::send_message(
-            cfg, &session_model, &msgs, tool_defs_ref, &memory_context, &instructions,
+            cfg, provider.as_deref(), &session_model, &msgs, tool_defs_ref, &memory_context, &instructions, remaining_budget,
         )
         .await;
 
@@ -703,6 +756,80 @@ async fn handle_message_turn(
 
                 // If no tool calls, done.
                 if tool_calls.is_empty() {
+                    // If the model produced no text either, surface a clear
+                    // message instead of appearing to hang.
+                    if assistant_text.is_empty() {
+                        send(w, &Event::TextDelta {
+                            id: Some(id),
+                            text: "(the model finished but produced no text response. It may have hit a reasoning/token limit or emitted an unrecognized tool marker.)\n".to_string(),
+                        })
+                        .await?;
+                    }
+                    send(w, &Event::Done { id: Some(id) }).await?;
+                    done_sent = true;
+                    break;
+                }
+
+                // Loop guard: detect the model repeating the same tool call
+                // (same name + serialized args) over and over. This usually
+                // means it's emitting malformed arguments that keep failing
+                // (e.g. a reasoning model that doesn't follow the tool schema).
+                // Stop early with a clear message instead of looping to the cap.
+                let sig = tool_calls
+                    .iter()
+                    .map(|tc| format!("{}:{}", tc.name, tc.input.to_string()))
+                    .collect::<Vec<_>>()
+                    .join("|");
+                total_tool_calls += tool_calls.len() as u32;
+                // Progress check: record distinct calls seen this turn.
+                for tc in &tool_calls {
+                    seen_calls.insert(format!("{}:{}", tc.name, tc.input.to_string()));
+                }
+                if last_call_sig.as_deref().map(|s| s == &sig).unwrap_or(false) {
+                    repeat_count += 1;
+                } else {
+                    repeat_count = 0;
+                    last_call_sig = Some(sig.clone());
+                }
+                if repeat_count >= MAX_REPEAT
+                    || total_tool_calls >= MAX_TOTAL_TOOL_CALLS
+                    || consecutive_errors >= MAX_CONSECUTIVE_ERRORS
+                    || denials_this_turn >= MAX_DENIALS_PER_TURN
+                {
+                    let reason = if denials_this_turn >= MAX_DENIALS_PER_TURN {
+                        format!(
+                            "{} operations were denied for approval in this turn. The model kept retrying gated operations; stopping.",
+                            denials_this_turn
+                        )
+                    } else if repeat_count >= MAX_REPEAT {
+                        format!(
+                            "the model kept repeating the same tool call ({}). It may be emitting malformed arguments.",
+                            sig.chars().take(80).collect::<String>()
+                        )
+                    } else if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        format!(
+                            "the model hit {} consecutive tool errors without making progress.",
+                            consecutive_errors
+                        )
+                    } else {
+                        format!(
+                            "the model made {} tool calls without producing a final answer. It may be looping through exploration or retrying denied operations.",
+                            total_tool_calls
+                        )
+                    };
+                    error!(
+                        "aborting turn: repeat={} total_tool_calls={} distinct={} errors={} sig={}",
+                        repeat_count,
+                        total_tool_calls,
+                        seen_calls.len(),
+                        consecutive_errors,
+                        sig.chars().take(80).collect::<String>()
+                    );
+                    send(w, &Event::Error {
+                        id: Some(id),
+                        message: format!("{} Try a different model or provider, or disable tools.", reason),
+                    })
+                    .await?;
                     send(w, &Event::Done { id: Some(id) }).await?;
                     done_sent = true;
                     break;
@@ -720,57 +847,147 @@ async fn handle_message_turn(
                 }
 
                 let mut prepared: Vec<PreparedCall> = Vec::new();
+
+                // Helper: resolve a gate path to an absolute, normalized key.
+                let resolve_gate_key = |g: &ApprovalGate| -> (String, String) {
+                    let path_key = g.path.clone().unwrap_or_default();
+                    let resolved_path = if !path_key.is_empty() {
+                        let p = Path::new(&path_key);
+                        if p.is_relative() {
+                            ctx.working_dir.join(p).display().to_string()
+                        } else {
+                            path_key.clone()
+                        }
+                    } else {
+                        String::new()
+                    };
+                    let norm_key = normalize_path_key(&resolved_path);
+                    (path_key, norm_key)
+                };
+
+                // Read-only tools that gate on "outside workspace" reads. When
+                // several of these target the same outside directory in one
+                // turn, we ask ONE approval for the directory and apply it to
+                // all of them, instead of prompting per file.
+                let read_only_tools = ["read", "list_dir", "glob", "agentgrep"];
+
+                // Pass 1: for each tool call, decide whether it needs approval
+                // and, if it's a read-only outside-workspace read, which
+                // directory group it belongs to.
+                struct ApprovalPlan<'a> {
+                    tc: &'a crate::protocol::ToolCall,
+                    tool: Option<&'a dyn crate::tools::Tool>,
+                    gate: Option<ApprovalGate>,
+                    // For read-only outside reads: the normalized directory key
+                    // to batch on (empty = not batchable / needs individual).
+                    group_key: String,
+                }
+                let mut plan: Vec<ApprovalPlan> = Vec::new();
                 for tc in &tool_calls {
+                    let tool = tool_registry.as_ref().and_then(|r| r.find(&tc.name));
+                    let gate = gate_tool(&tc.name, &tc.input, &ctx);
+                    let group_key = if read_only_tools.iter().any(|t| t == &tc.name) {
+                        if let Some(g) = &gate {
+                            let (_, norm) = resolve_gate_key(g);
+                            // Group by the DIRECTORY being read, so all reads
+                            // inside the same outside directory share one
+                            // approval. `list_dir`/`glob` target a directory
+                            // already; `read`/`agentgrep` target a file, so
+                            // use its parent directory.
+                            if !norm.is_empty() {
+                                if tc.name == "read" || tc.name == "agentgrep" {
+                                    Path::new(&norm).parent().map(|p| p.display().to_string()).unwrap_or(norm.clone())
+                                } else {
+                                    norm.clone()
+                                }
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    };
+                    plan.push(ApprovalPlan { tc, tool, gate, group_key });
+                }
+
+                // Pass 2: resolve approvals. Read-only calls sharing a group
+                // key get one prompt for the directory; everything else is
+                // prompted individually (or auto-approved).
+                let mut group_decisions: HashMap<String, bool> = HashMap::new();
+                for ap in &plan {
                     send(w, &Event::Status {
                         id: Some(id),
-                        message: format!("Executing tool: {}...", tc.name),
+                        message: format!("Executing tool: {}...", ap.tc.name),
                     })
                     .await?;
-                    let tool = tool_registry.as_ref().and_then(|r| r.find(&tc.name));
-                    // Approval gate: mutations and reads outside the
-                    // workspace require consent.
-                    let gate = gate_tool(&tc.name, &tc.input, &ctx);
-                    let (approved, deny_reason) = match &gate {
+                    let (approved, deny_reason) = match &ap.gate {
                         None => (true, None),
                         Some(g) => match cfg.server.approve_mode.as_str() {
                             "auto" => (true, None),
                             "deny" => (false, Some(g.reason.clone())),
                             _ => {
                                 if interactive {
-                                    // Resolve path to absolute using working directory, then normalize
-                                    // This ensures "index.html", "./index.html", "/abs/index.html" all map to same cache key
-                                    let path_key = g.path.clone().unwrap_or_default();
-                                    let path_key_for_log = path_key.clone();
-                                    let resolved_path = if !path_key.is_empty() {
-                                        let p = Path::new(&path_key);
-                                        if p.is_relative() {
-                                            ctx.working_dir.join(p).display().to_string()
-                                        } else {
-                                            path_key
-                                        }
-                                    } else {
-                                        String::new()
-                                    };
-                                    let norm_key = normalize_path_key(&resolved_path);
-                                    let norm_key_log = norm_key.clone();
-                                    info!("approval check: tool={} path_key={} norm_key={} cache_size={} cache_contains={}", 
-                                        tc.name, path_key_for_log, norm_key_log, approved_paths.len(), approved_paths.contains(&norm_key));
+                                    let (path_key, norm_key) = resolve_gate_key(g);
+                                    info!("approval check: tool={} path_key={} norm_key={} cache_size={} cache_contains={}",
+                                        ap.tc.name, path_key, norm_key, approved_paths.len(), approved_paths.contains(&norm_key));
+                                    // Already approved this exact path this session.
                                     if !norm_key.is_empty() && approved_paths.contains(&norm_key) {
-                                        info!("auto-approving {} (already approved in this session): {}", tc.name, g.reason);
+                                        info!("auto-approving {} (already approved in this session): {}", ap.tc.name, g.reason);
                                         (true, None)
+                                    } else if !ap.group_key.is_empty() && group_decisions.contains_key(&ap.group_key) {
+                                        // Another read-only call already prompted for this directory.
+                                        let ok = group_decisions.get(&ap.group_key).map(|b| *b).unwrap_or(false);
+                                        if ok && !norm_key.is_empty() {
+                                            approved_paths.insert(norm_key);
+                                        }
+                                        (ok, if ok { None } else { Some(g.reason.clone()) })
                                     } else {
+                                        // Prompt once. For a read-only group,
+                                        // list the files being read so the user
+                                        // knows what they're approving; otherwise
+                                        // describe the individual tool.
+                                        let prompt_path = if !ap.group_key.is_empty() {
+                                            Some(ap.group_key.clone())
+                                        } else {
+                                            g.path.clone()
+                                        };
+                                        let prompt_reason = if !ap.group_key.is_empty() {
+                                            // Collect all file paths in this
+                                            // directory group for the prompt.
+                                            let files = plan
+                                                .iter()
+                                                .filter(|p| p.group_key == ap.group_key)
+                                                .map(|p| {
+                                                    let (_, n) = resolve_gate_key(p.gate.as_ref().unwrap());
+                                                    n
+                                                })
+                                                .filter(|n| !n.is_empty())
+                                                .collect::<Vec<_>>();
+                                            if files.len() > 1 {
+                                                format!(
+                                                    "read {} files outside workspace in {}:\n  {}",
+                                                    files.len(),
+                                                    ap.group_key,
+                                                    files.join("\n  ")
+                                                )
+                                            } else {
+                                                format!("read outside workspace ({})", ap.group_key)
+                                            }
+                                        } else {
+                                            g.reason.clone()
+                                        };
                                         send(w, &Event::ApprovalRequired {
                                             id,
-                                            tool_call_id: tc.id.clone(),
-                                            tool_name: tc.name.clone(),
-                                            path: g.path.clone(),
-                                            reason: g.reason.clone(),
+                                            tool_call_id: ap.tc.id.clone(),
+                                            tool_name: ap.tc.name.clone(),
+                                            path: prompt_path,
+                                            reason: prompt_reason,
                                         })
                                         .await?;
-                                        info!("asking approval for {} ({})", tc.name, g.reason);
-                                        // The read loop routes ApprovalResponse
-                                        // here over `approvals`.
-                                        let key = format!("{}:{}", id, tc.id);
+                                        info!("asking approval for {} ({})", ap.tc.name, g.reason);
+                                        let key = format!("{}:{}", id, ap.tc.id);
                                         let (tx, rx) = tokio::sync::oneshot::channel();
                                         approvals.write().await.insert(key.clone(), tx);
                                         let decision = tokio::time::timeout(
@@ -780,22 +997,26 @@ async fn handle_message_turn(
                                         .await;
                                         approvals.write().await.remove(&key);
                                         let ok = matches!(decision, Ok(Ok(true)));
+                                        // Cache the group decision so sibling
+                                        // read-only calls in the same directory
+                                        // don't re-prompt.
+                                        if !ap.group_key.is_empty() {
+                                            group_decisions.insert(ap.group_key.clone(), ok);
+                                        }
                                         if ok && !norm_key.is_empty() {
-                                            let norm_key_clone = norm_key.clone();
-                                            approved_paths.insert(norm_key);
-                                            info!("inserted into approval cache: norm_key={} cache_size={}", norm_key_clone, approved_paths.len());
+                                            approved_paths.insert(norm_key.clone());
+                                            info!("inserted into approval cache: norm_key={} cache_size={}", norm_key, approved_paths.len());
                                         }
                                         // Also extract paths from apply_patch patches to populate cache
-                                        if ok && tc.name == "apply_patch" {
+                                        if ok && ap.tc.name == "apply_patch" {
                                             info!("apply_patch approved, extracting paths from patch");
-                                            if let Some(patch) = tc.input.get("patch").and_then(|v| v.as_str()) {
+                                            if let Some(patch) = ap.tc.input.get("patch").and_then(|v| v.as_str()) {
                                                 let extracted = extract_patch_paths(patch);
                                                 info!("extract_patch_paths returned: {:?}", extracted);
                                                 for p in extracted {
-                                                    let p_clone = p.clone();
-                                                    if !p_clone.is_empty() {
-                                                        approved_paths.insert(p_clone.clone());
-                                                        info!("inserted patch path into cache: {}", p_clone);
+                                                    if !p.is_empty() {
+                                                        approved_paths.insert(p.clone());
+                                                        info!("inserted patch path into cache: {}", p);
                                                     }
                                                 }
                                             } else {
@@ -805,13 +1026,13 @@ async fn handle_message_turn(
                                         (ok, if ok { None } else { Some(g.reason.clone()) })
                                     }
                                 } else {
-                                    info!("auto-approving {} in non-interactive mode: {}", tc.name, g.reason);
+                                    info!("auto-approving {} in non-interactive mode: {}", ap.tc.name, g.reason);
                                     (true, None)
                                 }
                             }
                         }
                     };
-                    prepared.push(PreparedCall { tc, tool, approved, deny_reason });
+                    prepared.push(PreparedCall { tc: ap.tc, tool: ap.tool, approved, deny_reason });
                 }
 
                 // Phase 2a: run all approved, independent (read-only) tools
@@ -847,6 +1068,7 @@ async fn handle_message_turn(
                 for pc in &prepared {
                     let result_entry = if !pc.approved {
                         warn!("tool denied: {} ({})", pc.tc.name, pc.deny_reason.as_deref().unwrap_or("no approval"));
+                        denials_this_turn += 1;
                         crate::protocol::ToolResultEntry {
                             tool_call_id: pc.tc.id.clone(),
                             output: format!("APPROVAL_DENIED: {}", pc.deny_reason.as_deref().unwrap_or("no approval")),
@@ -898,6 +1120,14 @@ async fn handle_message_turn(
                     })
                     .await?;
                     results.push(result_entry);
+                }
+
+                // Progress check: count consecutive tool errors. If every tool
+                // in this batch errored, bump the counter; otherwise reset it.
+                if !results.is_empty() && results.iter().all(|r| r.is_error) {
+                    consecutive_errors += 1;
+                } else {
+                    consecutive_errors = 0;
                 }
 
                 // Append tool results to session conversation.
@@ -1044,6 +1274,7 @@ async fn run_headless_agent(
     cfg: &crate::config::Config,
     sessions: &SessionMap,
     session_id: &str,
+    provider: Option<&str>,
 ) -> Result<String> {
     let tool_registry = {
         let mut reg = crate::tools::default_registry();
@@ -1094,10 +1325,12 @@ async fn run_headless_agent(
             let s = sessions.read().await;
             s.get(session_id)
                 .map(|e| e.model.clone())
-                .unwrap_or_else(|| cfg.provider.default_model.clone())
+                .unwrap_or_else(|| {
+                    crate::config::resolve_provider(cfg, provider.as_deref()).default_model.clone()
+                })
         };
 
-        let events = match crate::provider::send_message(cfg, &session_model, &msgs, tool_defs_ref, "", &instructions).await {
+        let events = match crate::provider::send_message(cfg, provider, &session_model, &msgs, tool_defs_ref, "", &instructions, None).await {
             Ok(events) => events,
             Err(e) => {
                 let msg = format!("ERROR: {}", e);
@@ -1211,6 +1444,7 @@ async fn handle_swarm_spawn(
     parent_session_id: Option<String>,
     initial_message: &str,
     model_override: Option<&str>,
+    provider_override: Option<&str>,
     label: Option<&str>,
 ) -> Result<()> {
     let cfg = crate::config::load()?;
@@ -1223,7 +1457,9 @@ async fn handle_swarm_spawn(
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        let model = model_override.unwrap_or(&cfg.provider.default_model).to_string();
+        let model = model_override
+            .unwrap_or(&crate::config::resolve_provider(&cfg, provider_override).default_model)
+            .to_string();
         let entry = map.entry(session_id.clone()).or_insert_with(|| Session {
             id: session_id.clone(),
             title: format!("agent-{}", new_id),
@@ -1265,7 +1501,7 @@ async fn handle_swarm_spawn(
 
     // Run the agent headlessly with the full tool set (auto-approved — no
     // human is attached). Returns the accumulated assistant text.
-    let assistant_text = run_headless_agent(&cfg, sessions, &session_id).await?;
+    let assistant_text = run_headless_agent(&cfg, sessions, &session_id, provider_override).await?;
 
     // Forward the completion report to the parent session (jancode's
     // report_back_to_session_id policy): queue a soft interrupt / send a

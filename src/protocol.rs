@@ -16,6 +16,10 @@ pub enum Request {
         tools: Option<Vec<String>>,
         #[serde(default)]
         model: Option<String>,
+        /// Name of the provider to use (from `[[providers]]`). Empty/None uses
+        /// the config default.
+        #[serde(default)]
+        provider: Option<String>,
         #[serde(default)]
         cwd: Option<String>,
         /// True when a human is attached and can answer approval prompts
@@ -50,6 +54,8 @@ pub enum Request {
         parent_session_id: Option<String>,
         initial_message: String,
         model: Option<String>,
+        #[serde(default)]
+        provider: Option<String>,
         label: Option<String>,
     },
     /// Direct message to another session. Delivered as a soft interrupt that

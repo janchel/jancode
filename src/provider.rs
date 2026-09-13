@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, ProviderConfig};
 use crate::protocol::{Event, ToolCall};
 use anyhow::{Context, Result};
 use reqwest::Client;
@@ -14,6 +14,12 @@ struct ChatRequest {
     tools: Option<Vec<ToolDef>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_choice: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u64>,
+    /// Stop sequences. In flattened mode we stop at the tool-request marker so
+    /// the model doesn't hallucinate the tool's result (classic ReAct failure).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stop: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,7 +54,15 @@ struct ApiToolCall {
     id: Option<String>,
     #[serde(default)]
     index: usize,
+    /// Groq (and some other providers) require `type: "function"` on each
+    /// tool call in the assistant message.
+    #[serde(rename = "type", default = "default_tool_call_type")]
+    tool_type: String,
     function: ApiFunctionCall,
+}
+
+fn default_tool_call_type() -> String {
+    "function".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +94,14 @@ struct StreamDelta {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ApiToolCall>>,
+    /// Reasoning/thinking tokens streamed by reasoning models (e.g. DeepSeek,
+    /// some routers). Captured so the client can surface them as status text.
+    #[serde(default)]
+    reasoning: Option<String>,
+    /// DeepSeek-style reasoning field (some providers use `reasoning_content`
+    /// instead of `reasoning`).
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 /// Parsed tool call accumulated across deltas.
@@ -146,6 +168,18 @@ async fn do_chat_request(
     let stall = stream_stall();
     let mut buf: Vec<u8> = Vec::new();
     let mut out = String::new();
+    // Some routers (e.g. rebelstack) send `keepalive` chunks (`delta:{}`) that
+    // reset the per-chunk stall timer. A slow-but-alive upstream router legitimately
+    // routes through keepalives for a while before the first real chunk, but a
+    // STUCK router can send them forever. Detect keepalive-only chunks and bail
+    // once nothing but keepalives have arrived for the whole stall window, so we
+    // don't hang forever. This gives a slow router the same generous window as a
+    // total stall, but turns an infinite keepalive stream into a bounded error.
+    // The budget is the same `stream_stall()` (so `JANCODE_STREAM_STALL_SECS`
+    // overrides it too), but measured as keepalive-only time — a real-content
+    // chunk also resets it.
+    let keepalive_stall = stream_stall();
+    let mut first_empty: Option<std::time::Instant> = None;
     loop {
         let chunk = tokio::time::timeout(stall, resp.chunk())
             .await
@@ -157,6 +191,31 @@ async fn do_chat_request(
             })?;
         let chunk = chunk.context("reading response body")?;
         let Some(bytes) = chunk else { break };
+        // Detect keepalive-only chunks: a line that is `data: {...}` with an
+        // empty delta and no content/tool_calls. We count them and bail if the
+        // provider keeps sending them without progress. Only count a chunk as
+        // keepalive if it has NO real content and NO [DONE] marker.
+        let line_str = String::from_utf8_lossy(&bytes);
+        let is_keepalive = !line_str.contains("[DONE]")
+            && line_str.contains("\"delta\":{}")
+            && !line_str.contains("\"content\":\"")
+            && !line_str.contains("\"tool_calls\"");
+        if is_keepalive {
+            let now = std::time::Instant::now();
+            let start = *first_empty.get_or_insert(now);
+            if now.duration_since(start) >= keepalive_stall {
+                tracing::error!(
+                    "provider stream stalled: only keepalive/empty chunks for {}s without a real response",
+                    now.duration_since(start).as_secs()
+                );
+                anyhow::bail!(
+                    "provider stream stalled: only keepalive chunks for {}s without a real response",
+                    keepalive_stall.as_secs()
+                );
+            }
+            continue;
+        }
+        first_empty = None;
         buf.extend_from_slice(&bytes);
         while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
             let line: Vec<u8> = buf.drain(..=pos).collect();
@@ -179,6 +238,11 @@ fn is_retryable_transport_error(e: &anyhow::Error) -> bool {
         if cause.downcast_ref::<tokio::time::error::Elapsed>().is_some() {
             return true;
         }
+        // Keepalive-only stall: transient provider condition (router routed to a
+        // slow/overloaded upstream). Worth retrying so a re-route can succeed.
+        if cause.to_string().contains("only keepalive chunks") {
+            return true;
+        }
         cause
             .downcast_ref::<reqwest::Error>()
             .map(|re| re.is_timeout() || re.is_connect() || re.is_body())
@@ -186,40 +250,177 @@ fn is_retryable_transport_error(e: &anyhow::Error) -> bool {
     })
 }
 
+/// True when the error is an HTTP 429 (rate limit) response.
+fn is_rate_limit_error(e: &anyhow::Error) -> bool {
+    e.to_string().contains("429")
+}
+
+/// Extract the suggested wait time from a 429 rate-limit error message, if the
+/// provider includes one (e.g. "Please try again in 13.155s"). Falls back to a
+/// default backoff.
+fn rate_limit_wait(e: &anyhow::Error) -> std::time::Duration {
+    let msg = e.to_string();
+    // Look for "in <N>s" or "in <N> seconds" in the message.
+    if let Some(idx) = msg.find("in ") {
+        let rest = &msg[idx + 3..];
+        let num: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+        if let Ok(secs) = num.parse::<f64>() {
+            if secs > 0.0 {
+                return std::time::Duration::from_secs_f64(secs + 1.0);
+            }
+        }
+    }
+    std::time::Duration::from_secs(15)
+}
+
+/// Normalize tool-call arguments to be robust against models that emit
+/// non-standard schemas. Some reasoning models / routers produce arguments
+/// that don't match the tool's declared JSON schema (e.g. `file_path` instead
+/// of `path`, or a `raw` wrapper around a JSON string). We repair the common
+/// cases so the tool can actually run instead of failing and looping.
+fn normalize_tool_args(name: &str, input: &Value) -> Value {
+    // If the args failed to parse as JSON, they were wrapped in `{"raw": ...}`.
+    // Try to recover the inner JSON string and re-parse it.
+    if let Some(raw) = input.get("raw").and_then(|v| v.as_str()) {
+        if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
+            return normalize_tool_args(name, &parsed);
+        }
+        // If the raw string is truncated JSON (unbalanced braces), try to
+        // repair it by balancing braces.
+        if let Some(repaired) = repair_truncated_json(raw) {
+            if let Ok(parsed) = serde_json::from_str::<Value>(&repaired) {
+                return normalize_tool_args(name, &parsed);
+            }
+        }
+    }
+
+    // Common schema aliases: map non-standard keys to the canonical ones the
+    // tools expect. This handles models that emit `file_path`/`file`/`filename`
+    // instead of `path`, etc. We rebuild the object with canonical keys.
+    if let Some(obj) = input.as_object() {
+        let mut out = serde_json::json!({});
+        if let Some(mut out_map) = out.as_object_mut() {
+            for (k, v) in obj {
+                let canonical = canonical_key(&k);
+                // Only set if not already present (don't overwrite a canonical key).
+                if !out_map.contains_key(&canonical) {
+                    out_map.insert(canonical, v.clone());
+                }
+            }
+        }
+        return out;
+    }
+    input.clone()
+}
+
+/// Map a non-standard tool-argument key to the canonical one the tools expect.
+fn canonical_key(k: &str) -> String {
+    match k {
+        "file_path" | "file" | "filename" | "filepath" | "target_path" | "destination" => "path".to_string(),
+        "command_line" | "cmd" | "shell_command" => "command".to_string(),
+        "query_string" | "search" => "query".to_string(),
+        "pattern_str" | "glob_pattern" => "pattern".to_string(),
+        "content_str" | "file_content" | "new_content" => "content".to_string(),
+        "replacement" => "new_string".to_string(),
+        "old_text" | "old_value" => "old_string".to_string(),
+        "new_text" | "new_value" => "new_string".to_string(),
+        _ => k.to_string(),
+    }
+}
+
+/// Attempt to repair truncated JSON by balancing braces/brackets. Some models
+/// stream tool-call arguments that get cut off (e.g. `{"path": "styles.css"`).
+/// We append the missing closing delimiters so the JSON parses.
+fn repair_truncated_json(s: &str) -> Option<String> {
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in s.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                if !stack.is_empty() && stack.last().map(|x| *x).unwrap_or('\0') == c {
+                    stack.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    if stack.is_empty() {
+        None
+    } else {
+        let mut out = s.to_string();
+        for c in stack.iter().rev() {
+            out.push(*c);
+        }
+        Some(out)
+    }
+}
+
 pub async fn send_message(
     cfg: &Config,
+    provider_name: Option<&str>,
     model: &str,
     session_messages: &[crate::storage::Message],
     tools: Option<&[crate::tools::ToolDefinition]>,
     memory_context: &str,
     instructions: &str,
+    tool_budget: Option<u32>,
 ) -> Result<Vec<Event>> {
-    let api_key = resolve_api_key(cfg)?;
-    let base_url = cfg.provider.base_url.trim_end_matches('/');
+    let provider = crate::config::resolve_provider(cfg, provider_name);
+    let api_key = resolve_api_key(cfg, &provider)?;
+    let base_url = provider.base_url.trim_end_matches('/');
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(12 * 60 * 60))
         .connect_timeout(std::time::Duration::from_secs(30))
         .build()?;
 
-    let mut system = "You are a helpful AI coding agent running with full local filesystem access on the user's machine. You have tools to explore the codebase: list_dir (list a directory), glob (find files by pattern), read (read file contents), agentgrep (search file contents), bash (run shell commands), write (create/overwrite files), and edit (replace text in a file). 
+    let mut system = if provider.supports_tools {
+        "You are a helpful AI coding agent with local filesystem access. You have tools: list_dir, glob, read, agentgrep, bash, write, edit, apply_patch, plan, git, fetch_url, http_request, note, docker, sql.
 
-CRITICAL RULES — VIOLATION WILL BREAK THE WORKFLOW:
-1. ALWAYS start with list_dir on '.' — this is MANDATORY before any other tool
-2. NEVER read files until you have the directory listing AND a clear reason to read a specific file
-3. Use glob/agentgrep to FIND files first, then read ONLY the specific files you need
-4. NEVER read all files in a directory — this wastes tokens and time
-3. When the user says 'modify colors' or similar, explore FIRST, then read ONLY the relevant files (e.g., styles.css)
+WORKFLOW (be surgical, not exhaustive):
+1. Start with list_dir on '.' to see the project structure.
+2. Use glob/agentgrep to FIND files, then read ONLY the specific files you need.
+3. Never read all files in a directory — that wastes time and tokens.
+4. When the user asks you to modify something, DO IT: read the relevant file, make the change, confirm it. Don't re-explore or re-read files you already have.
+5. If the user's message is a greeting or small talk, just respond naturally — don't start exploring the filesystem.
 
-VIOLATION EXAMPLES (DO NOT DO):
-❌ list_dir then immediately read hello.py, index.html, script.js, styles.css
-❌ read all files in a directory 'to understand the project'
-❌ read files 'just in case' or 'to be thorough'
+WORKSPACE (CRITICAL):
+Your working directory is your confined workspace. Use relative paths (e.g.
+`styles.css`, `src/main.rs`) — never absolute paths. Do NOT prepend the absolute
+path, and do NOT `cd /abs/path/...` to reach files that are already in your own
+workspace; your tools already run inside it. Only touch a location OUTSIDE the
+workspace if it's genuinely needed — it will require the user's approval.
 
-CORRECT WORKFLOW:
-✅ list_dir → see styles.css exists → read styles.css → make changes
-✅ list_dir → glob **/*.css → read only the CSS files found
+APPROVALS (CRITICAL):
+Some operations (write/apply_patch, bash mutations, git, docker, http non-GET)
+require the user to approve them. If a tool result says \"APPROVAL_DENIED\" or the
+user denies an operation, STOP retrying that operation. Do NOT keep issuing the
+same or similar gated operations hoping one gets approved — that wastes the whole
+tool budget and looks like a loop. Instead:
+- If a full-file write was denied, switch to small targeted `edit` calls that
+  only change the exact lines needed (these are usually approved).
+- If edits keep failing or being denied, give your final answer and explain what
+  you could not change and why.
 
-The user's time and tokens are limited. Be surgical, not exhaustive.".to_string();
+The user's time and tokens are limited. Be concise and direct.".to_string()
+    } else {
+        // No tool calling: the model answers directly. Don't mention tools so
+        // it doesn't try to call them (which would just loop).
+        "You are a helpful AI assistant. You do NOT have access to any tools or the filesystem. Answer the user's questions directly and concisely based on your knowledge. If you don't know something, say so. Do not mention tools, files, or directories — just answer the question.".to_string()
+    };
     if !instructions.is_empty() {
         system.push_str("\n\n# Project instructions (AGENTS.md)\n");
         system.push_str("Follow the project instructions below. They come from the repository's AGENTS.md/CLAUDE.md files and describe the project's conventions, build/test commands, and operating rules. They take precedence over generic guidance, but never override the user's direct request.\n");
@@ -230,6 +431,51 @@ The user's time and tokens are limited. Be surgical, not exhaustive.".to_string(
         system.push_str(memory_context);
     }
 
+    // In flattened mode the provider can't receive structured `tool_calls`, so
+    // the model must emit tool calls as text markers that we parse. Tell it
+    // exactly how to do that, otherwise it just asks the user to run tools.
+    // Only relevant when tools are enabled.
+    if provider.supports_tools && provider.tool_call_style == "flattened" {
+        system.push_str(
+            "\n\nTOOL CALLING FORMAT (CRITICAL):\n\
+             Call tools by emitting a JSON block:\n\
+             [tool_request]\n\
+             {\"name\": \"<tool_name>\", \"arguments\": {<json args>}}\n\
+             [END_TOOL_REQUEST]\n\
+             Then STOP — do not write the tool's result yourself; the system\n\
+             executes it and returns the real result next.\n\
+             \n\
+             Example:\n\
+             User: what files are here?\n\
+             Assistant: [tool_request]\n\
+             {\"name\": \"list_dir\", \"arguments\": {\"path\": \".\"}}\n\
+             [END_TOOL_REQUEST]\n\
+             \n\
+             User: [tool result]: index.html\nscript.js\nstyles.css\n\
+             Assistant: The directory contains index.html, script.js, and styles.css.\n\
+             \n\
+             Use EXACTLY the paths returned by list_dir. When editing, use the\n\
+             same path you read from. Once you have what you need, make the\n\
+             change and give your final answer in plain text.\n",
+        );
+    }
+
+    // Budget signaling: tell the model how many tool calls it has left so it
+    // wraps up instead of exploring forever. Only meaningful when tools are on.
+    if provider.supports_tools {
+        if let Some(budget) = tool_budget {
+            system.push_str(&format!(
+                "\n\nTOOL BUDGET (CRITICAL):\n\
+                 You have approximately {} tool call(s) remaining for this task.\n\
+                 Use them wisely: prefer reading the specific file you need over\n\
+                 broad exploration. Once you have enough information, make the\n\
+                 change and give your final answer. Do not waste calls re-reading\n\
+                 the same file or re-listing directories you already saw.\n",
+                budget
+            ));
+        }
+    }
+
     let mut messages: Vec<ChatMessage> = Vec::new();
     messages.push(ChatMessage {
         role: "system".to_string(),
@@ -237,28 +483,99 @@ The user's time and tokens are limited. Be surgical, not exhaustive.".to_string(
         tool_calls: None,
         tool_call_id: None,
     });
-    messages.extend(
-        session_messages
-            .iter()
-            .map(|m| ChatMessage {
-                role: m.role.clone(),
-                content: if m.content.is_empty() { None } else { Some(m.content.clone()) },
-                tool_calls: m.tool_calls.as_ref().map(|tcs| {
-                    tcs.iter()
-                        .enumerate()
-                        .map(|(i, tc)| ApiToolCall {
-                            id: Some(tc.id.clone()),
-                            index: i,
-                            function: ApiFunctionCall {
-                                name: Some(tc.name.clone()),
-                                arguments: Some(tc.arguments.clone()),
-                            },
-                        })
-                        .collect()
+
+    // Some providers (e.g. Gemma via LM Studio) reject the OpenAI
+    // `tool_calls`/`tool` message roles in the request history. When
+    // `tool_call_style = "flattened"`, we convert tool-call history into plain
+    // user/assistant messages so those providers accept it.
+    //
+    // `"auto"` starts with the OpenAI native format but ALSO parses text-based
+    // tool calls as a fallback, so a model that emits `[tool_request]` markers
+    // instead of structured `tool_calls` still works.
+    //
+    // We deliberately do NOT flatten on `auto` even when the history contains
+    // `tool`/`tool_calls` roles. Models served through `auto` combos (e.g.
+    // rebelstack) handle native `tool_calls` fine, and forcing the flattened
+    // text format on subsequent turns makes the combo router stall / route to
+    // an overloaded upstream. Native format round-trips reliably. Only
+    // `tool_call_style = "flattened"` (for providers like LM Studio that reject
+    // tool roles) triggers the flattened text encoding.
+    let has_tool_history = session_messages.iter().any(|m| m.role == "tool" || m.tool_calls.is_some());
+    let flattened = provider.tool_call_style == "flattened";
+    let auto_style = provider.tool_call_style == "auto";
+
+    if flattened {
+        for m in session_messages {
+            if m.role == "tool" {
+                // A tool result becomes a user message describing the output.
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(format!("[tool result]: {}", m.content)),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            } else if let Some(tcs) = &m.tool_calls {
+                // An assistant message that made tool calls: describe the calls
+                // in the assistant text (no `tool_calls` field).
+                let calls_desc = tcs
+                    .iter()
+                    .map(|tc| format!("{} {}", tc.name, tc.arguments))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let text = if m.content.is_empty() {
+                    format!("[calling tools: {}]", calls_desc)
+                } else {
+                    format!("{}\n[calling tools: {}]", m.content, calls_desc)
+                };
+                messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some(text),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            } else {
+                messages.push(ChatMessage {
+                    role: m.role.clone(),
+                    content: Some(m.content.clone()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
+        }
+    } else {
+        messages.extend(
+            session_messages
+                .iter()
+                .map(|m| ChatMessage {
+                    role: m.role.clone(),
+                    // Provider compatibility: an assistant message that carries
+                    // `tool_calls` must have `content` as null/omitted (not an
+                    // empty string) — LM Studio's Gemma rejects `content:""` on a
+                    // tool-call message. Tool-result and regular messages keep a
+                    // string content.
+                    content: if m.tool_calls.is_some() {
+                        None
+                    } else {
+                        Some(m.content.clone())
+                    },
+                    tool_calls: m.tool_calls.as_ref().map(|tcs| {
+                        tcs.iter()
+                            .enumerate()
+                            .map(|(i, tc)| ApiToolCall {
+                                id: Some(tc.id.clone()),
+                                index: i,
+                                tool_type: "function".to_string(),
+                                function: ApiFunctionCall {
+                                    name: Some(tc.name.clone()),
+                                    arguments: Some(tc.arguments.clone()),
+                                },
+                            })
+                            .collect()
+                    }),
+                    tool_call_id: m.tool_call_id.clone(),
                 }),
-                tool_call_id: m.tool_call_id.clone(),
-            }),
-    );
+        );
+    }
 
     let tool_defs = tools.map(|tds| {
         tds.iter()
@@ -279,12 +596,62 @@ The user's time and tokens are limited. Be surgical, not exhaustive.".to_string(
         Some(serde_json::json!("none"))
     };
 
+    // Optional context-window trimming: if `context_window` is set, drop the
+    // oldest messages (keeping the system prompt and the most recent turns)
+    // so the request stays within the model's context budget. This reduces
+    // token usage and rate-limit pressure on providers like Groq.
+    if provider.context_window > 0 && messages.len() > 4 {
+        // Rough token estimate: ~4 chars per token.
+        let budget = provider.context_window;
+        let mut total: u64 = 0;
+        let mut keep_from = messages.len();
+        // Walk backwards from the newest message, accumulating until we hit
+        // the budget. Always keep at least the system prompt + last 2 turns.
+        let min_keep = 3; // system + user + assistant
+        for i in (min_keep..messages.len()).rev() {
+            let est = (messages[i].content.as_deref().map_or(0, |c| c.len()) / 4) as u64;
+            if total + est > budget {
+                break;
+            }
+            total += est;
+            keep_from = i;
+        }
+        if keep_from > min_keep {
+            tracing::info!(
+                "context window {}: trimming {} oldest messages (keeping {}..{})",
+                budget,
+                keep_from - min_keep,
+                keep_from,
+                messages.len(),
+            );
+            let mut trimmed = Vec::new();
+            trimmed.push(messages[0].clone()); // system prompt
+            for i in keep_from..messages.len() {
+                trimmed.push(messages[i].clone());
+            }
+            messages = trimmed;
+        }
+    }
+
     let req = ChatRequest {
         model: model.to_string(),
         messages,
         stream: true,
         tools: tool_defs,
         tool_choice,
+        max_tokens: if provider.max_tokens > 0 {
+            Some(provider.max_tokens)
+        } else {
+            None
+        },
+        // In flattened mode, stop generation right after the model emits the
+        // tool-request marker so it can't hallucinate the tool's result. The
+        // server feeds the real result back in the next turn.
+        stop: if flattened {
+            Some(vec!["[END_TOOL_REQUEST]".to_string()])
+        } else {
+            None
+        },
     };
 
     let url = format!("{}/chat/completions", base_url);
@@ -294,25 +661,56 @@ The user's time and tokens are limited. Be surgical, not exhaustive.".to_string(
             tracing::info!("  tool: {} - {}", td.function.name, td.function.description.chars().take(60).collect::<String>());
         }
     }
+    // Debug: dump the exact JSON payload so we can see what the provider rejects.
+    if let Ok(json) = serde_json::to_string(&req) {
+        tracing::debug!("provider request body: {}", json);
+    }
     let mut events = Vec::new();
     let mut full = String::new();
+    // Accumulate reasoning/thinking tokens and emit them as ONE Status event
+    // after the stream, so the client shows a single "[thinking] ..." line
+    // instead of one line per token.
+    let mut reasoning_buf = String::new();
 
     // Accumulate tool calls across deltas; emit them as a single ToolCall event
     // when the turn finishes.
     let mut pending: Vec<AccumulatedToolCall> = Vec::new();
 
-    // Retry once when the failure is a transient transport problem (timeout,
-    // dropped connection, or body-read stall). The whole request is re-issued;
-    // this is safe because the provider call is just a generation, not a
-    // mutation. Non-transport errors (HTTP 4xx/5xx etc.) are surfaced as-is.
+    // Retry on transient transport problems (timeout, dropped connection,
+    // body-read stall) and on 429 rate-limit responses (with backoff). The
+    // whole request is re-issued; this is safe because the provider call is
+    // just a generation, not a mutation. Other HTTP errors (4xx/5xx) are
+    // surfaced as-is.
+    //
+    // For 429s we only retry SHORT waits (e.g. per-minute token limits). A
+    // long wait (e.g. "tokens per day" with a 29-minute reset) is surfaced
+    // immediately so the user can switch models instead of hanging for the
+    // retry budget.
+    const MAX_RATE_LIMIT_RETRY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
     let body = {
         let mut attempt = 0;
         loop {
             attempt += 1;
             match do_chat_request(&client, &url, &api_key, &req).await {
                 Ok(body) => break body,
-                Err(e) if attempt == 1 && is_retryable_transport_error(&e) => {
-                    tracing::warn!("provider transport failure: {:?}; retrying once", e);
+                Err(e) if attempt <= 3 && is_retryable_transport_error(&e) => {
+                    tracing::warn!("provider transport failure: {:?}; retrying (attempt {})", e, attempt);
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+                    continue;
+                }
+                Err(e) if attempt <= 3 && is_rate_limit_error(&e) => {
+                    let wait = rate_limit_wait(&e);
+                    if wait > MAX_RATE_LIMIT_RETRY_WAIT {
+                        // Long wait (daily quota, etc.) — don't hang; surface
+                        // the error so the user can switch models.
+                        tracing::error!(
+                            "provider rate limited with long wait ({}s); not retrying — switch models",
+                            wait.as_secs()
+                        );
+                        return Err(e);
+                    }
+                    tracing::warn!("provider rate limited; retrying in {}s (attempt {})", wait.as_secs(), attempt);
+                    tokio::time::sleep(wait).await;
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -322,25 +720,48 @@ The user's time and tokens are limited. Be surgical, not exhaustive.".to_string(
     tracing::info!("provider response: {} lines, {} bytes", body.lines().count(), body.len());
     tracing::debug!("provider response body: {}", body);
     for line in body.lines() {
-        process_line(line, &mut events, &mut full, &mut pending);
+        process_line(line, &mut events, &mut full, &mut pending, &mut reasoning_buf);
+    }
+
+    // Emit the accumulated reasoning as a single Status event (if any).
+    if !reasoning_buf.is_empty() {
+        events.push(Event::Status {
+            id: None,
+            message: format!("thinking: {}", reasoning_buf.trim()),
+        });
     }
 
     // Flush any accumulated tool calls into a ToolCall event.
-    if !pending.is_empty() {
+    let had_structured_calls = !pending.is_empty();
+    if had_structured_calls {
         let calls: Vec<ToolCall> = pending
             .into_iter()
             .map(|a| {
+                let name = a.name.clone();
                 let input: Value = serde_json::from_str(&a.args).unwrap_or_else(|_| {
                     serde_json::json!({ "raw": a.args.clone() })
                 });
+                let norm = normalize_tool_args(&name, &input);
                 ToolCall {
                     id: a.id,
-                    name: a.name,
-                    input,
+                    name,
+                    input: norm,
                 }
             })
             .collect();
         events.push(Event::ToolCall { id: None, calls });
+    }
+
+    // In flattened mode the model writes tool calls as text
+    // (`[calling tools: name {"arg":...}]`) instead of structured `tool_calls`.
+    // If no structured tool calls were emitted but the text contains the
+    // marker, parse it and emit a ToolCall event so the tools actually run.
+    // In "auto" mode we also parse text markers as a fallback, since some
+    // models emit them even when structured tool calling is advertised.
+    if (flattened || auto_style) && !had_structured_calls {
+        if let Some(calls) = parse_flattened_tool_calls(&full) {
+            events.push(Event::ToolCall { id: None, calls });
+        }
     }
 
     // Ensure a terminal Done event.
@@ -354,11 +775,126 @@ The user's time and tokens are limited. Be surgical, not exhaustive.".to_string(
     Ok(events)
 }
 
+/// Parse tool calls written as text in flattened mode. Handles two formats the
+/// model may emit:
+///   1. `[calling tools: read {"path":"styles.css"}]` (compact, `;`-separated)
+///   2. `[tool_request] {json} [END_TOOL_REQUEST]` (JSON block)
+/// Returns `None` if no tool-call marker is present.
+fn parse_flattened_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
+    let mut calls = Vec::new();
+
+    // Format 2: `[tool_request] ... [END_TOOL_REQUEST]` JSON blocks.
+    let mut search_from = 0;
+    while let Some(start) = text[search_from..].find("[tool_request]") {
+        let abs_start = search_from + start + "[tool_request]".len();
+        let rest = &text[abs_start..];
+        let end = rest.find("[END_TOOL_REQUEST]")?;
+        let body = rest[..end].trim();
+        if let Ok(v) = serde_json::from_str::<Value>(body) {
+            let name = v
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
+            let args = v.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({}));
+            if !name.is_empty() {
+                calls.push(ToolCall {
+                    id: format!("text-{}", calls.len()),
+                    name,
+                    input: args,
+                });
+            }
+        }
+        search_from = abs_start + end + "[END_TOOL_REQUEST]".len();
+    }
+
+    // Format 1: `[calling tools: ...]` compact marker.
+    if let Some(start) = text.find("[calling tools:") {
+        let rest = &text[start + "[calling tools:".len()..];
+        if let Some(end) = rest.find(']') {
+            let body = rest[..end].trim();
+            if !body.is_empty() {
+                // If the body is (or starts with) a JSON object/array, the
+                // call args may legitimately contain `;` (e.g. CSS inside an
+                // edit call), so we must NOT split on `;`. Parse it as one
+                // tool call instead.
+                //
+                // Two shapes:
+                //   a) `edit {"path":"x","content":"a;b"}`  (name + JSON args)
+                //   b) `edit` with no args, or `name arg` (plain)
+                let first_token_end = body
+                    .char_indices()
+                    .find(|(_, c)| c.is_whitespace())
+                    .map(|(i, _)| i)
+                    .unwrap_or(body.len());
+                let (name_part, args_part) = body.split_at(first_token_end);
+                let name = name_part.trim().to_string();
+                let args_part = args_part.trim();
+                if !name.is_empty() {
+                    // Try to parse the argument portion as JSON.
+                    let parsed_args: Option<Value> = if args_part.is_empty() {
+                        Some(serde_json::json!({}))
+                    } else if args_part.starts_with('{') {
+                        // One JSON object → one tool call (even if it contains
+                        // `;` inside string values).
+                        serde_json::from_str::<Value>(args_part).ok()
+                    } else {
+                        // Mixed / multiple plain calls — split on `;` but only
+                        // if not inside a JSON object. This is the legacy path
+                        // for `list_dir {}; read {"path":"x"}` style markers.
+                        None
+                    };
+                    match parsed_args {
+                        Some(input) => {
+                            calls.push(ToolCall {
+                                id: format!("text-{}", calls.len()),
+                                name: name.clone(),
+                                input,
+                            });
+                        }
+                        None => {
+                            // Legacy multi-call: split on `;`, but only split
+                            // each segment at its own JSON args.
+                            for part in body.split(';') {
+                                let part = part.trim();
+                                if part.is_empty() {
+                                    continue;
+                                }
+                                let mut it = part.splitn(2, char::is_whitespace);
+                                let n = it.next().unwrap_or("").trim().to_string();
+                                let args_str = it.next().unwrap_or("{}").trim();
+                                if n.is_empty() {
+                                    continue;
+                                }
+                                let input: Value = serde_json::from_str(args_str).unwrap_or_else(|_| {
+                                    serde_json::json!({ "raw": args_str })
+                                });
+                                calls.push(ToolCall {
+                                    id: format!("text-{}", calls.len()),
+                                    name: n,
+                                    input,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if calls.is_empty() {
+        None
+    } else {
+        Some(calls)
+    }
+}
+
 fn process_line(
     line: &str,
     events: &mut Vec<Event>,
     full: &mut String,
     pending: &mut Vec<AccumulatedToolCall>,
+    reasoning_buf: &mut String,
 ) {
     let line = line.trim();
     if !line.starts_with("data: ") {
@@ -386,6 +922,19 @@ fn process_line(
             if !text.is_empty() {
                 full.push_str(text);
                 events.push(Event::TextDelta { id: None, text: text.clone() });
+            }
+        }
+
+        // Reasoning/thinking tokens (reasoning models). Accumulate them into the
+        // buffer; they're emitted as a single Status event after the stream.
+        // Handles both `reasoning` (OpenAI-style) and `reasoning_content`
+        // (DeepSeek-style) field names.
+        let reasoning = choice.delta.reasoning
+            .as_ref()
+            .or_else(|| choice.delta.reasoning_content.as_ref());
+        if let Some(r) = reasoning {
+            if !r.is_empty() {
+                reasoning_buf.push_str(r);
             }
         }
 
@@ -437,12 +986,13 @@ fn process_line(
 /// Fetch the model catalog from the provider. Prefers the explicit `models`
 /// list in config; otherwise queries the OpenAI-compatible `GET /models`
 /// endpoint. Used by the `/model` interactive picker.
-pub async fn list_models(cfg: &Config) -> Result<Vec<String>> {
-    if !cfg.provider.models.is_empty() {
-        return Ok(cfg.provider.models.clone());
+pub async fn list_models(cfg: &Config, provider_name: Option<&str>) -> Result<Vec<String>> {
+    let provider = crate::config::resolve_provider(cfg, provider_name);
+    if !provider.models.is_empty() {
+        return Ok(provider.models.clone());
     }
-    let api_key = resolve_api_key(cfg)?;
-    let base_url = cfg.provider.base_url.trim_end_matches('/');
+    let api_key = resolve_api_key(cfg, &provider)?;
+    let base_url = provider.base_url.trim_end_matches('/');
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()?;
@@ -470,15 +1020,15 @@ pub async fn list_models(cfg: &Config) -> Result<Vec<String>> {
     Ok(parsed.data.into_iter().map(|m| m.id).collect())
 }
 
-fn resolve_api_key(cfg: &Config) -> Result<String> {
+fn resolve_api_key(cfg: &Config, provider: &ProviderConfig) -> Result<String> {
     // 1. Inline key in config (easiest for single-user setups)
-    if let Some(ref key) = cfg.provider.api_key {
+    if let Some(ref key) = provider.api_key {
         if !key.trim().is_empty() {
             return Ok(key.clone());
         }
     }
     // 2. Named environment variable from config
-    if let Some(ref env_name) = cfg.provider.api_key_env {
+    if let Some(ref env_name) = provider.api_key_env {
         if let Ok(val) = std::env::var(env_name) {
             if !val.trim().is_empty() {
                 return Ok(val);
@@ -493,6 +1043,110 @@ fn resolve_api_key(cfg: &Config) -> Result<String> {
     }
     anyhow::bail!(
         "no API key found; set provider.api_key in config.toml, or set {} env var, or set OPENAI_API_KEY",
-        cfg.provider.api_key_env.as_deref().unwrap_or("api_key_env")
+        provider.api_key_env.as_deref().unwrap_or("api_key_env")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_flattened_tool_calls() {
+        // Single call with JSON args.
+        let calls = parse_flattened_tool_calls(
+            "Let me read the file.\n[calling tools: read {\"path\":\"styles.css\"}]",
+        )
+        .unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].input["path"], "styles.css");
+
+        // Multiple calls separated by `;`.
+        let calls = parse_flattened_tool_calls(
+            "[calling tools: list_dir {}; read {\"path\":\"index.html\"}]",
+        )
+        .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "list_dir");
+        assert_eq!(calls[1].name, "read");
+        assert_eq!(calls[1].input["path"], "index.html");
+
+        // No marker -> None.
+        assert!(parse_flattened_tool_calls("just some text").is_none());
+        // Empty marker -> None.
+        assert!(parse_flattened_tool_calls("[calling tools: ]").is_none());
+
+        // JSON block format: `[tool_request] {json} [END_TOOL_REQUEST]`.
+        let calls = parse_flattened_tool_calls(
+            "Let me read the file.\n[tool_request]\n{\"name\":\"read\",\"arguments\":{\"path\":\"styles.css\"}}\n[END_TOOL_REQUEST]",
+        )
+        .unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].input["path"], "styles.css");
+
+        // Multiple JSON blocks.
+        let calls = parse_flattened_tool_calls(
+            "[tool_request]\n{\"name\":\"list_dir\",\"arguments\":{}}\n[END_TOOL_REQUEST]\n[tool_request]\n{\"name\":\"read\",\"arguments\":{\"path\":\"index.html\"}}\n[END_TOOL_REQUEST]",
+        )
+        .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "list_dir");
+        assert_eq!(calls[1].name, "read");
+
+        // CRITICAL: args containing `;` (e.g. CSS/new_string) must NOT be
+        // split on `;`. The whole JSON object is one tool call.
+        let calls = parse_flattened_tool_calls(
+            "[calling tools: edit {\"path\":\"styles.css\",\"new_string\":\"body { color: #fff; background: rgba(26,60,52,0.98); }\",\"old_string\":\"body { color: #000; }\"}]",
+        )
+        .unwrap();
+        assert_eq!(calls.len(), 1, "should be exactly ONE edit call, got {}", calls.len());
+        assert_eq!(calls[0].name, "edit");
+        assert_eq!(calls[0].input["new_string"], "body { color: #fff; background: rgba(26,60,52,0.98); }");
+    }
+
+    #[test]
+    fn rate_limit_detection() {
+        let e = anyhow::anyhow!("provider error 429 Too Many Requests: rate limit");
+        assert!(is_rate_limit_error(&e));
+        let e2 = anyhow::anyhow!("provider error 500 Internal Server Error");
+        assert!(!is_rate_limit_error(&e2));
+    }
+
+    #[test]
+    fn rate_limit_wait_parsing() {
+        // Parses the "in 13.155s" hint from the error message.
+        let e = anyhow::anyhow!("Please try again in 13.155s. Need more tokens?");
+        let wait = rate_limit_wait(&e);
+        assert!(wait.as_secs() >= 14, "expected ~14s, got {}", wait.as_secs());
+        // Falls back to 15s when no hint is present.
+        let e2 = anyhow::anyhow!("provider error 429 Too Many Requests");
+        assert_eq!(rate_limit_wait(&e2).as_secs(), 15);
+    }
+
+    #[test]
+    fn normalizes_tool_args() {
+        // `file_path` alias -> `path`.
+        let v = normalize_tool_args("read", &serde_json::json!({"file_path": "styles.css"}));
+        assert_eq!(v["path"], "styles.css");
+        // `raw` wrapper around a JSON string is unwrapped.
+        let v = normalize_tool_args("write", &serde_json::json!({"raw": "{\"path\": \"a.css\", \"content\": \"x\"}"}));
+        assert_eq!(v["path"], "a.css");
+        assert_eq!(v["content"], "x");
+        // Truncated JSON in `raw` is repaired (unbalanced brace).
+        let v = normalize_tool_args("write", &serde_json::json!({"raw": "{\"path\": \"a.css\""}));
+        assert_eq!(v["path"], "a.css");
+        // Canonical keys are preserved.
+        let v = normalize_tool_args("read", &serde_json::json!({"path": "b.css"}));
+        assert_eq!(v["path"], "b.css");
+    }
+
+    #[test]
+    fn repairs_truncated_json() {
+        assert_eq!(repair_truncated_json("{\"path\": \"a.css\"").unwrap(), "{\"path\": \"a.css\"}");
+        assert_eq!(repair_truncated_json("{\"a\": [1, 2").unwrap(), "{\"a\": [1, 2]}");
+        // Balanced JSON -> None (nothing to repair).
+        assert!(repair_truncated_json("{\"a\": 1}").is_none());
+    }
 }

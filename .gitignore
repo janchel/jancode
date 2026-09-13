@@ -11,6 +11,9 @@ daemon.log
 *.swp
 *~
 
+# Model catalog snapshots are local reference only — not part of the repo.
+catalog/
+
 # Changelogs are local keep-notes, not part of the published repo
 changelog
 changelog*
