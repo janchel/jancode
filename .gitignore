@@ -11,6 +11,12 @@ daemon.log
 *.swp
 *~
 
+# Except: the model catalog is a public reference, keep it tracked.
+!catalog/
+catalog/*
+!catalog/*.txt
+!catalog/*.json
+
 # Changelogs are local keep-notes, not part of the published repo
 changelog
 changelog*

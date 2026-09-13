@@ -160,7 +160,10 @@ idle_timeout_secs = 300
 # escapes (absolute paths, ~, $HOME, .., cd out); "strict" also gates on any
 # cd / $PWD / $OLDPWD.
 # bash_gate = "basic"
+# Print the model's reasoning as [thinking] lines (default false = hidden).
+# show_thinking = false
 
+# Single-provider setup (legacy): use the `[provider]` table.
 [provider]
 base_url = "https://api.openai.com/v1"
 # Option A: inline key (easiest for single-user setups)
@@ -168,6 +171,40 @@ base_url = "https://api.openai.com/v1"
 # Option B: name an env var to read the key from
 api_key_env = "OPENAI_API_KEY"
 default_model = "gpt-4o-mini"
+# Optional: cap the model's response length (sent as max_tokens). 0 = no cap.
+# max_tokens = 4096
+# Optional: context window in tokens. When set, jancode trims the oldest
+# conversation messages to fit this budget (reduces token usage / rate limits).
+# context_window = 32768
+
+# Multi-provider setup: use `[[providers]]` entries + `default_provider`.
+# When `providers` is non-empty it takes precedence over `[provider]`.
+# NOTE: `default_provider` must be at the ROOT level (before any [table]
+# header) to be read — placing it after [server] makes TOML treat it as
+# server.default_provider, which is ignored.
+# default_provider = "groq"
+# [[providers]]
+# name = "groq"
+# base_url = "https://api.groq.com/openai/v1"
+# api_key_env = "GROQ_API_KEY"
+# default_model = "openai/gpt-oss-20b"
+# max_tokens = 4096
+# context_window = 16000
+#
+# [[providers]]
+# name = "lmstudio"
+# base_url = "http://192.168.5.39:1234/v1"
+# api_key = "dummy"
+# default_model = "qwen2.5-coder-7b-instruct"
+# tool_call_style = "flattened"
+#
+# Tool-calling flexibility (per provider):
+#   tool_call_style = "openai"     # structured tool_calls (default)
+#   tool_call_style = "flattened"  # text markers for providers that reject tool roles
+#   tool_call_style = "auto"       # try openai, also parse text markers as fallback
+#   supports_tools = false         # disable tool calling entirely (model answers directly)
+#                                  # use for reasoning models / routers that emit
+#                                  # malformed tool calls and loop
 
 # [[mcp.servers]]
 # name = "ops"
@@ -236,16 +273,20 @@ Wants=network-online.target
 ExecStart=$exec_path serve
 Environment=JANCODE_HOME=$runtime_home
 Environment=JANCODE_RUNTIME_DIR=/run/jancode
+# systemd creates /run/jancode with the correct ownership on every start
+# (survives reboots, unlike a manual mkdir in /run which is tmpfs).
+RuntimeDirectory=jancode
+RuntimeDirectoryMode=0755
 Restart=on-failure
 RestartSec=3
 User=$user
 Group=$(id -gn "$user" 2>/dev/null || echo "$user")
 # uncomment and set your key:
 # Environment=OPENAI_API_KEY=sk-...
+
+[Install]
+WantedBy=multi-user.target
 EOF
-    mkdir -p /run/jancode
-    chown "$user" /run/jancode 2>/dev/null || true
-    chmod 755 /run/jancode
     mkdir -p "$runtime_home"
     systemctl daemon-reload
     log "Installed system service: $unit"
@@ -265,6 +306,9 @@ Restart=on-failure
 RestartSec=3
 # uncomment and set your key:
 # Environment=OPENAI_API_KEY=sk-...
+
+[Install]
+WantedBy=default.target
 EOF
     systemctl --user daemon-reload
     log "Installed user service: $unit"

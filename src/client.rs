@@ -32,6 +32,7 @@ pub async fn handle_swarm(sub: crate::SwarmCommands) -> Result<()> {
             parent_session_id: parent,
             initial_message: prompt,
             model,
+            provider: None,
             label,
         },
         crate::SwarmCommands::List => Request::SwarmList {
@@ -220,11 +221,25 @@ pub async fn connect() -> Result<()> {
         session_id.as_deref().unwrap_or("")
     );
     let default_model = crate::config::load()
-        .map(|c| c.provider.default_model.clone())
+        .map(|c| crate::config::resolve_provider(&c, None).default_model.clone())
         .unwrap_or_else(|_| "default".to_string());
+    // Whether to print the model's reasoning as `[thinking]` lines. Defaults
+    // to hidden for a clean CLI; enable with `[server] show_thinking = true`.
+    let show_thinking = crate::config::load()
+        .map(|c| c.server.show_thinking)
+        .unwrap_or(false);
     let mut current_model: Option<String> = None;
+    let mut current_provider: Option<String> = None;
     let mut models_cache: Option<Vec<String>> = None;
     let mut sessions_cache: Vec<crate::storage::Session> = Vec::new();
+    // Track the last user prompt and whether its turn failed (e.g. provider
+    // rate limit). When the user switches model/provider after a failure, we
+    // offer to re-send the last prompt so the new model can continue.
+    let mut last_prompt: Option<String> = None;
+    let mut last_turn_failed = false;
+    // When set (after a provider/model switch following a failed turn), the
+    // loop sends this prompt instead of waiting for new input.
+    let mut retry_prompt: Option<String> = None;
 
     // Async stdin reader for non-blocking input
     let mut stdin = BufReader::new(stdin());
@@ -234,11 +249,18 @@ pub async fn connect() -> Result<()> {
         print!("{}> ", prompt_label);
         std::io::stdout().flush()?;
         let mut raw_input = String::new();
-        let n = stdin.read_line(&mut raw_input).await?;
-        if n == 0 {
-            // EOF (Ctrl+D): quit the chat cleanly instead of looping forever.
-            println!();
-            break;
+        // If a retry was queued (after a provider/model switch following a
+        // failed turn), send it without waiting for new input.
+        if let Some(rp) = &retry_prompt {
+            raw_input = rp.clone();
+            retry_prompt = None;
+        } else {
+            let n = stdin.read_line(&mut raw_input).await?;
+            if n == 0 {
+                // EOF (Ctrl+D): quit the chat cleanly instead of looping forever.
+                println!();
+                break;
+            }
         }
         let mut input = raw_input.trim().to_string();
         if input.is_empty() {
@@ -280,9 +302,17 @@ pub async fn connect() -> Result<()> {
             println!("tools enabled: true (MCP + built-in)");
             input = remainder;
         }
-        if input == "/model" || input.starts_with("/model ") {
+        if input == "/model" || input.starts_with("/model ")
+            || input == "/models" || input.starts_with("/models ")
+        {
             let cfg = crate::config::load().unwrap_or_default();
-            let mut remainder = input.strip_prefix("/model").unwrap_or("").trim().to_string();
+            // `/models` is an accepted alias for `/model`.
+            let mut remainder = input
+                .strip_prefix("/model")
+                .or_else(|| input.strip_prefix("/models"))
+                .unwrap_or("")
+                .trim()
+                .to_string();
 
             // /model grep <term> and /model search <term> narrow the catalog
             // instead of being treated as literal model ids.
@@ -299,7 +329,7 @@ pub async fn connect() -> Result<()> {
             let catalog = match &models_cache {
                 Some(l) => l.clone(),
                 None => {
-                    let l = crate::provider::list_models(&cfg)
+                    let l = crate::provider::list_models(&cfg, current_provider.as_deref())
                         .await
                         .unwrap_or_else(|e| {
                             eprintln!("note: could not fetch model list from provider: {}", e);
@@ -387,6 +417,18 @@ pub async fn connect() -> Result<()> {
                     Some(Some(m)) => {
                         current_model = Some(m.clone());
                         println!("model switched to: {}", m);
+                        if last_turn_failed {
+                            if let Some(lp) = &last_prompt {
+                                eprint!("retry last prompt with new model? [y/N] ");
+                                std::io::stdout().flush()?;
+                                let mut ans = String::new();
+                                let _ = stdin.read_line(&mut ans).await;
+                                if matches!(ans.trim().to_lowercase().as_str(), "y" | "yes") {
+                                    retry_prompt = Some(lp.clone());
+                                    last_turn_failed = false;
+                                }
+                            }
+                        }
                     }
                     Some(None) => {
                         current_model = None;
@@ -403,6 +445,74 @@ pub async fn connect() -> Result<()> {
             }
             current_model = Some(remainder.clone());
             println!("model switched to: {}", remainder);
+            if last_turn_failed {
+                if let Some(lp) = &last_prompt {
+                    eprint!("retry last prompt with new model? [y/N] ");
+                    std::io::stdout().flush()?;
+                    let mut ans = String::new();
+                    let _ = stdin.read_line(&mut ans).await;
+                    if matches!(ans.trim().to_lowercase().as_str(), "y" | "yes") {
+                        retry_prompt = Some(lp.clone());
+                        last_turn_failed = false;
+                    }
+                }
+            }
+            continue;
+        }
+        if input == "/provider" || input.starts_with("/provider ") {
+            let cfg = crate::config::load().unwrap_or_default();
+            let names = crate::config::provider_names(&cfg);
+            let remainder = input.strip_prefix("/provider").unwrap_or("").trim().to_string();
+            if remainder.is_empty() {
+                // List providers.
+                println!("available providers ({}):", names.len());
+                for (i, n) in names.iter().enumerate() {
+                    let marker = if current_provider.as_deref().unwrap_or("") == n || (current_provider.is_none() && i == 0) {
+                        " *"
+                    } else {
+                        ""
+                    };
+                    println!("  [{}] {}{}", i + 1, n, marker);
+                }
+                println!("  [0] default");
+                println!("usage: /provider <name> or /provider <number>");
+            } else {
+                // Switch provider by name or number.
+                let mut switched: Option<String> = None;
+                if let Ok(n) = remainder.parse::<usize>() {
+                    if n == 0 {
+                        switched = Some("default".to_string());
+                    } else if n >= 1 && n <= names.len() {
+                        switched = Some(names[n - 1].clone());
+                    }
+                } else {
+                    if names.iter().any(|x| x == &remainder) {
+                        switched = Some(remainder.clone());
+                    }
+                }
+                if let Some(p) = switched {
+                    current_provider = if p == "default" { None } else { Some(p.clone()) };
+                    current_model = None; // reset model; provider may differ
+                    models_cache = None;  // refetch catalog for the new provider
+                    println!("provider switched to: {}", if p == "default" { "default" } else { &p });
+                    // If the previous turn failed (e.g. rate limit), offer to
+                    // re-send the last prompt with the new provider.
+                    if last_turn_failed {
+                        if let Some(lp) = &last_prompt {
+                            eprint!("retry last prompt with new provider? [y/N] ");
+                            std::io::stdout().flush()?;
+                            let mut ans = String::new();
+                            let _ = stdin.read_line(&mut ans).await;
+                            if matches!(ans.trim().to_lowercase().as_str(), "y" | "yes") {
+                                retry_prompt = Some(lp.clone());
+                                last_turn_failed = false;
+                            }
+                        }
+                    }
+                } else {
+                    println!("unknown provider '{}' (run /provider to list)", remainder);
+                }
+            }
             continue;
         }
         if input == "/mcp_tools" || input == "/mcp_status" {
@@ -573,6 +683,10 @@ pub async fn connect() -> Result<()> {
 
         let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
         let id = crate::protocol::new_message_id();
+        // Remember this prompt so we can re-send it after a model/provider
+        // switch if the turn fails (e.g. rate limit).
+        last_prompt = Some(input.clone());
+        last_turn_failed = false;
         let req = Request::Message {
             id,
             session_id: session_id.clone(),
@@ -599,6 +713,7 @@ pub async fn connect() -> Result<()> {
                 None
             },
             model: current_model.clone(),
+            provider: current_provider.clone(),
             cwd,
             interactive: true,
         };
@@ -701,8 +816,13 @@ pub async fn connect() -> Result<()> {
                         Event::ToolResult { .. } => {
                             // Suppress tool result output for a quiet, readable session.
                         }
-                        Event::Status { .. } => {
-                            // Suppress status/progress messages.
+                        Event::Status { id: _, message } => {
+                            // Show reasoning/thinking progress only when
+                            // `[server] show_thinking = true`. Other status
+                            // messages (e.g. "Executing tool: ...") stay quiet.
+                            if show_thinking && message.starts_with("thinking: ") {
+                                eprintln!("[thinking] {}", message.strip_prefix("thinking: ").unwrap_or(""));
+                            }
                         }
                         Event::TextDelta { id: _, text } => {
                             in_stream = true;
@@ -760,6 +880,7 @@ pub async fn connect() -> Result<()> {
                         }
                         Event::Error { id: _, message } => {
                             eprintln!("error: {}", message);
+                            last_turn_failed = true;
                             break;
                         }
                         _ => {}
@@ -830,6 +951,7 @@ pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool) -> Res
             None
         },
         model,
+        provider: None,
         cwd,
         interactive: false,
     };
