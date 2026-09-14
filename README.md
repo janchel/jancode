@@ -106,6 +106,14 @@ sudo systemctl enable --now jancode     # system service
 systemctl --user enable --now jancode   # user service
 ```
 
+> **Daemon secrets.** The installer creates `$JANCODE_HOME/service.env`
+> (chmod 600) and wires it into the unit via `EnvironmentFile=`. systemd
+> services **don't** inherit your shell environment, so put provider keys
+> (`OPENAI_API_KEY`, `GROQ_API_KEY`, ...) and MCP bearer tokens
+> (`bearer_env`) there, then `sudo systemctl restart jancode`. (MCP servers can
+> alternatively use an inline `bearer = "..."` in `config.toml` — see
+> [MCP servers](#mcp-model-context-protocol-servers).)
+
 The `serve` command below is only for **advanced/foreground** use — e.g. running
 the daemon under a custom process manager, or overriding the default data/socket
 paths. It is not required for normal use:
@@ -152,6 +160,11 @@ In interactive mode, use these commands:
   exposes (name + one-line description). Read-only; never executes tools.
 - `/mcp_status` — Show per-server connection status: `[ok]` with the tool
   count, or `[FAILED]` with the error from the connect/initialize handshake.
+- `/mcp_reconnect` (alias `/mcp_restart`) — Reload `config.toml` from disk and
+  reconnect to every MCP server, then print the new status. Use this after
+  editing MCP config (e.g. adding a bearer token) — no daemon restart needed.
+  In fact MCP servers are re-read from disk and reconnected on every
+  tool-enabled turn, so config edits also apply on your next message.
 - `/help` — List available slash commands.
 - `/quit`, `/exit`, `/q` — End the session (handled locally, never sent to the
   model).
@@ -320,19 +333,36 @@ Configure servers in `$JANCODE_HOME/config.toml`:
 name = "ops"
 url = "https://your-mcp-server.example.com/mcp"
 transport = "http-streamable"
-bearer_env = "OPS_MCP_KEY"   # optional: export a token, sent as Authorization: Bearer
+bearer = "your-token-here"     # inline token (easiest; read straight from config)
+# bearer_env = "OPS_MCP_KEY"   # or: name an env var holding the token
 ```
 
 - `name` — short label used in logs and `/mcp`.
 - `url` — the MCP streamable-HTTP endpoint the server listens on.
 - `transport` — currently only `http-streamable` (the default); `sse` is
   reserved for a future transport.
-- `bearer_env` — optional name of an environment variable holding a bearer
-  token. If set and exported, every request carries
-  `Authorization: Bearer <token>`. The token is read by the **daemon** process,
-  so export it before `run`/`connect` starts the daemon (the daemon inherits the
-  environment of the command that spawned it). Omit this field to send no auth
-  header.
+- `bearer` — inline bearer token, sent as `Authorization: Bearer <token>`.
+  Simplest option: it lives in `config.toml`, which the daemon already reads,
+  so it works regardless of how the daemon was started. Takes precedence over
+  `bearer_env`.
+- `bearer_env` — name of an environment variable holding the token (used when
+  `bearer` isn't set). Read by the **daemon** process; export it before
+  `run`/`connect` starts the daemon, or set it for the systemd service.
+
+> **Running the daemon as a systemd service?** systemd services do **not**
+> inherit your shell environment. Use the inline `bearer = "..."` field above
+> (recommended), or add the token to the service secrets file the installer
+> creates at `$JANCODE_HOME/service.env` (chmod 600) and restart:
+>
+> ```bash
+> # ~/.jancode/service.env
+> OPS_MCP_KEY=your-token-here
+> # then
+> sudo systemctl restart jancode
+> ```
+>
+> If a `bearer_env` variable is missing, jancode logs a clear warning and the
+> request is sent unauthenticated (the server replies `401`).
 
 When tool-calling is enabled, jancode connects to each configured server,
 runs the `initialize` handshake, discovers its tools via `tools/list`, and
@@ -345,9 +375,16 @@ Quick start:
 /mcp                               # list configured servers
 /mcp_tools                         # list tools exposed by each server (read-only)
 /mcp_status                        # per-server connection status
+/mcp_reconnect                     # reload config + reconnect all MCP servers
 /mcp check disk space on server1    # send with MCP tools enabled
 jancode run "..." --tools          # one-shot with MCP tools available
 ```
+
+**No daemon restart needed for MCP config changes.** MCP servers are re-read
+from `config.toml` and reconnected on every tool-enabled turn, and on demand
+with `/mcp_reconnect` (alias `/mcp_restart`). So after editing a token or
+adding a server, just run `/mcp_reconnect` (or send your next message) — the
+daemon picks up the change live.
 
 ### One-shot Prompt
 
@@ -539,6 +576,26 @@ keepalive-only streams and, if nothing but keepalives arrive for the whole stall
 window, treats it as a stall and errors out (and retries) instead of hanging
 forever. A real-content chunk resets the keepalive timer, so a slow-but-alive
 stream still succeeds.
+
+### Empty-response retry (proxy / routed providers)
+
+Provider routers (like rebelstack) pick a different upstream model per request.
+Occasionally the routed model returns **nothing at all** — no text and no tool
+calls — usually a transient hiccup while the router switches models.
+
+When that happens jancode does **not** dead-end. It:
+
+- sleeps briefly (30s) and **retries the same conversation**, so the newly
+  routed model reads the full history and continues where the last turn left
+  off;
+- **resets the tool-loop counters** so the retried model gets a fresh budget
+  (it isn't penalized for the empty turn); and
+- gives up after **3 retries**, then reports that the model produced no
+  response.
+
+This applies to both interactive `connect` chats and headless `run`/swarm
+agents. In interactive mode you'll see a line like
+`(the model returned no response; retrying with a fresh model in 30s — attempt 1/3)`.
 
 ## Core mechanics
 

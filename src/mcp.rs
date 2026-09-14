@@ -253,16 +253,50 @@ impl crate::tools::Tool for McpTool {
     }
 }
 
+/// Resolve the bearer token for an MCP server. Prefers the inline `bearer`
+/// config value; falls back to the `bearer_env` environment variable. If
+/// `bearer_env` is set but the variable is missing or empty, log a clear
+/// warning — otherwise the request is sent without auth and the server replies
+/// with an opaque 401 that's hard to diagnose (common when the daemon runs as
+/// a systemd service that doesn't inherit your shell env).
+fn resolve_bearer(svc: &crate::config::McpServerConfig) -> Option<String> {
+    // Inline token wins (set it straight in config.toml — no env needed).
+    if let Some(t) = svc.bearer.as_deref() {
+        if !t.trim().is_empty() {
+            return Some(t.trim().to_string());
+        }
+    }
+    let name = svc.bearer_env.as_deref()?;
+    match std::env::var(name) {
+        Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
+        Ok(_) => {
+            tracing::warn!(
+                "MCP server {}: env var {} is set but empty; sending no Authorization header",
+                svc.name,
+                name
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                "MCP server {}: {} is configured as bearer_env but is NOT set in the daemon's \
+                 environment; requests will be unauthenticated. Set an inline `bearer = \"...\"` \
+                 in config.toml, or (for a systemd service) add it to the unit's EnvironmentFile.",
+                svc.name,
+                name
+            );
+            None
+        }
+    }
+}
+
 /// Connect to every configured MCP server and return their tools, merged as
 /// jancode `Tool`s. Failed servers are logged and skipped so the rest of the
 /// conversation still works.
 pub async fn load_tools(cfg: &crate::config::Config) -> Vec<Box<dyn crate::tools::Tool>> {
     let mut out: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
     for svc in &cfg.mcp.servers {
-        let token = svc
-            .bearer_env
-            .as_deref()
-            .and_then(|name| std::env::var(name).ok());
+        let token = resolve_bearer(svc);
         let client = std::sync::Arc::new(tokio::sync::Mutex::new(McpClient::with_bearer(
             &svc.url,
             token,
@@ -296,10 +330,7 @@ pub async fn load_tools(cfg: &crate::config::Config) -> Vec<Box<dyn crate::tools
 pub async fn probe(cfg: &crate::config::Config) -> Vec<McpServerProbe> {
     let mut out = Vec::new();
     for svc in &cfg.mcp.servers {
-        let token = svc
-            .bearer_env
-            .as_deref()
-            .and_then(|name| std::env::var(name).ok());
+        let token = resolve_bearer(svc);
         let mut client = McpClient::with_bearer(&svc.url, token);
         let (ok, error, tools) = match (async {
             client.initialize().await?;
@@ -320,4 +351,37 @@ pub async fn probe(cfg: &crate::config::Config) -> Vec<McpServerProbe> {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn svc(bearer: Option<&str>, bearer_env: Option<&str>) -> crate::config::McpServerConfig {
+        crate::config::McpServerConfig {
+            name: "ops".to_string(),
+            url: "http://example/mcp".to_string(),
+            transport: "http-streamable".to_string(),
+            bearer: bearer.map(|s| s.to_string()),
+            bearer_env: bearer_env.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn resolve_bearer_prefers_inline_over_env() {
+        // Inline wins even when bearer_env names a set variable.
+        std::env::set_var("JANCODE_TEST_MCP_KEY", "from-env");
+        assert_eq!(resolve_bearer(&svc(Some("inline-token"), Some("JANCODE_TEST_MCP_KEY"))), Some("inline-token".to_string()));
+        // Inline is trimmed.
+        assert_eq!(resolve_bearer(&svc(Some("  spaced  "), None)), Some("spaced".to_string()));
+        // Empty inline falls through to the env var.
+        assert_eq!(resolve_bearer(&svc(Some("   "), Some("JANCODE_TEST_MCP_KEY"))), Some("from-env".to_string()));
+        // No inline + env var set -> env value.
+        assert_eq!(resolve_bearer(&svc(None, Some("JANCODE_TEST_MCP_KEY"))), Some("from-env".to_string()));
+        // No inline + env var unset -> None (server gets no auth).
+        assert_eq!(resolve_bearer(&svc(None, Some("JANCODE_TEST_MCP_MISSING"))), None);
+        // Neither configured -> None.
+        assert_eq!(resolve_bearer(&svc(None, None)), None);
+        std::env::remove_var("JANCODE_TEST_MCP_KEY");
+    }
 }

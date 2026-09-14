@@ -515,8 +515,12 @@ pub async fn connect() -> Result<()> {
             }
             continue;
         }
-        if input == "/mcp_tools" || input == "/mcp_status" {
+        if input == "/mcp_tools" || input == "/mcp_status" || input == "/mcp_reconnect" || input == "/mcp_restart" {
             let show_tools = input == "/mcp_tools";
+            let reconnect = input == "/mcp_reconnect" || input == "/mcp_restart";
+            if reconnect {
+                println!("reconnecting to MCP servers (reloading config)...");
+            }
             let id = crate::protocol::new_message_id();
             let req = Request::McpProbe { id };
             let data = serde_json::to_string(&req)?;
@@ -671,7 +675,7 @@ pub async fn connect() -> Result<()> {
             continue;
         }
         if input == "/help" {
-            println!("Available commands: /quit, /exit, /q (quit), /tools (toggle tool calling), /model (list models and switch), /mcp (list MCP servers / send with MCP tools), /mcp_tools (list tools exposed by MCP servers), /mcp_status (MCP server connection status), /session (list sessions), /resume <number>, /memory (list memories), /forget <number>, /help (Ctrl+C cancels the running request; Ctrl+D quits)");
+            println!("Available commands: /quit, /exit, /q (quit), /tools (toggle tool calling), /model (list models and switch), /provider (list/switch providers), /mcp (list MCP servers / send with MCP tools), /mcp_tools (list tools exposed by MCP servers), /mcp_status (MCP server connection status), /mcp_reconnect (reload config + reconnect MCP servers), /session (list sessions), /resume <number>, /memory (list memories), /forget <number>, /help (Ctrl+C cancels the running request; Ctrl+D quits)");
             continue;
         }
         // Drain any queued Ctrl+C first so a stray keypress while idle can't

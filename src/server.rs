@@ -98,6 +98,21 @@ pub async fn run() -> Result<()> {
     }
 }
 
+/// Reload the config from disk, falling back to the cached copy if the on-disk
+/// file is missing or invalid. MCP servers are read this way on every probe
+/// and every tool-enabled turn, so token/server edits take effect **without
+/// restarting the daemon** (letting users fix e.g. an MCP bearer token and just
+/// run `/mcp_reconnect`).
+fn reload_cfg(cached: &crate::config::Config) -> crate::config::Config {
+    match crate::config::load() {
+        Ok(fresh) => fresh,
+        Err(e) => {
+            tracing::warn!("could not reload config ({}); using cached copy", e);
+            cached.clone()
+        }
+    }
+}
+
 async fn handle_client(
     stream: UnixStream,
     sessions: SessionMap,
@@ -134,7 +149,10 @@ async fn handle_client(
                 send(&w, &Event::Pong { id }).await?;
             }
             Request::McpProbe { id } => {
-                let servers = crate::mcp::probe(&cfg).await;
+                // Reload config so /mcp_status and /mcp_reconnect reflect
+                // on-disk edits (e.g. a newly added bearer token) immediately.
+                let live_cfg = reload_cfg(&cfg);
+                let servers = crate::mcp::probe(&live_cfg).await;
                 send(&w, &Event::McpInfo { id, servers }).await?;
             }
             Request::GetHistory { id, session_id: _ } => {
@@ -191,7 +209,10 @@ async fn handle_client(
                 let enable_tools = tools.is_some();
                 let tool_registry = if enable_tools {
                     let mut reg = crate::tools::default_registry();
-                    for t in crate::mcp::load_tools(&cfg).await {
+                    // Load MCP tools from a freshly-read config so edits (tokens,
+                    // new servers) apply on the next turn without a daemon restart.
+                    let mcp_cfg = reload_cfg(&cfg);
+                    for t in crate::mcp::load_tools(&mcp_cfg).await {
                         reg.register_boxed(t);
                     }
                     Some(reg)

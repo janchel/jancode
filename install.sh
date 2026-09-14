@@ -210,7 +210,8 @@ default_model = "gpt-4o-mini"
 # name = "ops"
 # url = "https://your-mcp-server.example.com/mcp"
 # transport = "http-streamable"
-# bearer_env = "OPS_MCP_KEY"
+# bearer = "your-token-here"       # inline token (recommended; works with systemd)
+# # bearer_env = "OPS_MCP_KEY"     # or: name an env var holding the token
 EOF
     log "Created config template: $home/config.toml"
     log " -> set your API key in \$OPENAI_API_KEY (or put api_key in config.toml)."
@@ -263,6 +264,24 @@ install_service() {
     else
       user="$USER"
     fi
+    # Secrets for the daemon (provider keys, MCP bearer tokens). systemd
+    # services do NOT inherit your shell env, so anything the daemon reads via
+    # env (e.g. OPENAI_API_KEY, or an MCP `bearer_env`) must live here.
+    env_file="$runtime_home/service.env"
+    if [ ! -f "$env_file" ]; then
+        mkdir -p "$runtime_home"
+        cat > "$env_file" << 'EOF'
+# Environment variables for the jancode daemon (read by systemd).
+# systemd services don't inherit your shell, so set secrets here.
+# One KEY=VALUE per line, no quotes, no `export`.
+#
+# Examples:
+# OPENAI_API_KEY=sk-...
+# GROQ_API_KEY=gsk-...
+# OPS_MCP_KEY=your-mcp-bearer-token
+EOF
+        chmod 600 "$env_file"
+    fi
     cat > "$unit" << EOF
 [Unit]
 Description=jancode AI coding agent daemon
@@ -273,6 +292,10 @@ Wants=network-online.target
 ExecStart=$exec_path serve
 Environment=JANCODE_HOME=$runtime_home
 Environment=JANCODE_RUNTIME_DIR=/run/jancode
+# Secrets (provider keys, MCP bearer_env tokens). The leading '-' in the
+# EnvironmentFile line means the unit still starts if the file is absent.
+# Edit: $env_file
+EnvironmentFile=-$env_file
 # systemd creates /run/jancode with the correct ownership on every start
 # (survives reboots, unlike a manual mkdir in /run which is tmpfs).
 RuntimeDirectory=jancode
@@ -281,7 +304,7 @@ Restart=on-failure
 RestartSec=3
 User=$user
 Group=$(id -gn "$user" 2>/dev/null || echo "$user")
-# uncomment and set your key:
+# You can also set one-off keys inline here:
 # Environment=OPENAI_API_KEY=sk-...
 
 [Install]
@@ -290,10 +313,22 @@ EOF
     mkdir -p "$runtime_home"
     systemctl daemon-reload
     log "Installed system service: $unit"
+    log "Daemon secrets file: $env_file (chmod 600) — add MCP bearer keys here"
     log "Start it with: sudo systemctl enable --now $BIN_NAME"
   else
     unit="$HOME/.config/systemd/user/$BIN_NAME.service"
     mkdir -p "$(dirname "$unit")"
+    env_file="$runtime_home/service.env"
+    if [ ! -f "$env_file" ]; then
+        mkdir -p "$runtime_home"
+        cat > "$env_file" << 'EOF'
+# Environment variables for the jancode daemon (read by systemd --user).
+# One KEY=VALUE per line, no quotes, no `export`.
+# OPENAI_API_KEY=sk-...
+# OPS_MCP_KEY=your-mcp-bearer-token
+EOF
+        chmod 600 "$env_file"
+    fi
     cat > "$unit" << EOF
 [Unit]
 Description=jancode AI coding agent daemon (user)
@@ -302,9 +337,10 @@ After=graphical-session.target
 [Service]
 ExecStart=$exec_path serve
 Environment=JANCODE_HOME=$runtime_home
+EnvironmentFile=-$env_file
 Restart=on-failure
 RestartSec=3
-# uncomment and set your key:
+# You can also set one-off keys inline here:
 # Environment=OPENAI_API_KEY=sk-...
 
 [Install]
@@ -312,6 +348,7 @@ WantedBy=default.target
 EOF
     systemctl --user daemon-reload
     log "Installed user service: $unit"
+    log "Daemon secrets file: $env_file (chmod 600) — add MCP bearer keys here"
     log "Start it with: systemctl --user enable --now $BIN_NAME"
   fi
 }
