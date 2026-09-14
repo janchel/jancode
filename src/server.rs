@@ -641,6 +641,18 @@ async fn handle_message_turn(
     let mut denials_this_turn = 0u32;
     const MAX_DENIALS_PER_TURN: u32 = 3;
 
+    // Empty-response retry: some providers are proxies that route to a
+    // different upstream model per request. Occasionally the routed model
+    // returns nothing (no text, no tool calls) — often a transient hiccup
+    // while the proxy switches models. When that happens we sleep briefly and
+    // retry the SAME conversation (the new model reads the full history),
+    // resetting the loop-guard counters so it gets a fresh budget. We cap the
+    // number of empty-response retries so a genuinely stuck model still gives
+    // up instead of looping forever.
+    let mut empty_response_retries = 0u32;
+    const MAX_EMPTY_RESPONSE_RETRIES: u32 = 3;
+    const EMPTY_RESPONSE_RETRY_DELAY_SECS: u64 = 30;
+
     // Tool-calling loop: send message, execute tools, append results, repeat.
     loop {
         loop_iteration += 1;
@@ -756,6 +768,43 @@ async fn handle_message_turn(
 
                 // If no tool calls, done.
                 if tool_calls.is_empty() {
+                    // If the model produced no text either, it likely hit a
+                    // transient proxy/model-switch hiccup (the routed model
+                    // returned nothing). Retry the same conversation after a
+                    // short delay so the next model can read the full history
+                    // and continue — resetting the loop-guard counters so it
+                    // gets a fresh budget. Only give up after several retries.
+                    if assistant_text.is_empty() && empty_response_retries < MAX_EMPTY_RESPONSE_RETRIES {
+                        empty_response_retries += 1;
+                        warn!(
+                            "model returned empty response (no text, no tool calls); retrying in {}s (attempt {}/{})",
+                            EMPTY_RESPONSE_RETRY_DELAY_SECS,
+                            empty_response_retries,
+                            MAX_EMPTY_RESPONSE_RETRIES
+                        );
+                        send(w, &Event::TextDelta {
+                            id: Some(id),
+                            text: format!(
+                                "(the model returned no response; retrying with a fresh model in {}s — attempt {}/{})\n",
+                                EMPTY_RESPONSE_RETRY_DELAY_SECS,
+                                empty_response_retries,
+                                MAX_EMPTY_RESPONSE_RETRIES
+                            ),
+                        })
+                        .await?;
+                        // Reset the loop-guard counters so the retried model
+                        // gets a fresh budget and isn't penalized for the
+                        // empty response.
+                        loop_iteration = 0;
+                        repeat_count = 0;
+                        total_tool_calls = 0;
+                        consecutive_errors = 0;
+                        denials_this_turn = 0;
+                        last_call_sig = None;
+                        seen_calls.clear();
+                        tokio::time::sleep(std::time::Duration::from_secs(EMPTY_RESPONSE_RETRY_DELAY_SECS)).await;
+                        continue;
+                    }
                     // If the model produced no text either, surface a clear
                     // message instead of appearing to hang.
                     if assistant_text.is_empty() {
@@ -1304,6 +1353,12 @@ async fn run_headless_agent(
     const MAX_TOOL_LOOPS: u32 = 20;
     let mut total_text = String::new();
     let mut iteration = 0u32;
+    // Empty-response retry (same rationale as the interactive path): a proxy
+    // provider may route to a model that returns nothing; retry the same
+    // conversation after a short delay so the next model can continue.
+    let mut empty_response_retries = 0u32;
+    const MAX_EMPTY_RESPONSE_RETRIES: u32 = 3;
+    const EMPTY_RESPONSE_RETRY_DELAY_SECS: u64 = 30;
 
     loop {
         iteration += 1;
@@ -1382,6 +1437,22 @@ async fn run_headless_agent(
         }
 
         if tool_calls.is_empty() {
+            // If the model produced no text either, it likely hit a transient
+            // proxy/model-switch hiccup. Retry the same conversation after a
+            // short delay so the next model can read the history and continue.
+            if turn_text.is_empty() && empty_response_retries < MAX_EMPTY_RESPONSE_RETRIES {
+                empty_response_retries += 1;
+                info!(
+                    "headless agent {}: model returned empty response; retrying in {}s (attempt {}/{})",
+                    session_id,
+                    EMPTY_RESPONSE_RETRY_DELAY_SECS,
+                    empty_response_retries,
+                    MAX_EMPTY_RESPONSE_RETRIES
+                );
+                iteration = 0; // reset loop budget for the retried model
+                tokio::time::sleep(std::time::Duration::from_secs(EMPTY_RESPONSE_RETRY_DELAY_SECS)).await;
+                continue;
+            }
             break;
         }
 
