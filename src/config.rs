@@ -46,8 +46,14 @@ pub struct McpServerConfig {
     pub url: String,
     #[serde(default = "default_mcp_transport")]
     pub transport: String,
+    /// Inline bearer token sent as `Authorization: Bearer <token>` on every
+    /// request to this server. Easiest when the daemon runs as a service (no
+    /// env juggling); takes precedence over `bearer_env` when both are set.
+    #[serde(default)]
+    pub bearer: Option<String>,
     /// Name of an environment variable holding a bearer token to send as
     /// `Authorization: Bearer <token>` on every request to this server.
+    /// Used when `bearer` is not set.
     #[serde(default)]
     pub bearer_env: Option<String>,
 }
