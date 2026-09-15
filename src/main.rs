@@ -29,8 +29,13 @@ enum Commands {
         prompt: String,
         #[arg(short, long)]
         model: Option<String>,
+        /// Enable built-in tool-calling for this prompt.
         #[arg(short, long)]
         tools: bool,
+        /// Also enable MCP tools for this prompt (connects to configured MCP
+        /// servers). Off by default so a slow/down MCP server doesn't add latency.
+        #[arg(long)]
+        mcp: bool,
     },
     Connect,
     /// Swarm (multi-agent) management commands.
@@ -80,7 +85,7 @@ async fn main() -> Result<()> {
         .init();
     match cli.command {
         Commands::Serve => server::run().await,
-        Commands::Run { prompt, model, tools } => client::run_prompt(&prompt, model, tools).await,
+        Commands::Run { prompt, model, tools, mcp } => client::run_prompt(&prompt, model, tools, mcp).await,
         Commands::Connect => client::connect().await,
         Commands::Swarm(sub) => client::handle_swarm(sub).await,
     }

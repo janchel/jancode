@@ -175,7 +175,7 @@ async fn handle_client(
                 )
                 .await?;
             }
-            Request::Message { id, session_id, content, tools, model, provider, cwd, interactive } => {
+            Request::Message { id, session_id, content, tools, mcp, model, provider, cwd, interactive } => {
                 let session_id_s = session_id.unwrap_or_else(|| format!("session-{}", id));
                 let working_dir = cwd.clone().unwrap_or_else(|| {
                     std::env::current_dir().unwrap_or_default().to_string_lossy().to_string()
@@ -209,11 +209,14 @@ async fn handle_client(
                 let enable_tools = tools.is_some();
                 let tool_registry = if enable_tools {
                     let mut reg = crate::tools::default_registry();
-                    // Load MCP tools from a freshly-read config so edits (tokens,
-                    // new servers) apply on the next turn without a daemon restart.
-                    let mcp_cfg = reload_cfg(&cfg);
-                    for t in crate::mcp::load_tools(&mcp_cfg).await {
-                        reg.register_boxed(t);
+                    // MCP tools are opt-in per turn (client sets `mcp: true` for
+                    // `/mcp <message>`). Ordinary turns skip them entirely so a
+                    // slow/down MCP server can't add latency to every message.
+                    if mcp {
+                        let mcp_cfg = reload_cfg(&cfg);
+                        for t in crate::mcp::load_tools(&mcp_cfg).await {
+                            reg.register_boxed(t);
+                        }
                     }
                     Some(reg)
                 } else {
@@ -634,25 +637,31 @@ async fn handle_message_turn(
 
     let mut done_sent = false;
     let mut loop_iteration = 0u32;
-    const MAX_TOOL_LOOPS: u32 = 20;
+    // Configurable so big projects can explore longer. Defaults: 50 iterations
+    // / 75 tool calls (see `[server] max_tool_loops` / `max_total_tool_calls`).
+    let max_tool_loops = cfg.server.max_tool_loops.max(1);
     // Loop guard: if the model repeats the exact same tool call (same name +
     // args) several times in a row — usually because it's emitting malformed
     // arguments that keep failing — stop early with a clear message instead of
-    // burning through all 20 iterations.
+    // burning through the whole iteration budget.
     let mut last_call_sig: Option<String> = None;
     let mut repeat_count = 0u32;
     const MAX_REPEAT: u32 = 3;
     // Also track the total number of tool calls across the whole turn. If the
     // model keeps calling tools without ever producing a final answer, cap it
-    // lower than MAX_TOOL_LOOPS so a wandering model (many DIFFERENT calls)
-    // doesn't burn the full budget. This catches the "exploring forever"
-    // pattern that identical-repeat detection misses.
+    // so a wandering model (many DIFFERENT calls) doesn't burn the full budget.
+    // This catches the "exploring forever" pattern that identical-repeat
+    // detection misses.
     let mut total_tool_calls = 0u32;
-    const MAX_TOTAL_TOOL_CALLS: u32 = 25;
+    let max_total_tool_calls = cfg.server.max_total_tool_calls.max(1);
     // Progress check: track distinct tool calls seen and consecutive errors.
     // If the model keeps hitting tool errors without producing new information,
     // escalate to a clear terminal message instead of letting it spin.
-    let mut seen_calls: std::collections::HashSet<String> = HashSet::new();
+    // `seen_calls` maps call-signature -> how many times it was issued this
+    // turn, so we can catch a model that keeps re-issuing the *same* call
+    // (e.g. re-reading one file) even when interleaved with other calls.
+    let mut seen_calls: std::collections::HashMap<String, u32> = HashMap::new();
+    const MAX_SAME_CALL_REPEATS: u32 = 5;
     let mut consecutive_errors = 0u32;
     const MAX_CONSECUTIVE_ERRORS: u32 = 4;
     // Total APPROVAL_DENIED results this turn. Unlike `consecutive_errors`,
@@ -677,11 +686,11 @@ async fn handle_message_turn(
     // Tool-calling loop: send message, execute tools, append results, repeat.
     loop {
         loop_iteration += 1;
-        if loop_iteration > MAX_TOOL_LOOPS {
-            error!("tool-calling loop exceeded {} iterations, breaking", MAX_TOOL_LOOPS);
+        if loop_iteration > max_tool_loops {
+            error!("tool-calling loop exceeded {} iterations, breaking", max_tool_loops);
             send(w, &Event::Error {
                 id: Some(id),
-                message: format!("exceeded maximum tool-calling iterations ({})", MAX_TOOL_LOOPS),
+                message: format!("exceeded maximum tool-calling iterations ({})", max_tool_loops),
             })
             .await?;
             break;
@@ -714,9 +723,9 @@ async fn handle_message_turn(
         let instructions = crate::agents::load_instructions(&working_dir);
 
         // Signal the remaining tool budget so the model wraps up instead of
-        // exploring forever. MAX_TOTAL_TOOL_CALLS is the hard cap.
-        let remaining_budget = if MAX_TOTAL_TOOL_CALLS > total_tool_calls {
-            Some((MAX_TOTAL_TOOL_CALLS - total_tool_calls) as u32)
+        // exploring forever. max_total_tool_calls is the hard cap.
+        let remaining_budget = if max_total_tool_calls > total_tool_calls {
+            Some(max_total_tool_calls - total_tool_calls)
         } else {
             Some(0u32)
         };
@@ -851,9 +860,17 @@ async fn handle_message_turn(
                     .collect::<Vec<_>>()
                     .join("|");
                 total_tool_calls += tool_calls.len() as u32;
-                // Progress check: record distinct calls seen this turn.
+                // Progress check: count how many times each distinct call was
+                // issued this turn. Repeating the *same* call many times (even
+                // interleaved with other calls) means the model is stuck — e.g.
+                // re-reading the same file over and over.
+                let mut max_same_call = 0u32;
                 for tc in &tool_calls {
-                    seen_calls.insert(format!("{}:{}", tc.name, tc.input.to_string()));
+                    let c = seen_calls
+                        .entry(format!("{}:{}", tc.name, tc.input.to_string()))
+                        .or_insert(0);
+                    *c += 1;
+                    max_same_call = max_same_call.max(*c);
                 }
                 if last_call_sig.as_deref().map(|s| s == &sig).unwrap_or(false) {
                     repeat_count += 1;
@@ -862,11 +879,17 @@ async fn handle_message_turn(
                     last_call_sig = Some(sig.clone());
                 }
                 if repeat_count >= MAX_REPEAT
-                    || total_tool_calls >= MAX_TOTAL_TOOL_CALLS
+                    || total_tool_calls >= max_total_tool_calls
                     || consecutive_errors >= MAX_CONSECUTIVE_ERRORS
                     || denials_this_turn >= MAX_DENIALS_PER_TURN
+                    || max_same_call >= MAX_SAME_CALL_REPEATS
                 {
-                    let reason = if denials_this_turn >= MAX_DENIALS_PER_TURN {
+                    let reason = if max_same_call >= MAX_SAME_CALL_REPEATS {
+                        format!(
+                            "the model issued the same tool call {} times without progress (e.g. re-reading the same file). Stopping to avoid a loop.",
+                            max_same_call
+                        )
+                    } else if denials_this_turn >= MAX_DENIALS_PER_TURN {
                         format!(
                             "{} operations were denied for approval in this turn. The model kept retrying gated operations; stopping.",
                             denials_this_turn
@@ -883,15 +906,16 @@ async fn handle_message_turn(
                         )
                     } else {
                         format!(
-                            "the model made {} tool calls without producing a final answer. It may be looping through exploration or retrying denied operations.",
+                            "the model made {} tool calls without producing a final answer. It may be looping through exploration or retrying denied operations. Increase `[server] max_tool_loops` / `max_total_tool_calls` for very large projects.",
                             total_tool_calls
                         )
                     };
                     error!(
-                        "aborting turn: repeat={} total_tool_calls={} distinct={} errors={} sig={}",
+                        "aborting turn: repeat={} total_tool_calls={} distinct={} max_same={} errors={} sig={}",
                         repeat_count,
                         total_tool_calls,
                         seen_calls.len(),
+                        max_same_call,
                         consecutive_errors,
                         sig.chars().take(80).collect::<String>()
                     );
@@ -1346,13 +1370,10 @@ async fn run_headless_agent(
     session_id: &str,
     provider: Option<&str>,
 ) -> Result<String> {
-    let tool_registry = {
-        let mut reg = crate::tools::default_registry();
-        for t in crate::mcp::load_tools(cfg).await {
-            reg.register_boxed(t);
-        }
-        reg
-    };
+    // Built-in tools only: headless agents have no way to opt in to MCP, and
+    // connecting to MCP servers per turn would add latency (and stall on a down
+    // server). Interactive `/mcp <message>` is the MCP entry point.
+    let tool_registry = crate::tools::default_registry();
     let tool_defs: Vec<crate::tools::ToolDefinition> =
         tool_registry.all().iter().map(|t| t.to_definition()).collect();
     let tool_defs_ref = if tool_defs.is_empty() { None } else { Some(tool_defs.as_slice()) };
@@ -1371,7 +1392,8 @@ async fn run_headless_agent(
 
     let instructions = crate::agents::load_instructions(&working_dir);
 
-    const MAX_TOOL_LOOPS: u32 = 20;
+    // Configurable so big projects can explore longer (see `[server] max_tool_loops`).
+    let max_tool_loops = cfg.server.max_tool_loops.max(1);
     let mut total_text = String::new();
     let mut iteration = 0u32;
     // Empty-response retry (same rationale as the interactive path): a proxy
@@ -1383,11 +1405,11 @@ async fn run_headless_agent(
 
     loop {
         iteration += 1;
-        if iteration > MAX_TOOL_LOOPS {
-            info!("headless agent {} exceeded {} tool loops", session_id, MAX_TOOL_LOOPS);
+        if iteration > max_tool_loops {
+            info!("headless agent {} exceeded {} tool loops", session_id, max_tool_loops);
             total_text.push_str(&format!(
                 "\n[stopped: exceeded {} tool-calling iterations]",
-                MAX_TOOL_LOOPS
+                max_tool_loops
             ));
             break;
         }

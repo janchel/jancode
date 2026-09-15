@@ -117,7 +117,7 @@ pub struct ProviderConfig {
     pub context_window: u64,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_secs: u64,
@@ -142,6 +142,30 @@ pub struct ServerConfig {
     /// light CLI. Set to `true` to debug what the model is working through.
     #[serde(default = "default_show_thinking")]
     pub show_thinking: bool,
+    /// Draw a border/box around the model's responses so they stand out from
+    /// tool output and user input (helps a lot in long sessions). Values:
+    ///   - "gutter": prefix each response line with a dim `│ ` bar. Default.
+    ///   - "box":    like "gutter", plus top/bottom `─` rules around the reply.
+    ///   - "none":   plain output (old behavior).
+    /// Pure client-side rendering; no extra tokens or provider calls.
+    #[serde(default = "default_response_border")]
+    pub response_border: String,
+    /// Dim the `[tool]` / `[approval]` / `[thinking]` status lines so they
+    /// recede and the model's reply stands out. Terminal-only (no effect when
+    /// piped). Default true.
+    #[serde(default = "default_dim_tool_lines")]
+    pub dim_tool_lines: bool,
+    /// Maximum number of model turns (tool-calling iterations) in a single
+    /// request before jancode gives up. Larger projects need more exploration
+    /// turns. Default 50. The per-call repeat/error/denial guards still apply,
+    /// so raising this doesn't enable runaway loops — just longer useful work.
+    #[serde(default = "default_max_tool_loops")]
+    pub max_tool_loops: u32,
+    /// Maximum total tool calls in a single request before jancode stops (a
+    /// secondary cap for a model that wanders across many *different* calls
+    /// without producing a final answer). Default 75.
+    #[serde(default = "default_max_total_tool_calls")]
+    pub max_total_tool_calls: u32,
 }
 
 fn default_base_url() -> String {
@@ -174,6 +198,41 @@ fn default_bash_gate() -> String {
 
 fn default_show_thinking() -> bool {
     false
+}
+
+fn default_response_border() -> String {
+    "gutter".to_string()
+}
+
+fn default_dim_tool_lines() -> bool {
+    true
+}
+
+fn default_max_tool_loops() -> u32 {
+    50
+}
+
+fn default_max_total_tool_calls() -> u32 {
+    75
+}
+
+// Hand-written so a config file with no `[server]` section gets the SAME
+// defaults as an empty `[server]` (serde uses this impl for the missing field,
+// while the `default = "..."` attrs cover missing individual keys). A derived
+// `Default` would yield zeros (e.g. idle_timeout 0).
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout_secs: default_idle_timeout(),
+            approve_mode: default_approve_mode(),
+            bash_gate: default_bash_gate(),
+            show_thinking: default_show_thinking(),
+            response_border: default_response_border(),
+            dim_tool_lines: default_dim_tool_lines(),
+            max_tool_loops: default_max_tool_loops(),
+            max_total_tool_calls: default_max_total_tool_calls(),
+        }
+    }
 }
 
 pub fn jancode_dir() -> PathBuf {
@@ -246,5 +305,34 @@ pub fn provider_names(cfg: &Config) -> Vec<String> {
         cfg.providers.iter().map(|p| p.name.clone()).collect()
     } else {
         vec!["default".to_string()]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_defaults() {
+        // An empty/minimal config gets sensible defaults.
+        let cfg: Config = toml::from_str("").expect("empty config parses");
+        assert_eq!(cfg.server.max_tool_loops, 50);
+        assert_eq!(cfg.server.max_total_tool_calls, 75);
+        assert_eq!(cfg.server.response_border, "gutter");
+        assert!(cfg.server.dim_tool_lines);
+        assert_eq!(cfg.server.idle_timeout_secs, 300);
+        assert_eq!(cfg.server.approve_mode, "prompt");
+        assert_eq!(cfg.server.bash_gate, "basic");
+    }
+
+    #[test]
+    fn server_limits_override() {
+        let cfg: Config = toml::from_str(
+            "[server]\nmax_tool_loops = 120\nmax_total_tool_calls = 200\nresponse_border = \"none\"\n",
+        )
+        .expect("override config parses");
+        assert_eq!(cfg.server.max_tool_loops, 120);
+        assert_eq!(cfg.server.max_total_tool_calls, 200);
+        assert_eq!(cfg.server.response_border, "none");
     }
 }

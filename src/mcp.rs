@@ -45,7 +45,14 @@ impl McpClient {
         Self {
             url: url.to_string(),
             http: reqwest::Client::builder()
+                // Total per-request budget (a slow tools/call may legitimately
+                // take a while).
                 .timeout(std::time::Duration::from_secs(120))
+                // …but fail FAST when the server is unreachable, so a down MCP
+                // server doesn't add tens of seconds to every turn. The client
+                // re-reads config and reconnects each turn, so an unreachable
+                // server would otherwise stall every message.
+                .connect_timeout(std::time::Duration::from_secs(5))
                 .build()
                 .unwrap_or_default(),
             session_id: None,
@@ -293,9 +300,11 @@ fn resolve_bearer(svc: &crate::config::McpServerConfig) -> Option<String> {
 /// Connect to every configured MCP server and return their tools, merged as
 /// jancode `Tool`s. Failed servers are logged and skipped so the rest of the
 /// conversation still works.
+///
+/// Servers are connected **concurrently**, so the total wait is the slowest
+/// single server (not the sum) — a down server can't serialize the others.
 pub async fn load_tools(cfg: &crate::config::Config) -> Vec<Box<dyn crate::tools::Tool>> {
-    let mut out: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
-    for svc in &cfg.mcp.servers {
+    let tasks = cfg.mcp.servers.iter().map(|svc| async move {
         let token = resolve_bearer(svc);
         let client = std::sync::Arc::new(tokio::sync::Mutex::new(McpClient::with_bearer(
             &svc.url,
@@ -311,25 +320,22 @@ pub async fn load_tools(cfg: &crate::config::Config) -> Vec<Box<dyn crate::tools
             Ok(info) => info,
             Err(e) => {
                 tracing::error!("MCP server {} ({}) skipped: {:?}", svc.name, svc.url, e);
-                continue;
+                return Vec::new();
             }
         };
         tracing::info!("MCP server {} exposed {} tools", svc.name, info.len());
-        for t in info {
-            out.push(Box::new(McpTool {
-                client: client.clone(),
-                info: t,
-            }));
-        }
-    }
-    out
+        info.into_iter()
+            .map(|t| Box::new(McpTool { client: client.clone(), info: t }) as Box<dyn crate::tools::Tool>)
+            .collect::<Vec<_>>()
+    });
+    futures::future::join_all(tasks).await.into_iter().flatten().collect()
 }
 
 /// Read-only probe of every configured MCP server: connect, initialize, and
 /// list its tools. Never executes tools. Used by `/mcp_tools` and `/mcp_status`.
+/// Servers are probed concurrently so a down server doesn't delay the rest.
 pub async fn probe(cfg: &crate::config::Config) -> Vec<McpServerProbe> {
-    let mut out = Vec::new();
-    for svc in &cfg.mcp.servers {
+    let tasks = cfg.mcp.servers.iter().map(|svc| async move {
         let token = resolve_bearer(svc);
         let mut client = McpClient::with_bearer(&svc.url, token);
         let (ok, error, tools) = match (async {
@@ -341,16 +347,16 @@ pub async fn probe(cfg: &crate::config::Config) -> Vec<McpServerProbe> {
             Ok(t) => (true, None, t),
             Err(e) => (false, Some(format!("{:?}", e)), Vec::new()),
         };
-        out.push(McpServerProbe {
+        McpServerProbe {
             name: svc.name.clone(),
             url: svc.url.clone(),
             transport: svc.transport.clone(),
             ok,
             error,
             tools,
-        });
-    }
-    out
+        }
+    });
+    futures::future::join_all(tasks).await
 }
 
 #[cfg(test)]

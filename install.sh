@@ -162,6 +162,14 @@ idle_timeout_secs = 300
 # bash_gate = "basic"
 # Print the model's reasoning as [thinking] lines (default false = hidden).
 # show_thinking = false
+# Response border/box around model replies (terminal-only). "gutter" (default
+# left bar), "box" (gutter + top/bottom rules), or "none".
+# response_border = "gutter"
+# Dim the [tool]/[approval] status lines so the reply stands out (default true).
+# dim_tool_lines = true
+# Max model turns / total tool calls per request. Raise for big-project analysis.
+# max_tool_loops = 50
+# max_total_tool_calls = 75
 
 # Single-provider setup (legacy): use the `[provider]` table.
 [provider]

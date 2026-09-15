@@ -14,6 +14,11 @@ pub enum Request {
         content: String,
         #[serde(default)]
         tools: Option<Vec<String>>,
+        /// Opt in to MCP tools for this turn only. MCP servers are NOT connected
+        /// for ordinary turns (they can be slow/down and would add latency to
+        /// every message); the client sets this true only for `/mcp <message>`.
+        #[serde(default)]
+        mcp: bool,
         #[serde(default)]
         model: Option<String>,
         /// Name of the provider to use (from `[[providers]]`). Empty/None uses
