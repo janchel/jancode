@@ -1,11 +1,148 @@
 use crate::config::runtime_dir;
 use crate::protocol::{Event, Request};
 use anyhow::{Context, Result};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::process::Command;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, stdin};
 use tracing::info;
+
+/// Left-gutter border for model responses (interactive readability). Rendered
+/// client-side only — no extra tokens or provider calls. The ANSI dim (`\x1b[2m`)
+/// is only emitted on a real terminal, so piped/redirected output stays clean.
+const RESPONSE_GUTTER_ANSI: &str = "\x1b[2m│\x1b[0m ";
+const ANSI_DIM: &str = "\x1b[2m";
+const ANSI_RESET: &str = "\x1b[0m";
+
+/// True when the style draws any response chrome (blank lines / gutter / box).
+fn border_enabled(style: &str) -> bool {
+    !matches!(style, "none" | "off" | "false")
+}
+
+/// True when the style adds top/bottom rules around the reply.
+fn border_is_box(style: &str) -> bool {
+    matches!(style, "box" | "boxed")
+}
+
+/// Choose the gutter prefix for the current output target. Returns an empty
+/// string when the border is disabled, or when stdout isn't a terminal (so
+/// `jancode ... | grep` and log files stay unpolluted).
+fn gutter_prefix(style: &str) -> &'static str {
+    if border_enabled(style) && std::io::stdout().is_terminal() {
+        RESPONSE_GUTTER_ANSI
+    } else {
+        ""
+    }
+}
+
+/// Wrap a status line in the dim SGR so `[tool]`/`[approval]`/`[thinking]`
+/// recede behind the model's reply. Terminal-only (stderr), so piped logs stay
+/// clean. Cheap: one small String per status line.
+fn dim(s: &str, enabled: bool) -> String {
+    if enabled && std::io::stderr().is_terminal() {
+        format!("{}{}{}", ANSI_DIM, s, ANSI_RESET)
+    } else {
+        s.to_string()
+    }
+}
+
+/// Terminal width for box rules: `$COLUMNS` when sane, else 60. Avoids pulling
+/// in a terminal-size crate (keeps the dependency surface lean).
+fn term_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.trim().parse::<usize>().ok())
+        .filter(|w| *w >= 10)
+        .unwrap_or(60)
+}
+
+/// A full-width horizontal rule for box style.
+fn rule_line() -> String {
+    "─".repeat(term_width())
+}
+
+/// Prefix each line of a streamed response chunk with the gutter. `at_line_start`
+/// tracks the cursor so the bar is emitted once per line and blank lines stay
+/// unbarred. State is tracked even when the gutter is empty, so the caller can
+/// decide whether to append a trailing newline. Pure function (unit-tested).
+fn apply_gutter(text: &str, at_line_start: &mut bool, gutter: &str) -> String {
+    // Fast path: no gutter and no line break -> nothing to prefix.
+    if gutter.is_empty() && !text.contains('\n') {
+        if !text.is_empty() {
+            *at_line_start = false;
+        }
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + gutter.len());
+    for ch in text.chars() {
+        if ch == '\n' {
+            out.push('\n');
+            *at_line_start = true;
+        } else {
+            if *at_line_start && !gutter.is_empty() {
+                out.push_str(gutter);
+            }
+            *at_line_start = false;
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Ask the daemon to probe the configured MCP servers (connect + initialize +
+/// list tools) and return their status. Used by `/mcp`, `/mcp_status`,
+/// `/mcp_tools`, and `/mcp_reconnect`. Returns an empty vec on timeout.
+async fn mcp_probe_servers(
+    w: &mut tokio::net::unix::OwnedWriteHalf,
+    lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+) -> Result<Vec<crate::mcp::McpServerProbe>> {
+    let id = crate::protocol::new_message_id();
+    let req = Request::McpProbe { id };
+    let data = serde_json::to_string(&req)?;
+    w.write_all(data.as_bytes()).await?;
+    w.write_all(b"\n").await?;
+    w.flush().await?;
+    let res = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(line) = lines.next_line().await? {
+            let ev: Event = match serde_json::from_str(&line) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if let Event::McpInfo { id: mid, servers } = ev {
+                if mid == id {
+                    return Ok::<Vec<crate::mcp::McpServerProbe>, anyhow::Error>(servers);
+                }
+            }
+        }
+        Ok(Vec::new())
+    })
+    .await;
+    match res {
+        Ok(Ok(servers)) => Ok(servers),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+/// Print per-server MCP connection status. Returns how many servers are online
+/// so callers can add guidance when some are offline.
+fn print_mcp_status(servers: &[crate::mcp::McpServerProbe]) -> (usize, usize) {
+    let mut online = 0usize;
+    for s in servers {
+        let status = if s.ok { "ok" } else { "OFFLINE" };
+        if s.ok {
+            online += 1;
+        }
+        println!(
+            "  - {} ({}, {}) [{}] - {} tools",
+            s.name, s.url, s.transport, status, s.tools.len()
+        );
+        if let Some(e) = &s.error {
+            println!("      error: {}", e.lines().next().unwrap_or(""));
+        }
+    }
+    (online, servers.len())
+}
 
 /// Handle a `jancode swarm <subcommand>` CLI call.
 pub async fn handle_swarm(sub: crate::SwarmCommands) -> Result<()> {
@@ -214,6 +351,9 @@ pub async fn connect() -> Result<()> {
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
     let mut tools_enabled = true;
+    // MCP tools are opt-in per turn (only `/mcp <message>` sets this). Ordinary
+    // turns skip MCP entirely so a slow/down server can't slow every message.
+    let mut mcp_requested = false;
     let mut session_id = Some(format!("connect-{}", crate::protocol::new_message_id()));
     println!(
         "swarm session id: {} (spawn agents with `jancode swarm spawn --parent {}`)",
@@ -228,6 +368,18 @@ pub async fn connect() -> Result<()> {
     let show_thinking = crate::config::load()
         .map(|c| c.server.show_thinking)
         .unwrap_or(false);
+    // Left gutter/box for model responses (see `[server] response_border`).
+    // Makes the AI's replies easy to spot between tool output and user input.
+    let response_border = crate::config::load()
+        .map(|c| c.server.response_border.clone())
+        .unwrap_or_else(|_| "gutter".to_string());
+    // Dim the [tool]/[approval]/[thinking] status lines so the reply stands out.
+    let dim_tools = crate::config::load()
+        .map(|c| c.server.dim_tool_lines)
+        .unwrap_or(true);
+    let gutter = gutter_prefix(&response_border);
+    let chrome = border_enabled(&response_border);
+    let boxed = border_is_box(&response_border);
     let mut current_model: Option<String> = None;
     let mut current_provider: Option<String> = None;
     let mut models_cache: Option<Vec<String>> = None;
@@ -290,15 +442,31 @@ pub async fn connect() -> Result<()> {
                 continue;
             }
             let remainder = input.strip_prefix("/mcp ").unwrap_or("").trim().to_string();
-            println!("MCP servers configured:");
-            for s in &cfg.mcp.servers {
-                println!("  - {} ({}, {})", s.name, s.url, s.transport);
-            }
             if remainder.is_empty() {
+                // Bare `/mcp`: list configured servers AND check connectivity so
+                // offline servers are visible immediately.
+                println!("MCP servers configured:");
+                for s in &cfg.mcp.servers {
+                    println!("  - {} ({}, {})", s.name, s.url, s.transport);
+                }
+                println!();
+                println!("checking connectivity...");
+                let servers = mcp_probe_servers(&mut w, &mut lines).await?;
+                let (online, total) = print_mcp_status(&servers);
+                if online < total {
+                    println!();
+                    println!(
+                        "hint: {} of {} MCP server(s) OFFLINE. Fix the server/config, then run \
+                         /mcp_reconnect, or just send `/mcp <message>` (it reconnects on demand).",
+                        total - online,
+                        total
+                    );
+                }
                 continue;
             }
-            // /mcp <message>: enable tools (which include MCP tools) and send.
+            // /mcp <message>: enable tools INCLUDING MCP tools for this turn only.
             tools_enabled = true;
+            mcp_requested = true;
             println!("tools enabled: true (MCP + built-in)");
             input = remainder;
         }
@@ -521,64 +689,37 @@ pub async fn connect() -> Result<()> {
             if reconnect {
                 println!("reconnecting to MCP servers (reloading config)...");
             }
-            let id = crate::protocol::new_message_id();
-            let req = Request::McpProbe { id };
-            let data = serde_json::to_string(&req)?;
-            w.write_all(data.as_bytes()).await?;
-            w.write_all(b"\n").await?;
-            w.flush().await?;
-            let timeout = tokio::time::timeout(
-                Duration::from_secs(20),
-                async {
-                    while let Some(line) = lines.next_line().await? {
-                        let ev: Event = match serde_json::from_str(&line) {
-                            Ok(e) => e,
-                            Err(_) => continue,
-                        };
-                        if let Event::McpInfo { id: mid, servers } = ev {
-                            if mid == id {
-                                return Ok::<Vec<crate::mcp::McpServerProbe>, anyhow::Error>(servers);
-                            }
-                        }
-                    }
-                    Ok::<Vec<crate::mcp::McpServerProbe>, anyhow::Error>(Vec::new())
-                },
-            )
-            .await;
-            match timeout {
-                Ok(Ok(servers)) => {
-                    if servers.is_empty() {
-                        println!("no MCP servers configured; add [[mcp.servers]] to ~/.jancode/config.toml");
-                        println!("  [[mcp.servers]]\n  name = \"server-name\"\n  url = \"https://host/mcp\"");
-                    } else if show_tools {
-                        for s in &servers {
-                            println!("--- {} ({}) ---", s.name, s.transport);
-                            if s.tools.is_empty() {
-                                println!("  (no tools exposed)");
-                            } else {
-                                for t in &s.tools {
-                                    println!("  - {}", t.name);
-                                    let d = t.description.trim();
-                                    if !d.is_empty() {
-                                        println!("      {}", d.lines().next().unwrap_or(""));
-                                    }
-                                }
-                            }
-                            println!();
-                        }
-                        println!("Tip: /mcp <message> sends with these tools enabled");
+            let servers = mcp_probe_servers(&mut w, &mut lines).await?;
+            if servers.is_empty() {
+                println!("no MCP servers configured, or the daemon timed out waiting for MCP status");
+                println!("  [[mcp.servers]]\n  name = \"server-name\"\n  url = \"https://host/mcp\"");
+            } else if show_tools {
+                for s in &servers {
+                    println!("--- {} ({}) ---", s.name, s.transport);
+                    if s.tools.is_empty() {
+                        println!("  (no tools exposed)");
                     } else {
-                        for s in &servers {
-                            let status = if s.ok { "ok" } else { "FAILED" };
-                            println!("  - {} ({}, {}) [{}] - {} tools",
-                                s.name, s.url, s.transport, status, s.tools.len());
-                            if let Some(e) = &s.error {
-                                println!("      error: {}", e.lines().next().unwrap_or(""));
+                        for t in &s.tools {
+                            println!("  - {}", t.name);
+                            let d = t.description.trim();
+                            if !d.is_empty() {
+                                println!("      {}", d.lines().next().unwrap_or(""));
                             }
                         }
                     }
+                    println!();
                 }
-                _ => println!("timed out waiting for MCP status from daemon"),
+                println!("Tip: /mcp <message> sends with these tools enabled");
+            } else {
+                let (online, total) = print_mcp_status(&servers);
+                if online < total {
+                    println!();
+                    println!(
+                        "hint: {} of {} MCP server(s) OFFLINE. Fix the server/config, then run /mcp_reconnect.",
+                        total - online,
+                        total
+                    );
+                }
             }
             continue;
         }
@@ -720,7 +861,11 @@ pub async fn connect() -> Result<()> {
             provider: current_provider.clone(),
             cwd,
             interactive: true,
+            // MCP tools only for turns started with `/mcp <message>`.
+            mcp: mcp_requested,
         };
+        // MCP opt-in is per-turn: reset so the next message is built-in only.
+        mcp_requested = false;
         let data = serde_json::to_string(&req)?;
         w.write_all(data.as_bytes()).await?;
         w.write_all(b"\n").await?;
@@ -728,6 +873,9 @@ pub async fn connect() -> Result<()> {
 
         let mut in_stream = false;
         let mut cancelled = false;
+        // Tracks line starts so the response gutter is drawn once per line and
+        // blank lines stay unbarred. Reset each turn.
+        let mut resp_at_line_start = true;
         loop {
             tokio::select! {
                 line = lines.next_line() => {
@@ -814,8 +962,12 @@ pub async fn connect() -> Result<()> {
                                 } else {
                                     c.input.to_string()
                                 };
-                                eprintln!("[tool] {}", if arg_str.is_empty() { c.name.clone() } else { format!("{} {}", c.name, arg_str) });
+                                eprintln!("{}", dim(&format!("[tool] {}", if arg_str.is_empty() { c.name.clone() } else { format!("{} {}", c.name, arg_str) }), dim_tools));
                             }
+                            // A tool line ends with a newline on the shared
+                            // terminal, so the next response line should start
+                            // fresh (gutter included).
+                            resp_at_line_start = true;
                         }
                         Event::ToolResult { .. } => {
                             // Suppress tool result output for a quiet, readable session.
@@ -825,20 +977,33 @@ pub async fn connect() -> Result<()> {
                             // `[server] show_thinking = true`. Other status
                             // messages (e.g. "Executing tool: ...") stay quiet.
                             if show_thinking && message.starts_with("thinking: ") {
-                                eprintln!("[thinking] {}", message.strip_prefix("thinking: ").unwrap_or(""));
+                                eprintln!("{}", dim(&format!("[thinking] {}", message.strip_prefix("thinking: ").unwrap_or("")), dim_tools));
+                                resp_at_line_start = true;
                             }
                         }
                         Event::TextDelta { id: _, text } => {
-                            in_stream = true;
-                            print!("{}", text);
+                            // On the first text of the turn, open the response
+                            // block: a blank line for breathing room, and (box
+                            // style) a top rule.
+                            if !in_stream && !text.is_empty() {
+                                in_stream = true;
+                                if chrome {
+                                    println!();
+                                }
+                                if boxed {
+                                    println!("{}", rule_line());
+                                }
+                            }
+                            let rendered = apply_gutter(&text, &mut resp_at_line_start, gutter);
+                            print!("{}", rendered);
                             std::io::stdout().flush()?;
                         }
                         Event::ApprovalRequired { id, tool_call_id, tool_name, path, reason } => {
                             in_stream = false;
                             eprintln!();
-                            eprintln!("[approval] {} — {}", tool_name, reason);
+                            eprintln!("{}", dim(&format!("[approval] {} — {}", tool_name, reason), dim_tools));
                             if let Some(p) = path {
-                                eprintln!("           target: {}", p);
+                                eprintln!("{}", dim(&format!("           target: {}", p), dim_tools));
                             }
                             eprint!("allow? [y/N] ");
                             std::io::stdout().flush()?;
@@ -855,7 +1020,8 @@ pub async fn connect() -> Result<()> {
                             w.write_all(data.as_bytes()).await?;
                             w.write_all(b"\n").await?;
                             w.flush().await?;
-                            eprintln!("[approval] {}", if approved { "allowed" } else { "DENIED" });
+                            eprintln!("{}", dim(&format!("[approval] {}", if approved { "allowed" } else { "DENIED" }), dim_tools));
+                            resp_at_line_start = true;
                         }
                         Event::Notification {
                             id: _,
@@ -875,10 +1041,21 @@ pub async fn connect() -> Result<()> {
                                 from,
                                 message
                             );
+                            resp_at_line_start = true;
                         }
                         Event::Done { id: _ } => {
+                            // Close the response block: finish the line, then
+                            // (box style) a bottom rule, then a blank line.
                             if in_stream {
-                                println!();
+                                if !resp_at_line_start {
+                                    println!();
+                                }
+                                if boxed {
+                                    println!("{}", rule_line());
+                                }
+                                if chrome {
+                                    println!();
+                                }
                             }
                             break;
                         }
@@ -921,7 +1098,7 @@ pub async fn connect() -> Result<()> {
     Ok(())
 }
 
-pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool) -> Result<()> {
+pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool, mcp: bool) -> Result<()> {
     let stream = connect_or_spawn().await?;
     let (r, mut w) = stream.into_split();
     let mut lines = BufReader::new(r).lines();
@@ -954,6 +1131,8 @@ pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool) -> Res
         } else {
             None
         },
+        // Opt-in via `--mcp`; MCP servers aren't connected otherwise.
+        mcp,
         model,
         provider: None,
         cwd,
@@ -965,6 +1144,17 @@ pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool) -> Res
     w.flush().await?;
 
     let mut any_output = false;
+    // Response chrome (terminal-only; see `[server] response_border`).
+    let response_border = crate::config::load()
+        .map(|c| c.server.response_border.clone())
+        .unwrap_or_else(|_| "gutter".to_string());
+    let dim_tools = crate::config::load()
+        .map(|c| c.server.dim_tool_lines)
+        .unwrap_or(true);
+    let gutter = gutter_prefix(&response_border);
+    let chrome = border_enabled(&response_border);
+    let boxed = border_is_box(&response_border);
+    let mut resp_at_line_start = true;
     while let Some(line) = lines.next_line().await? {
         let ev: Event = match serde_json::from_str(&line) {
             Ok(e) => e,
@@ -972,8 +1162,17 @@ pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool) -> Res
         };
         match ev {
             Event::TextDelta { id: _, text } => {
-                any_output = true;
-                print!("{}", text);
+                if !any_output && !text.is_empty() {
+                    any_output = true;
+                    if chrome {
+                        println!();
+                    }
+                    if boxed {
+                        println!("{}", rule_line());
+                    }
+                }
+                let rendered = apply_gutter(&text, &mut resp_at_line_start, gutter);
+                print!("{}", rendered);
                 std::io::stdout().flush()?;
             }
             Event::ToolCall { id: _, calls } => {
@@ -1041,14 +1240,22 @@ pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool) -> Res
                     } else {
                         c.input.to_string()
                     };
-                    eprintln!("[tool] {}", if arg_str.is_empty() { c.name.clone() } else { format!("{} {}", c.name, arg_str) });
+                    eprintln!("{}", dim(&format!("[tool] {}", if arg_str.is_empty() { c.name.clone() } else { format!("{} {}", c.name, arg_str) }), dim_tools));
                 }
             }
             Event::ToolResult { .. } => {}
             Event::Status { .. } => {}
             Event::Done { id: _ } => {
                 if any_output {
-                    println!();
+                    if !resp_at_line_start {
+                        println!();
+                    }
+                    if boxed {
+                        println!("{}", rule_line());
+                    }
+                    if chrome {
+                        println!();
+                    }
                 }
                 break;
             }
@@ -1059,4 +1266,87 @@ pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool) -> Res
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gutter_prefixes_each_line_once() {
+        let g = "│ ";
+        // First line gets a bar; the char after a newline gets a bar too.
+        let mut at_start = true;
+        assert_eq!(apply_gutter("hello", &mut at_start, g), "│ hello");
+        assert!(!at_start);
+        // Continuation of the same line: no extra bar.
+        assert_eq!(apply_gutter(" world", &mut at_start, g), " world");
+        // A newline then text -> bar on the new line.
+        assert_eq!(apply_gutter("\nsecond", &mut at_start, g), "\n│ second");
+        // Trailing newline leaves us at line start (blank lines stay unbarred).
+        assert_eq!(apply_gutter("x\ny\n", &mut at_start, g), "x\n│ y\n");
+        assert!(at_start);
+    }
+
+    #[test]
+    fn gutter_blank_lines_unbarred() {
+        let g = "│ ";
+        let mut at_start = true;
+        // A blank line between content must not get a bar.
+        assert_eq!(apply_gutter("a\n\nb", &mut at_start, g), "│ a\n\n│ b");
+    }
+
+    #[test]
+    fn gutter_disabled_is_passthrough() {
+        let mut at_start = true;
+        // Empty gutter -> exact passthrough, but line state is still tracked so
+        // the Done handler knows whether to append a trailing newline.
+        assert_eq!(apply_gutter("hello\nworld", &mut at_start, ""), "hello\nworld");
+        assert!(!at_start);
+        // Text ending in a newline leaves us at line start.
+        assert_eq!(apply_gutter("done\n", &mut at_start, ""), "done\n");
+        assert!(at_start);
+        // Empty chunk doesn't disturb state.
+        assert_eq!(apply_gutter("", &mut at_start, ""), "");
+        assert!(at_start);
+    }
+
+    #[test]
+    fn gutter_style_selection() {
+        // "none"/"off"/"false" disable regardless of terminal.
+        assert_eq!(gutter_prefix("none"), "");
+        assert_eq!(gutter_prefix("off"), "");
+        assert_eq!(gutter_prefix("false"), "");
+        // Non-disable styles are terminal-aware; the value depends on whether
+        // stdout is a TTY (true under `--nocapture`, false when captured), so we
+        // only assert it's one of the two valid prefixes.
+        let g = gutter_prefix("gutter");
+        assert!(g == RESPONSE_GUTTER_ANSI || g.is_empty());
+    }
+
+    #[test]
+    fn border_style_predicates() {
+        // Enabled for gutter/box, disabled for none/off/false.
+        assert!(border_enabled("gutter"));
+        assert!(border_enabled("box"));
+        assert!(!border_enabled("none"));
+        assert!(!border_enabled("off"));
+        assert!(!border_enabled("false"));
+        // Box only for box/boxed.
+        assert!(border_is_box("box"));
+        assert!(border_is_box("boxed"));
+        assert!(!border_is_box("gutter"));
+        assert!(!border_is_box("none"));
+    }
+
+    #[test]
+    fn dim_is_passthrough_when_disabled() {
+        // Disabled -> exact passthrough regardless of terminal.
+        assert_eq!(dim("hello", false), "hello");
+    }
+
+    #[test]
+    fn rule_line_is_nonempty() {
+        assert!(!rule_line().is_empty());
+    }
 }

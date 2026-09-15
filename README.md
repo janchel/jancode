@@ -153,9 +153,12 @@ In interactive mode, use these commands:
   support tool calling and every turn will error while tools are enabled.
 - `/memory` — List auto-captured memory notes for the current folder.
 - `/forget <number>` — Delete a memory note listed by `/memory`.
-- `/mcp` — List MCP servers configured in `$JANCODE_HOME/config.toml`.
-- `/mcp <message>` — Force tools ON (built-in + MCP tools) and send
-  `<message>` in one step (e.g. `/mcp check disk space on server1`).
+- `/mcp` — List configured MCP servers **and check connectivity** (connect +
+  initialize), showing `[ok]` or `[OFFLINE]` per server, with a hint to run
+  `/mcp_reconnect` if any are down.
+- `/mcp <message>` — Send `<message>` with MCP tools enabled **for that turn
+  only** (built-in + MCP). MCP servers are connected on demand, so ordinary
+  messages never pay MCP latency.
 - `/mcp_tools` — Connect to each configured MCP server and list the tools it
   exposes (name + one-line description). Read-only; never executes tools.
 - `/mcp_status` — Show per-server connection status: `[ok]` with the tool
@@ -173,6 +176,35 @@ Tool-calling is **enabled by default** in interactive mode. Tool activity is
 shown compactly as `[tool] <name> <target>` lines (e.g. `[tool] read
 package.json`); full tool output is fed back to the model but suppressed from
 the terminal so only the AI's final response is prominent.
+
+#### Response border
+
+To make the model's replies easy to tell apart from tool output and your own
+input in long sessions, responses get a subtle left gutter (like other CLI
+agents), and you can optionally wrap them in a full-width box:
+
+```
+auto/best-free> refactor the parser
+────────────────────────────────────────
+│ I'll start by reading src/parser.rs to see the current structure.
+│ Then I'll extract the tokenizer into its own module.
+────────────────────────────────────────
+
+auto/best-free>
+```
+
+- Configure with `[server] response_border`:
+  - `"gutter"` (default) — the dim `│ ` left border.
+  - `"box"` — the gutter **plus** top/bottom `─` rules (chat-bubble look).
+  - `"none"` — plain output (old behavior).
+- `[server] dim_tool_lines` (default `true`) dims the `[tool]`/`[approval]`/
+  `[thinking]` status lines so they recede behind the reply.
+- The box rules are sized to `$COLUMNS` (fallback 60) — no terminal-size
+  dependency.
+- All of this is **terminal-only**: piped or redirected output
+  (`jancode ... > file`, `| grep`) stays clean, with no ANSI codes or bars.
+  Pure client-side string handling — no extra tokens, provider calls, or
+  measurable CPU.
 
 ### Built-in tools
 
@@ -281,11 +313,36 @@ The policy lives in `$JANCODE_HOME/config.toml` under `[server]`:
 [server]
 idle_timeout_secs = 300
 approve_mode = "prompt"   # "prompt" | "auto" | "deny"
+response_border = "gutter" # "gutter" (default) | "box" | "none"
+dim_tool_lines = true      # dim [tool]/[approval] status lines
+max_tool_loops = 50        # model turns per request (default 50)
+max_total_tool_calls = 75  # total tool calls per request (default 75)
 ```
 
 - `"prompt"` (default) — interactive sessions ask; headless sessions auto-allow.
 - `"auto"` — always allow risky calls (no prompts).
 - `"deny"` — always block risky calls with `APPROVAL_DENIED`.
+
+#### Tool loop limits
+
+Analyzing large projects (or tracing a pipeline across several repos) can need a
+lot of read/grep turns. Two `[server]` settings bound how far the agent may go in
+a single request:
+
+```toml
+[server]
+max_tool_loops = 50        # model turns (tool-calling iterations) per request
+max_total_tool_calls = 75  # total tool calls per request
+```
+
+- Raise them for big-codebase analysis; lower them to fail fast.
+- These are **safety caps, not the only guard** — jancode still stops early on
+  real loops: repeating an identical call several times in a row, issuing the
+  **same call too many times** across the turn (e.g. re-reading one file),
+  consecutive tool errors, or repeated denials. So a higher cap enables longer
+  *useful* work without enabling runaway loops.
+- When a cap is hit, the error message says so explicitly (and, for the total
+  cap, suggests raising these settings).
 
 ### Workspace confinement
 
@@ -369,15 +426,27 @@ runs the `initialize` handshake, discovers its tools via `tools/list`, and
 registers them so the model can call them like built-in tools. Servers that
 fail to connect are skipped (logged) without breaking the request.
 
+> **MCP is opt-in per turn.** jancode does **not** connect to MCP servers at
+> startup or on ordinary messages — they're contacted only when a turn
+> explicitly asks for MCP tools:
+> - interactive: `/mcp <message>` (or `/mcp`, `/mcp_status`, `/mcp_tools`,
+>   `/mcp_reconnect` to probe);
+> - one-shot: `jancode run "..." --tools --mcp`;
+> - headless swarm agents: built-in tools only.
+>
+> This keeps every normal message fast and immune to a slow or down MCP server.
+> Down servers are also detected quickly (5s connect timeout) and all servers
+> are probed concurrently, so one bad server can't stall the others.
+
 Quick start:
 
 ```bash
-/mcp                               # list configured servers
+/mcp                               # list configured servers + check connectivity
 /mcp_tools                         # list tools exposed by each server (read-only)
 /mcp_status                        # per-server connection status
 /mcp_reconnect                     # reload config + reconnect all MCP servers
-/mcp check disk space on server1    # send with MCP tools enabled
-jancode run "..." --tools          # one-shot with MCP tools available
+/mcp check disk space on server1    # send with MCP tools enabled (this turn only)
+jancode run "..." --tools --mcp    # one-shot with MCP tools available
 ```
 
 **No daemon restart needed for MCP config changes.** MCP servers are re-read
@@ -393,9 +462,11 @@ jancode run "Explain this code" --model <model-name> --tools
 ```
 
 - `--model <model-name>` — Override the default model (e.g., `gpt-4o`).
-- `--tools` — Enable tool-calling for this prompt. Like interactive mode, tool
-  output is shown compactly (`[tool] ...`) and only the final response is
-  printed in full.
+- `--tools` — Enable built-in tool-calling for this prompt. Like interactive
+  mode, tool output is shown compactly (`[tool] ...`) and only the final
+  response is printed in full.
+- `--mcp` — Also enable MCP tools for this prompt (connects to the configured
+  MCP servers). Off by default so a slow/down MCP server can't add latency.
 
 ### Swarm (multi-agent)
 
