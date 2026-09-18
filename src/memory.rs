@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::config::jancode_dir;
@@ -155,17 +155,48 @@ fn filter_fact(sentence: &str) -> Option<String> {
 /// simple token-overlap score (Dice coefficient). Notes from the active folder
 /// are boosted so local context wins over global notes.
 pub fn retrieve(query: &str, folder: &str, k: usize) -> Vec<MemoryNote> {
+    let notes = load_notes().unwrap_or_default();
+    rank_notes(&notes, query, folder, k)
+}
+
+/// Is a note saved in `note_folder` in scope for the current `folder`?
+///
+/// Scoped by directory, never by keywords alone. A note applies to the folder
+/// it was saved in and to that folder's descendants (a note saved in `~/devops`
+/// covers `~/devops/proj`), but never to a sibling project.
+///
+/// This gate matters: keyword overlap is far too weak on its own. Ordinary
+/// English ("can you … this … and … project") scores above the relevance
+/// threshold, so without a hard folder check a note from one project gets
+/// injected into an unrelated one — and because the notes are appended to the
+/// system prompt as facts to trust, the model then confidently acts on the
+/// wrong project.
+fn note_in_scope(note_folder: &str, folder: &str) -> bool {
+    if note_folder.is_empty() || folder.is_empty() {
+        return false;
+    }
+    if note_folder == folder {
+        return true;
+    }
+    let note = Path::new(note_folder);
+    Path::new(folder).ancestors().any(|ancestor| ancestor == note)
+}
+
+/// Score the in-scope notes against `query` and return the best `k`.
+/// Split out from `retrieve` so the scoring and scoping rules are
+/// unit-testable without reading the on-disk note file.
+fn rank_notes(notes: &[MemoryNote], query: &str, folder: &str, k: usize) -> Vec<MemoryNote> {
     let q: std::collections::HashSet<String> = tokens(query);
 
-    let notes = load_notes().unwrap_or_default();
     let mut scored: Vec<(f64, MemoryNote)> = notes
-        .into_iter()
+        .iter()
+        .filter(|n| note_in_scope(&n.folder, folder))
         .map(|n| {
             let n_tokens: std::collections::HashSet<String> = tokens(&n.text);
             let overlap = overlap_coeff(&q, &n_tokens);
             let base = if n.folder == folder { 0.5 } else { 0.0 };
             let fresh = recency_boost(n.updated_at_ms);
-            (overlap + base + fresh, n)
+            (overlap + base + fresh, n.clone())
         })
         .collect();
 
@@ -204,4 +235,96 @@ fn tokens(text: &str) -> std::collections::HashSet<String> {
         .filter(|t| t.len() > 2)
         .map(|t| t.to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn note(text: &str, folder: &str) -> MemoryNote {
+        MemoryNote {
+            id: "test".to_string(),
+            text: text.to_string(),
+            folder: folder.to_string(),
+            created_at_ms: 0,
+            // Fresh, so the recency boost can't be blamed for a leak.
+            updated_at_ms: Utc::now().timestamp_millis(),
+        }
+    }
+
+    #[test]
+    fn note_scope_covers_the_folder_and_its_descendants_only() {
+        let here = "/home/u/proj";
+        assert!(note_in_scope(here, here), "the folder itself");
+        assert!(note_in_scope("/home/u", here), "an ancestor covers its descendants");
+        assert!(note_in_scope("/", here), "the root is global");
+        assert!(!note_in_scope("/home/u/other", here), "a sibling project must not leak");
+        assert!(!note_in_scope("/home/u/proj/sub", here), "a descendant note is not a parent fact");
+        assert!(!note_in_scope("", here), "unscoped notes are not injected");
+    }
+
+    #[test]
+    fn note_from_another_project_is_never_injected() {
+        // Regression, from a real session: this note was saved while working in
+        // ~/devops/DownloadLogs and mentions another project's path. The user
+        // then asked about an EMPTY, unrelated workspace and the model went off
+        // to read /home/jandel/devops/my-github/test1 — because this note was
+        // injected into the system prompt as a fact to trust.
+        let foreign = note(
+            "can you check this folder as well /home/jandel/devops/my-github/test1 as reference and let know what this project is.",
+            "/home/jandel/devops/DownloadLogs",
+        );
+        let query = "in this workspace can you generate Dockerfile for the Playwright \
+                     container that can execute QA tests. Use headless chromium and other \
+                     needed packages for this project.";
+        let hits = rank_notes(
+            &[foreign],
+            query,
+            "/home/jandel/devops/my-github/docker-playwright",
+            5,
+        );
+        assert!(
+            hits.is_empty(),
+            "a note from a sibling project leaked into the prompt: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn keyword_overlap_alone_would_have_admitted_it() {
+        // Guards the reason the folder gate must be a hard filter, not a boost:
+        // generic English scores ~0.26, over the 0.25 relevance threshold.
+        let q = tokens(
+            "in this workspace can you generate Dockerfile for the Playwright container \
+             that can execute QA tests. Use headless chromium and other needed packages for this project.",
+        );
+        let n = tokens(
+            "can you check this folder as well /home/jandel/devops/my-github/test1 as \
+             reference and let know what this project is.",
+        );
+        assert!(
+            overlap_coeff(&q, &n) > 0.25,
+            "expected the raw keyword score to clear the threshold (got {})",
+            overlap_coeff(&q, &n)
+        );
+    }
+
+    #[test]
+    fn local_notes_rank_above_ancestor_notes() {
+        let folder = "/home/u/proj";
+        let local = note("this project uses playwright for QA tests", folder);
+        let parent = note("we always run playwright headless in CI", "/home/u");
+        let hits = rank_notes(&[parent, local], "playwright QA tests", folder, 5);
+
+        assert_eq!(hits.len(), 2, "both the local and the ancestor note are eligible");
+        assert_eq!(hits[0].folder, folder, "the local note outranks the ancestor note");
+
+        // Documented behaviour: a note saved in the CURRENT folder is always
+        // injected, because the folder boost (0.5) alone already clears the
+        // relevance threshold. That is the deliberate "local context wins"
+        // design, not an oversight — but it does mean local notes need no
+        // keyword overlap at all to reach the prompt.
+        let local_but_irrelevant = note("the database runs on postgres", folder);
+        let hits = rank_notes(&[local_but_irrelevant], "playwright QA tests", folder, 5);
+        assert_eq!(hits.len(), 1, "local notes are injected regardless of overlap");
+    }
 }

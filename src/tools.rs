@@ -191,6 +191,14 @@ pub fn normalize_bash_cd(command: &str, working_dir: &Path) -> Option<String> {
     }
 }
 
+/// Shell operators/separators — never file operands.
+fn is_shell_operator(t: &str) -> bool {
+    matches!(
+        t,
+        "&&" | "||" | ";" | "|" | ">" | ">>" | "2>" | "1>" | "<<" | "<<-" | "2>>" | "&>"
+    )
+}
+
 /// Extract the likely target file/directory path(s) for a mutating command
 /// (e.g. `sed -i`, `rm`, `mv file1 file2`, `touch a b`, `cat > out`). This is
 /// shown in the approval reason so the user knows what the command would change.
@@ -198,26 +206,27 @@ pub fn normalize_bash_cd(command: &str, working_dir: &Path) -> Option<String> {
 /// expression bodies, shell operators, and redirection operators, and collect
 /// the remaining path-looking tokens.
 fn mutation_targets(command: &str, mut_cmd: &str) -> Vec<String> {
-    use std::path::Path;
     let tokens: Vec<&str> = command.split_whitespace().collect();
 
-    // sed / awk / perl take the file operand LAST (after `-e 'script'`).
-    // Expressions can contain spaces and slashes (e.g. `'s/a b/c d/'`), which
-    // splits them across tokens, so the safest extraction is the final token
-    // that isn't a flag or an operator — that's the target file.
+    // sed / awk / perl put their file operands AFTER the flags and expressions.
+    // Expressions can contain spaces (`'s/rgba(1, 2/3, 4/'`), which splits them
+    // across tokens, so scan backwards and take the trailing run of
+    // path-looking tokens — the scan stops at the first token that isn't a path
+    // (an expression fragment, a flag, or a shell operator). This also copes
+    // with backslash line continuations, where `\` is itself a token, and with
+    // several operands (`sed -i ... a.css b.css`).
     if matches!(mut_cmd, "sed" | "awk" | "perl") {
-        // `tokens` is `Vec<&str>`; iterate as `&str` items.
-        let last = tokens
+        let mut targets: Vec<String> = tokens
             .iter()
             .rev()
-            .map(|s| *s)
-            .find(|t| {
-                !t.starts_with('-')
-                    && *t != "&&" && *t != "||" && *t != ";" && *t != "|"
-                    && *t != ">" && *t != ">>" && *t != "2>" && *t != "1>" && *t != "<<"
+            .map_while(|t| {
+                let t = t.trim_matches(['\'', '"']);
+                (!t.starts_with('-') && !is_shell_operator(t) && is_likely_target(t))
+                    .then(|| t.to_string())
             })
-            .map(|t| t.trim_matches(['\'', '"']).to_string());
-        return last.filter(|t| is_likely_target(t)).into_iter().collect();
+            .collect();
+        targets.reverse();
+        return targets;
     }
 
     // For `mv a b` / `cp a b`, the destination is the last path; for
@@ -233,7 +242,7 @@ fn mutation_targets(command: &str, mut_cmd: &str) -> Vec<String> {
             if t.starts_with('-') {
                 return None;
             }
-            if matches!(t, "&&" | "||" | ";" | "|" | ">" | ">>" | "2>" | "1>" | "<<" | "<<-" | "if" | "then" | "else" | "fi") {
+            if is_shell_operator(t) || matches!(t, "if" | "then" | "else" | "fi") {
                 return None;
             }
             let prev = if i > 0 { tokens[i - 1] } else { "" };
@@ -275,6 +284,59 @@ fn is_likely_target(t: &str) -> bool {
     }
     // A file extension (e.g. .css, .rs, .txt, .json) is a strong signal.
     Path::new(t).extension().is_some()
+}
+
+/// Does a sed/awk/perl invocation edit files in place? Accepts the separate
+/// flag (`-i`), a value form (`-i.bak`), the long form (`--in-place[=SUFFIX]`),
+/// and clustered short flags (`perl -pi`, `sed -ni`). The cluster case matters:
+/// a naive `contains("-i")` misses `-pi`, silently letting an in-place rewrite
+/// through ungated.
+fn has_in_place_flag(command: &str) -> bool {
+    command.split_whitespace().any(|t| {
+        if t.starts_with("--") {
+            return t.starts_with("--in-place");
+        }
+        // A cluster of short flags (`-i`, `-pi`, `-ni`, `-i.bak`): `i` is the
+        // only lowercase 'i' a sed/awk/perl flag cluster uses for a file write.
+        t.len() > 1 && t.starts_with('-') && t[1..].contains('i')
+    })
+}
+
+/// The mutating command in a `bash` command string (`sed -i`, `rm`, `tee`,
+/// `cat > file`, ...), or `None` when the command doesn't write files.
+/// `"shell-redirect"` stands in for a bare write redirection.
+///
+/// Single source of truth for "could this `bash` call change a file?": the
+/// approval gate uses it to decide whether to ask, and the client uses it (via
+/// `bash_mutation_targets`) to decide whether to look up a diff afterwards.
+pub fn bash_mutation(command: &str) -> Option<&str> {
+    // sed/awk/perl only mutate with -i / --in-place; a plain
+    // `sed s/a/b/ file` just prints to stdout.
+    let in_place = has_in_place_flag(command);
+    let mutating = command.split_whitespace().find(|t| match *t {
+        "sed" | "awk" | "perl" => in_place,
+        "rm" | "rmdir" | "mv" | "cp" | "install" | "truncate" | "unlink" | "dd" | "nano"
+        | "vim" | "vi" | "ed" | "tee" | "touch" | "mkdir" | "chmod" | "chown" | "chattr" => true,
+        _ => false,
+    });
+    if mutating.is_some() {
+        return mutating;
+    }
+    // Also flag shell redirection writing to a file (`>`, `>>`, `2>`, `1>`) —
+    // but a lone `>` could be a comparison, so we only flag a standalone
+    // operator token.
+    command
+        .split_whitespace()
+        .any(|t| matches!(t, ">" | ">>" | "2>" | "1>"))
+        .then_some("shell-redirect")
+}
+
+/// Best-effort paths a mutating `bash` command writes to, or `None` when the
+/// command is read-only (so callers can skip the work entirely). Used to scope
+/// a post-hoc `git diff` to just the files the command touched.
+pub fn bash_mutation_targets(command: &str) -> Option<Vec<String>> {
+    let mut_cmd = bash_mutation(command)?;
+    Some(mutation_targets(command, mut_cmd))
 }
 
 /// Heuristic: does a `bash` command reference files/directories outside the
@@ -350,28 +412,9 @@ pub fn bash_escapes_workspace(command: &str, working_dir: &Path, mode: &str) -> 
     // `bash sed -i 's/x/y/' styles.css` from silently rewriting source files
     // (which is exactly what write/edit/apply_patch gate). We scan EVERY token
     // (not just the first) so `cd ... && sed -i ...` is still caught.
-    let tokens: Vec<&str> = cmd.split_whitespace().collect();
-    let mutating = tokens.iter().any(|t| match *t {
-        "sed" => cmd.contains("-i") || cmd.contains("--in-place"),
-        "awk" => cmd.contains("-i") || cmd.contains("--in-place"),
-        "perl" => cmd.contains("-i"),
-        "rm" | "rmdir" | "mv" | "cp" | "install" | "truncate" | "unlink" | "dd" | "nano" | "vim" | "vi" | "ed" => true,
-        "tee" => true,
-        "touch" => true,
-        "mkdir" => true,
-        "chmod" | "chown" | "chattr" => true,
-        _ => false,
-    });
-    // Also flag shell redirection writing to a file (`>`, `>>`, `2>`, `1>`) —
-    // but only a write-destinating `cat > file` / `>>`; a lone `>` could be a
-    // comparison or shell redirection. We flag a standalone operator token.
-    let has_write_redirect = tokens.iter().any(|t| *t == ">" || *t == ">>" || *t == "2>" || *t == "1>");
-    if mutating || has_write_redirect {
+    if let Some(c) = bash_mutation(cmd) {
         // Gate in-workspace file mutation. Out-of-workspace mutations are
         // separately flagged by the path-escape token scan below.
-        let c = tokens.iter().copied().find(|&t| {
-            matches!(t, "sed" | "awk" | "perl" | "rm" | "rmdir" | "mv" | "cp" | "install" | "truncate" | "unlink" | "dd" | "nano" | "vim" | "vi" | "ed" | "tee" | "touch" | "mkdir" | "chmod" | "chown" | "chattr")
-        }).unwrap_or("shell-redirect");
         let targets = mutation_targets(cmd, c);
         let targets_str = if targets.is_empty() {
             String::new()
@@ -2338,6 +2381,68 @@ mod tests {
         assert_eq!(mutation_targets("touch a.css b.js", "touch"), vec!["a.css".to_string(), "b.js".to_string()]);
         assert_eq!(mutation_targets("cat > out.txt << EOF", "shell-redirect"), vec!["out.txt".to_string()]);
         assert_eq!(mutation_targets("cd /x/y && sed -i s/a/b/ f.css", "sed"), vec!["f.css".to_string()]);
+    }
+
+    #[test]
+    fn bash_mutation_detection() {
+        // In-place editors and file writers mutate.
+        assert_eq!(bash_mutation("sed -i s/a/b/ styles.css"), Some("sed"));
+        assert_eq!(bash_mutation("perl -pi -e s/a/b/ f.rs"), Some("perl"));
+        assert_eq!(bash_mutation("perl -i -pe s/a/b/ f.rs"), Some("perl"));
+        assert_eq!(bash_mutation("sed -ni '1,5p' f.rs"), Some("sed"));
+        assert_eq!(bash_mutation("sed --in-place=.bak s/a/b/ f.rs"), Some("sed"));
+        assert_eq!(bash_mutation("rm -rf target"), Some("rm"));
+        assert_eq!(bash_mutation("tee out.log"), Some("tee"));
+        assert_eq!(bash_mutation("cat > out.txt"), Some("shell-redirect"));
+        assert_eq!(bash_mutation("echo hi >> note.md"), Some("shell-redirect"));
+        // Read-only commands must NOT report a mutation, so the client never
+        // pays for a post-hoc `git diff`.
+        assert_eq!(bash_mutation("git status"), None);
+        assert_eq!(bash_mutation("cargo test"), None);
+        // A non-in-place sed only prints to stdout.
+        assert_eq!(bash_mutation("sed -n '1,5p' file.rs"), None);
+        assert_eq!(bash_mutation("grep -r alpha src"), None);
+    }
+
+    #[test]
+    fn bash_mutation_targets_scope_the_diff() {
+        // The client scopes its diff to these paths, so they must match what
+        // the approval gate names.
+        assert_eq!(
+            bash_mutation_targets("sed -i s/a/b/ styles.css"),
+            Some(vec!["styles.css".to_string()])
+        );
+        assert_eq!(
+            bash_mutation_targets("cat > out.txt << EOF"),
+            Some(vec!["out.txt".to_string()])
+        );
+        // Read-only commands yield None, not an empty list, so callers can
+        // short-circuit.
+        assert_eq!(bash_mutation_targets("git status"), None);
+        assert_eq!(bash_mutation_targets("sed -n '1,5p' file.rs"), None);
+    }
+
+    #[test]
+    fn sed_targets_survive_real_world_invocations() {
+        // The shape claude/copilot-style agents actually emit for a palette
+        // swap: multi-line, backslash-continued, several -e expressions, and
+        // expressions containing spaces and slashes.
+        let multiline = "sed -i \\\n -e 's/#4a2e1b/#2f4238/g' \\\n -e 's/rgba(43, 29, 19/ rgba(20, 52, 43/g' \\\n styles.css";
+        assert_eq!(
+            bash_mutation_targets(multiline),
+            Some(vec!["styles.css".to_string()]),
+            "backslash continuations must still yield the file operand"
+        );
+        // Several operands are all reported.
+        assert_eq!(
+            bash_mutation_targets("sed -i -e 's/a/b/' a.css b.css"),
+            Some(vec!["a.css".to_string(), "b.css".to_string()])
+        );
+        // A trailing shell chain still isolates the file operands.
+        assert_eq!(
+            bash_mutation_targets("sed -i s/a/b/ styles.css && grep -n color styles.css"),
+            Some(vec!["styles.css".to_string()])
+        );
     }
 
     #[test]

@@ -155,6 +155,14 @@ pub struct ServerConfig {
     /// piped). Default true.
     #[serde(default = "default_dim_tool_lines")]
     pub dim_tool_lines: bool,
+    /// Show the lines the model changed, right below each successful
+    /// `edit` / `apply_patch` tool call (a compact `-`/`+` diff, colourised on
+    /// a terminal). Only the modified lines are shown — context lines are
+    /// dropped. Rendered client-side from the tool-call arguments; costs no
+    /// extra tokens or provider calls. Default true; set `false` to keep the
+    /// session minimal.
+    #[serde(default = "default_show_diffs")]
+    pub show_diffs: bool,
     /// Maximum number of model turns (tool-calling iterations) in a single
     /// request before jancode gives up. Larger projects need more exploration
     /// turns. Default 50. The per-call repeat/error/denial guards still apply,
@@ -208,6 +216,10 @@ fn default_dim_tool_lines() -> bool {
     true
 }
 
+fn default_show_diffs() -> bool {
+    true
+}
+
 fn default_max_tool_loops() -> u32 {
     50
 }
@@ -229,6 +241,7 @@ impl Default for ServerConfig {
             show_thinking: default_show_thinking(),
             response_border: default_response_border(),
             dim_tool_lines: default_dim_tool_lines(),
+            show_diffs: default_show_diffs(),
             max_tool_loops: default_max_tool_loops(),
             max_total_tool_calls: default_max_total_tool_calls(),
         }
@@ -320,6 +333,7 @@ mod tests {
         assert_eq!(cfg.server.max_total_tool_calls, 75);
         assert_eq!(cfg.server.response_border, "gutter");
         assert!(cfg.server.dim_tool_lines);
+        assert!(cfg.server.show_diffs);
         assert_eq!(cfg.server.idle_timeout_secs, 300);
         assert_eq!(cfg.server.approve_mode, "prompt");
         assert_eq!(cfg.server.bash_gate, "basic");
@@ -328,11 +342,12 @@ mod tests {
     #[test]
     fn server_limits_override() {
         let cfg: Config = toml::from_str(
-            "[server]\nmax_tool_loops = 120\nmax_total_tool_calls = 200\nresponse_border = \"none\"\n",
+            "[server]\nmax_tool_loops = 120\nmax_total_tool_calls = 200\nresponse_border = \"none\"\nshow_diffs = false\n",
         )
         .expect("override config parses");
         assert_eq!(cfg.server.max_tool_loops, 120);
         assert_eq!(cfg.server.max_total_tool_calls, 200);
         assert_eq!(cfg.server.response_border, "none");
+        assert!(!cfg.server.show_diffs);
     }
 }

@@ -167,6 +167,8 @@ idle_timeout_secs = 300
 # response_border = "gutter"
 # Dim the [tool]/[approval] status lines so the reply stands out (default true).
 # dim_tool_lines = true
+# Show the lines the model changed under each successful edit/apply_patch.
+# show_diffs = true
 # Max model turns / total tool calls per request. Raise for big-project analysis.
 # max_tool_loops = 50
 # max_total_tool_calls = 75

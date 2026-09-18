@@ -1,7 +1,9 @@
 use crate::config::runtime_dir;
 use crate::protocol::{Event, Request};
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, stdin};
@@ -13,6 +15,14 @@ use tracing::info;
 const RESPONSE_GUTTER_ANSI: &str = "\x1b[2m│\x1b[0m ";
 const ANSI_DIM: &str = "\x1b[2m";
 const ANSI_RESET: &str = "\x1b[0m";
+/// Diff colours: removed lines red, added lines green, `@@` hunk headers cyan.
+const ANSI_RED: &str = "\x1b[31m";
+const ANSI_GREEN: &str = "\x1b[32m";
+const ANSI_CYAN: &str = "\x1b[36m";
+
+/// Cap on changed lines shown per file, so a huge patch can't flood the
+/// terminal. The remainder is summarised as a single `...` line.
+const MAX_DIFF_LINES: usize = 60;
 
 /// True when the style draws any response chrome (blank lines / gutter / box).
 fn border_enabled(style: &str) -> bool {
@@ -87,6 +97,374 @@ fn apply_gutter(text: &str, at_line_start: &mut bool, gutter: &str) -> String {
         }
     }
     out
+}
+
+/// Colour one rendered diff line by its marker: `+` green, `-` red, `@@`
+/// cyan, anything else (a truncation note) left alone. Pure function so the
+/// formatting is unit-testable; `color` is false when not writing to a
+/// terminal, in which case the line passes through untouched.
+fn colorize_diff_line(line: &str, color: bool) -> String {
+    if !color {
+        return line.to_string();
+    }
+    let code = if line.starts_with('+') {
+        ANSI_GREEN
+    } else if line.starts_with('-') {
+        ANSI_RED
+    } else if line.starts_with("@@") {
+        ANSI_CYAN
+    } else {
+        return line.to_string();
+    };
+    format!("{}{}{}", code, line, ANSI_RESET)
+}
+
+/// Resolve a workspace-relative path from a tool call against the client's
+/// working directory. The daemon anchors each session to the folder the client
+/// was launched from, so both agree on what "." means.
+fn workspace_path(path: &str) -> PathBuf {
+    let p = PathBuf::from(path);
+    if p.is_absolute() {
+        p
+    } else {
+        std::env::current_dir().map(|d| d.join(&p)).unwrap_or(p)
+    }
+}
+
+/// Path shown in a diff header: relative to the workspace when possible.
+fn display_path(path: &Path) -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| path.strip_prefix(&cwd).ok().map(|p| p.display().to_string()))
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Files a tool call is about to modify (best-effort), or empty for read-only
+/// calls. This is what gets snapshotted, so it must not over-report.
+fn mutation_paths_for_call(name: &str, input: &serde_json::Value) -> Vec<String> {
+    let arg = |key: &str| input.get(key).and_then(|v| v.as_str()).unwrap_or("");
+    match name {
+        "write" | "edit" => {
+            let p = arg("path");
+            if p.is_empty() { Vec::new() } else { vec![p.to_string()] }
+        }
+        "apply_patch" => patch_path_list(arg("patch")),
+        // `bash` hides its writes in the shell string, so reuse the same
+        // detection the approval gate uses to decide what to watch.
+        "bash" => crate::tools::bash_mutation_targets(arg("command")).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// A file's content before a tool call ran, and the path it was read from.
+/// `None` means the file doesn't exist yet (the call creates it).
+struct Snapshot {
+    path: PathBuf,
+    before: Option<String>,
+}
+
+/// Read the files a mutating call is about to touch, so the change can be
+/// shown once it succeeds. Safe to do here: the daemon streams the whole
+/// provider response (and, for every mutating tool, waits for the approval
+/// round trip) before it executes anything, so this sees the pre-change
+/// content. Works in any directory — no git repository required.
+fn snapshot_for_call(name: &str, input: &serde_json::Value) -> Vec<Snapshot> {
+    mutation_paths_for_call(name, input)
+        .iter()
+        .map(|p| {
+            let path = workspace_path(p);
+            let before = std::fs::read_to_string(&path).ok();
+            Snapshot { path, before }
+        })
+        .collect()
+}
+
+/// One step of a line-level diff.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiffOp {
+    Keep,
+    Remove,
+    Add,
+}
+
+/// Longest-common-subsequence walk over two runs of lines. Returns one entry
+/// per line, in diff order; `Keep` entries are lines shared by both sides.
+fn lcs_ops<'a>(a: &[&'a str], b: &[&'a str]) -> Vec<(DiffOp, &'a str)> {
+    // dp[i][j] = LCS length of a[i..] and b[j..].
+    let mut dp = vec![vec![0u32; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            dp[i][j] = if a[i] == b[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            out.push((DiffOp::Keep, a[i]));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            out.push((DiffOp::Remove, a[i]));
+            i += 1;
+        } else {
+            out.push((DiffOp::Add, b[j]));
+            j += 1;
+        }
+    }
+    out.extend(a[i..].iter().map(|l| (DiffOp::Remove, *l)));
+    out.extend(b[j..].iter().map(|l| (DiffOp::Add, *l)));
+    out
+}
+
+/// Above this many cells the alignment table is skipped and the changed region
+/// is reported as one block, so a huge rewrite can't blow up memory.
+const MAX_LCS_CELLS: usize = 1_000_000;
+
+/// Line diff of two file contents: only the changed lines, as `-`/`+` with
+/// `@@` hunk headers. Common leading and trailing lines are trimmed before
+/// aligning, which keeps ordinary edits cheap. `None` on either side means the
+/// file was created or deleted.
+fn diff_contents(old: Option<&str>, new: Option<&str>) -> Vec<String> {
+    let (old, new) = (old.unwrap_or(""), new.unwrap_or(""));
+    if old == new {
+        return Vec::new();
+    }
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+
+    let mut head = 0;
+    while head < a.len() && head < b.len() && a[head] == b[head] {
+        head += 1;
+    }
+    let mut tail = 0;
+    while tail < a.len() - head
+        && tail < b.len() - head
+        && a[a.len() - 1 - tail] == b[b.len() - 1 - tail]
+    {
+        tail += 1;
+    }
+    let (mid_a, mid_b) = (&a[head..a.len() - tail], &b[head..b.len() - tail]);
+
+    let ops: Vec<(DiffOp, &str)> = if mid_a.len().saturating_mul(mid_b.len()) > MAX_LCS_CELLS {
+        mid_a
+            .iter()
+            .map(|l| (DiffOp::Remove, *l))
+            .chain(mid_b.iter().map(|l| (DiffOp::Add, *l)))
+            .collect()
+    } else {
+        lcs_ops(mid_a, mid_b)
+    };
+
+    // Group the ops into hunks, tracking 1-based line numbers for the headers.
+    let mut out = Vec::new();
+    let mut old_line = head + 1;
+    let mut new_line = head + 1;
+    let mut idx = 0;
+    while idx < ops.len() {
+        if ops[idx].0 == DiffOp::Keep {
+            let mut kept = 0;
+            while idx < ops.len() && ops[idx].0 == DiffOp::Keep {
+                idx += 1;
+                kept += 1;
+            }
+            old_line += kept;
+            new_line += kept;
+            continue;
+        }
+        let (hunk_old, hunk_new) = (old_line, new_line);
+        let (mut removed, mut added) = (0usize, 0usize);
+        let mut body = Vec::new();
+        while idx < ops.len() && ops[idx].0 != DiffOp::Keep {
+            if ops[idx].0 == DiffOp::Remove {
+                body.push(format!("-{}", ops[idx].1));
+                removed += 1;
+            } else {
+                body.push(format!("+{}", ops[idx].1));
+                added += 1;
+            }
+            idx += 1;
+        }
+        out.push(format!("@@ -{},{} +{},{} @@", hunk_old, removed, hunk_new, added));
+        out.extend(body);
+        old_line += removed;
+        new_line += added;
+    }
+    out
+}
+
+/// Re-read each snapshotted file and diff it against its pre-call content.
+/// Returns the lines to show, or `None` when nothing actually changed (the call
+/// was a no-op, or it failed). With several files, each block is preceded by
+/// its path so the hunks are attributable.
+fn changed_lines(snapshots: &[Snapshot]) -> Option<Vec<String>> {
+    let several = snapshots.len() > 1;
+    let mut out = Vec::new();
+    for snap in snapshots {
+        let after = std::fs::read_to_string(&snap.path).ok();
+        let lines = diff_contents(snap.before.as_deref(), after.as_deref());
+        if lines.is_empty() {
+            continue;
+        }
+        if several {
+            out.push(display_path(&snap.path));
+        }
+        out.extend(lines);
+    }
+    finish_diff_lines(out)
+}
+
+/// Drop an empty diff (nothing worth showing) and fold anything past
+/// `MAX_DIFF_LINES` into a single summary line.
+fn finish_diff_lines(mut lines: Vec<String>) -> Option<Vec<String>> {
+    if lines.is_empty() {
+        return None;
+    }
+    if lines.len() > MAX_DIFF_LINES {
+        let hidden = lines.len() - MAX_DIFF_LINES;
+        lines.truncate(MAX_DIFF_LINES);
+        lines.push(format!("  ... (+{} more changed lines)", hidden));
+    }
+    Some(lines)
+}
+
+/// Print the changed lines below the `[tool]` status line, indented to nest
+/// under it. Goes to stderr like the other status lines, so redirected stdout
+/// stays clean; colours only appear on a terminal.
+fn print_diff(lines: &[String]) {
+    let color = std::io::stderr().is_terminal();
+    for line in lines {
+        eprintln!("  {}", colorize_diff_line(line, color));
+    }
+}
+
+/// Comma-separated list of the files a unified diff touches, used for the
+/// one-line `[tool] apply_patch <paths>` summary.
+fn patch_paths(patch: &str) -> String {
+    patch_path_list(patch).join(", ")
+}
+
+/// The files a unified diff touches (paths with a `/dev/null` target, i.e.
+/// deleted files, are skipped).
+fn patch_path_list(patch: &str) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    for line in patch.lines() {
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            let p = rest.trim();
+            if p == "/dev/null" {
+                continue;
+            }
+            let p = p.strip_prefix("b/").unwrap_or(p);
+            if !paths.iter().any(|existing| existing == p) {
+                paths.push(p.to_string());
+            }
+        }
+    }
+    paths
+}
+
+/// One-line summary of a tool call's target for the `[tool] <name> <summary>`
+/// status line. Shared by interactive and one-shot modes so both render tool
+/// calls identically.
+fn tool_arg_summary(name: &str, input: &serde_json::Value) -> String {
+    let arg = |key: &str| input.get(key).and_then(|v| v.as_str()).unwrap_or("");
+    let truncate = |s: &str, n: usize| s.chars().take(n).collect::<String>();
+    match name {
+        "bash" => truncate(arg("command"), 80),
+        "read" | "write" | "edit" | "list_dir" => arg("path").to_string(),
+        "glob" => arg("pattern").to_string(),
+        "agentgrep" | "grep" => arg("query").to_string(),
+        "apply_patch" => patch_paths(arg("patch")),
+        "plan" => arg("action").to_string(),
+        "fetch_url" => arg("url").to_string(),
+        "http_request" => format!("{} {}", arg("method").trim().to_uppercase(), arg("url")),
+        "note" => join_nonempty(&[arg("action"), arg("title")]),
+        "docker" => join_nonempty(&[
+            arg("action"),
+            if arg("container").is_empty() { arg("image") } else { arg("container") },
+        ]),
+        "sql" => truncate(arg("query"), 60),
+        "git" => git_arg_summary(input),
+        // Unknown (e.g. MCP) tools: show a truncated JSON dump of the arguments
+        // so the call is still identifiable.
+        _ => truncate(&input.to_string(), 80),
+    }
+}
+
+/// Join the non-empty parts of a summary with a space.
+fn join_nonempty(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `[tool] git <action> <target>` summary (branch/ref/path, depending on action).
+fn git_arg_summary(input: &serde_json::Value) -> String {
+    let arg = |key: &str| input.get(key).and_then(|v| v.as_str()).unwrap_or("");
+    let action = arg("action");
+    let target: String = if matches!(action, "checkout" | "branch" | "push") {
+        let branch = arg("branch");
+        if branch.is_empty() { arg("refspec").to_string() } else { branch.to_string() }
+    } else if matches!(action, "merge" | "rebase") {
+        match input.get("branch").and_then(|v| v.as_str()) {
+            Some(b) => b.to_string(),
+            None => {
+                if action == "rebase"
+                    && input.get("rebase_continue").and_then(|v| v.as_bool()).unwrap_or(false)
+                {
+                    "--continue".to_string()
+                } else {
+                    String::new()
+                }
+            }
+        }
+    } else if action == "reset" {
+        let mode = input.get("mode").and_then(|v| v.as_str()).unwrap_or("mixed");
+        format!("{} {}", mode, arg("ref"))
+    } else if action == "add" || action == "diff" {
+        arg("path").to_string()
+    } else {
+        String::new()
+    };
+    if target.trim().is_empty() {
+        action.to_string()
+    } else {
+        format!("{} {}", action, target)
+    }
+}
+
+/// Run `git diff` in the working directory and print it, reusing git's own
+/// battle-tested diff engine (and its colours) instead of shipping one.
+/// `extra` passes user args straight through, so `/diff --staged` or
+/// `/diff HEAD src/main.rs` work. Read-only: never mutates the repo.
+/// Returns `false` when the working tree has no changes to show.
+fn git_diff(extra: &[String]) -> Result<bool> {
+    let mut cmd = Command::new("git");
+    cmd.arg("--no-pager").arg("diff");
+    if std::io::stdout().is_terminal() {
+        cmd.arg("--color=always");
+    }
+    cmd.args(extra);
+    let out = cmd.output().context("running git diff")?;
+    if !out.status.success() {
+        anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    if text.trim().is_empty() {
+        return Ok(false);
+    }
+    print!("{}", text);
+    if !text.ends_with('\n') {
+        println!();
+    }
+    Ok(true)
 }
 
 /// Ask the daemon to probe the configured MCP servers (connect + initialize +
@@ -377,6 +755,11 @@ pub async fn connect() -> Result<()> {
     let dim_tools = crate::config::load()
         .map(|c| c.server.dim_tool_lines)
         .unwrap_or(true);
+    // Show the lines the model changed under each successful edit/apply_patch
+    // (see `[server] show_diffs`).
+    let show_diffs = crate::config::load()
+        .map(|c| c.server.show_diffs)
+        .unwrap_or(true);
     let gutter = gutter_prefix(&response_border);
     let chrome = border_enabled(&response_border);
     let boxed = border_is_box(&response_border);
@@ -392,6 +775,10 @@ pub async fn connect() -> Result<()> {
     // When set (after a provider/model switch following a failed turn), the
     // loop sends this prompt instead of waiting for new input.
     let mut retry_prompt: Option<String> = None;
+    // Files (and pre-call contents) for in-flight mutating tool calls, keyed by
+    // tool_call_id. Captured when the model asks for the call, drained when the
+    // daemon reports it succeeded, so we only ever show changes that landed.
+    let mut pending_diffs: HashMap<String, Vec<Snapshot>> = HashMap::new();
 
     // Async stdin reader for non-blocking input
     let mut stdin = BufReader::new(stdin());
@@ -815,8 +1202,25 @@ pub async fn connect() -> Result<()> {
             }
             continue;
         }
+        if input == "/diff" || input.starts_with("/diff ") {
+            // Show the working tree's modified lines using git's own diff
+            // engine (colourised on a terminal). Extra args pass straight
+            // through: `/diff --staged`, `/diff HEAD`, `/diff src/main.rs`.
+            let extra: Vec<String> = input
+                .strip_prefix("/diff")
+                .unwrap_or("")
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect();
+            match git_diff(&extra) {
+                Ok(true) => {}
+                Ok(false) => println!("(no changes)"),
+                Err(e) => println!("diff failed: {}", e),
+            }
+            continue;
+        }
         if input == "/help" {
-            println!("Available commands: /quit, /exit, /q (quit), /tools (toggle tool calling), /model (list models and switch), /provider (list/switch providers), /mcp (list MCP servers / send with MCP tools), /mcp_tools (list tools exposed by MCP servers), /mcp_status (MCP server connection status), /mcp_reconnect (reload config + reconnect MCP servers), /session (list sessions), /resume <number>, /memory (list memories), /forget <number>, /help (Ctrl+C cancels the running request; Ctrl+D quits)");
+            println!("Available commands: /quit, /exit, /q (quit), /tools (toggle tool calling), /model (list models and switch), /provider (list/switch providers), /diff (show modified lines via git diff), /mcp (list MCP servers / send with MCP tools), /mcp_tools (list tools exposed by MCP servers), /mcp_status (MCP server connection status), /mcp_reconnect (reload config + reconnect MCP servers), /session (list sessions), /resume <number>, /memory (list memories), /forget <number>, /help (Ctrl+C cancels the running request; Ctrl+D quits)");
             continue;
         }
         // Drain any queued Ctrl+C first so a stray keypress while idle can't
@@ -873,6 +1277,9 @@ pub async fn connect() -> Result<()> {
 
         let mut in_stream = false;
         let mut cancelled = false;
+        // Drop any diff captured for a call whose result never arrived (e.g. a
+        // cancelled turn) so a later call can't inherit it.
+        pending_diffs.clear();
         // Tracks line starts so the response gutter is drawn once per line and
         // blank lines stay unbarred. Reset each turn.
         let mut resp_at_line_start = true;
@@ -890,93 +1297,55 @@ pub async fn connect() -> Result<()> {
                     match ev {
                         Event::Ack { .. } => {}
                         Event::ToolCall { id: _, calls } => {
+                            // If the reply is mid-line, finish it first: tool
+                            // lines go to stderr, so without this they'd be
+                            // appended to the end of a streamed sentence.
+                            if !resp_at_line_start {
+                                println!();
+                            }
                             for c in &calls {
-                                let arg_str = if c.name == "bash" {
-                                    c.input.get("command").and_then(|v| v.as_str())
-                                        .map(|s| s.chars().take(80).collect::<String>())
-                                        .unwrap_or_default()
-                                } else if c.name == "read" {
-                                    c.input.get("path").and_then(|v| v.as_str())
-                                        .map(|s| s.to_string())
-                                        .unwrap_or_default()
-                                } else if c.name == "write" || c.name == "edit" {
-                                    c.input.get("path").and_then(|v| v.as_str())
-                                        .map(|s| s.to_string())
-                                        .unwrap_or_default()
-                                } else if c.name == "plan" {
-                                    c.input.get("action").and_then(|v| v.as_str())
-                                        .map(|s| s.to_string())
-                                        .unwrap_or_default()
-                                } else if c.name == "git" {
-                                    let action = c.input.get("action").and_then(|v| v.as_str()).unwrap_or("");
-                                    let target: String = if matches!(action, "checkout" | "branch" | "push") {
-                                        c.input.get("branch").and_then(|v| v.as_str())
-                                            .or_else(|| c.input.get("refspec").and_then(|v| v.as_str()))
-                                            .unwrap_or_default().to_string()
-                                    } else if matches!(action, "merge" | "rebase") {
-                                        match c.input.get("branch").and_then(|v| v.as_str()) {
-                                            Some(b) => b.to_string(),
-                                            None => {
-                                                if action == "rebase"
-                                                    && c.input.get("rebase_continue").and_then(|v| v.as_bool()).unwrap_or(false)
-                                                {
-                                                    "--continue".to_string()
-                                                } else {
-                                                    String::new()
-                                                }
-                                            }
-                                        }
-                                    } else if action == "reset" {
-                                        c.input.get("ref").and_then(|v| v.as_str())
-                                            .map(|s| format!("{} {}", c.input.get("mode").and_then(|v| v.as_str()).unwrap_or("mixed"), s))
-                                            .unwrap_or_default()
-                                    } else if action == "add" || action == "diff" {
-                                        c.input.get("path").and_then(|v| v.as_str()).unwrap_or_default().to_string()
-                                    } else {
-                                        String::new()
-                                    };
-                                    if target.is_empty() {
-                                        action.to_string()
-                                    } else {
-                                        format!("{} {}", action, target)
-                                    }
-                                } else if c.name == "fetch_url" {
-                                    c.input.get("url").and_then(|v| v.as_str()).unwrap_or_default().to_string()
-                                } else if c.name == "http_request" {
-                                    let m = c.input.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
-                                    let u = c.input.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                                    format!("{} {}", m, u)
-                                } else if c.name == "note" {
-                                    let a = c.input.get("action").and_then(|v| v.as_str()).unwrap_or("");
-                                    let t = c.input.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                                    if t.is_empty() { a.to_string() } else { format!("{} {}", a, t) }
-                                } else if c.name == "docker" {
-                                    let a = c.input.get("action").and_then(|v| v.as_str()).unwrap_or("");
-                                    let t = c.input.get("container").and_then(|v| v.as_str())
-                                        .or_else(|| c.input.get("image").and_then(|v| v.as_str()))
-                                        .unwrap_or("");
-                                    if t.is_empty() { a.to_string() } else { format!("{} {}", a, t) }
-                                } else if c.name == "sql" {
-                                    c.input.get("query").and_then(|v| v.as_str()).unwrap_or("")
-                                        .chars().take(60).collect::<String>()
-                                } else {
-                                    c.input.to_string()
-                                };
+                                let arg_str = tool_arg_summary(&c.name, &c.input);
                                 eprintln!("{}", dim(&format!("[tool] {}", if arg_str.is_empty() { c.name.clone() } else { format!("{} {}", c.name, arg_str) }), dim_tools));
+                                // Snapshot the files this call is about to
+                                // change, so the difference can be shown once
+                                // the daemon confirms it succeeded — denied or
+                                // failed calls show nothing.
+                                if show_diffs {
+                                    let snapshots = snapshot_for_call(&c.name, &c.input);
+                                    if !snapshots.is_empty() {
+                                        pending_diffs.insert(c.id.clone(), snapshots);
+                                    }
+                                }
                             }
                             // A tool line ends with a newline on the shared
                             // terminal, so the next response line should start
                             // fresh (gutter included).
                             resp_at_line_start = true;
                         }
-                        Event::ToolResult { .. } => {
-                            // Suppress tool result output for a quiet, readable session.
+                        Event::ToolResult { id: _, results } => {
+                            // Tool result output stays suppressed for a quiet,
+                            // readable session — but do show the lines that
+                            // actually changed for successful edits/patches.
+                            for r in &results {
+                                if r.is_error {
+                                    continue;
+                                }
+                                if let Some(snapshots) = pending_diffs.remove(&r.tool_call_id) {
+                                    if let Some(lines) = changed_lines(&snapshots) {
+                                        print_diff(&lines);
+                                    }
+                                }
+                            }
+                            resp_at_line_start = true;
                         }
                         Event::Status { id: _, message } => {
                             // Show reasoning/thinking progress only when
                             // `[server] show_thinking = true`. Other status
                             // messages (e.g. "Executing tool: ...") stay quiet.
                             if show_thinking && message.starts_with("thinking: ") {
+                                if !resp_at_line_start {
+                                    println!();
+                                }
                                 eprintln!("{}", dim(&format!("[thinking] {}", message.strip_prefix("thinking: ").unwrap_or("")), dim_tools));
                                 resp_at_line_start = true;
                             }
@@ -1151,10 +1520,16 @@ pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool, mcp: b
     let dim_tools = crate::config::load()
         .map(|c| c.server.dim_tool_lines)
         .unwrap_or(true);
+    let show_diffs = crate::config::load()
+        .map(|c| c.server.show_diffs)
+        .unwrap_or(true);
     let gutter = gutter_prefix(&response_border);
     let chrome = border_enabled(&response_border);
     let boxed = border_is_box(&response_border);
     let mut resp_at_line_start = true;
+    // Files (and pre-call contents) for in-flight mutating tool calls; see the
+    // interactive loop.
+    let mut pending_diffs: HashMap<String, Vec<Snapshot>> = HashMap::new();
     while let Some(line) = lines.next_line().await? {
         let ev: Event = match serde_json::from_str(&line) {
             Ok(e) => e,
@@ -1176,74 +1551,40 @@ pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool, mcp: b
                 std::io::stdout().flush()?;
             }
             Event::ToolCall { id: _, calls } => {
-                for c in &calls {
-                    let arg_str = if c.name == "bash" {
-                        c.input.get("command").and_then(|v| v.as_str())
-                            .map(|s| s.chars().take(80).collect::<String>())
-                            .unwrap_or_default()
-                    } else if c.name == "read" || c.name == "write" || c.name == "edit" {
-                        c.input.get("path").and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                            .unwrap_or_default()
-} else if c.name == "git" {
-                        let action = c.input.get("action").and_then(|v| v.as_str()).unwrap_or("");
-                        let target: String = if matches!(action, "checkout" | "push") {
-                            c.input.get("branch").and_then(|v| v.as_str())
-                                .or_else(|| c.input.get("refspec").and_then(|v| v.as_str()))
-                                .unwrap_or_default().to_string()
-                        } else if matches!(action, "merge" | "rebase") {
-                            match c.input.get("branch").and_then(|v| v.as_str()) {
-                                Some(b) => b.to_string(),
-                                None => {
-                                    if action == "rebase"
-                                        && c.input.get("rebase_continue").and_then(|v| v.as_bool()).unwrap_or(false)
-                                    {
-                                        "--continue".to_string()
-                                    } else {
-                                        String::new()
-                                    }
-                                }
-                            }
-                        } else if action == "reset" {
-                            c.input.get("ref").and_then(|v| v.as_str())
-                                .map(|s| format!("{} {}", c.input.get("mode").and_then(|v| v.as_str()).unwrap_or("mixed"), s))
-                                .unwrap_or_default()
-                        } else if action == "add" {
-                            c.input.get("path").and_then(|v| v.as_str()).unwrap_or_default().to_string()
-                        } else {
-                            String::new()
-                        };
-                        if target.is_empty() {
-                            action.to_string()
-                        } else {
-                            format!("{} {}", action, target)
-                        }
-                    } else if c.name == "fetch_url" {
-                        c.input.get("url").and_then(|v| v.as_str()).unwrap_or_default().to_string()
-                    } else if c.name == "http_request" {
-                        let m = c.input.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
-                        let u = c.input.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                        format!("{} {}", m, u)
-                    } else if c.name == "note" {
-                        let a = c.input.get("action").and_then(|v| v.as_str()).unwrap_or("");
-                        let t = c.input.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                        if t.is_empty() { a.to_string() } else { format!("{} {}", a, t) }
-                    } else if c.name == "docker" {
-                        let a = c.input.get("action").and_then(|v| v.as_str()).unwrap_or("");
-                        let t = c.input.get("container").and_then(|v| v.as_str())
-                            .or_else(|| c.input.get("image").and_then(|v| v.as_str()))
-                            .unwrap_or("");
-                        if t.is_empty() { a.to_string() } else { format!("{} {}", a, t) }
-                    } else if c.name == "sql" {
-                        c.input.get("query").and_then(|v| v.as_str()).unwrap_or("")
-                            .chars().take(60).collect::<String>()
-                    } else {
-                        c.input.to_string()
-                    };
-                    eprintln!("{}", dim(&format!("[tool] {}", if arg_str.is_empty() { c.name.clone() } else { format!("{} {}", c.name, arg_str) }), dim_tools));
+                // Finish a mid-line reply first: tool lines go to stderr and
+                // would otherwise be appended to a streamed sentence.
+                if !resp_at_line_start {
+                    println!();
                 }
+                for c in &calls {
+                    let arg_str = tool_arg_summary(&c.name, &c.input);
+                    eprintln!("{}", dim(&format!("[tool] {}", if arg_str.is_empty() { c.name.clone() } else { format!("{} {}", c.name, arg_str) }), dim_tools));
+                    // Snapshot the files this call is about to change; the
+                    // difference is shown once the daemon confirms success.
+                    if show_diffs {
+                        let snapshots = snapshot_for_call(&c.name, &c.input);
+                        if !snapshots.is_empty() {
+                            pending_diffs.insert(c.id.clone(), snapshots);
+                        }
+                    }
+                }
+                resp_at_line_start = true;
             }
-            Event::ToolResult { .. } => {}
+            Event::ToolResult { id: _, results } => {
+                // Tool output stays suppressed, but show what changed for
+                // successful edits/patches.
+                for r in &results {
+                    if r.is_error {
+                        continue;
+                    }
+                    if let Some(snapshots) = pending_diffs.remove(&r.tool_call_id) {
+                        if let Some(lines) = changed_lines(&snapshots) {
+                            print_diff(&lines);
+                        }
+                    }
+                }
+                resp_at_line_start = true;
+            }
             Event::Status { .. } => {}
             Event::Done { id: _ } => {
                 if any_output {
@@ -1348,5 +1689,206 @@ mod tests {
     #[test]
     fn rule_line_is_nonempty() {
         assert!(!rule_line().is_empty());
+    }
+
+    #[test]
+    fn colorize_marks_added_and_removed_lines() {
+        // Colour off -> exact passthrough.
+        assert_eq!(colorize_diff_line("+new", false), "+new");
+        assert_eq!(colorize_diff_line("-old", false), "-old");
+        // Colour on -> marker-driven SGR, reset at the end.
+        assert_eq!(colorize_diff_line("+new", true), format!("{}+new{}", ANSI_GREEN, ANSI_RESET));
+        assert_eq!(colorize_diff_line("-old", true), format!("{}-old{}", ANSI_RED, ANSI_RESET));
+        assert_eq!(colorize_diff_line("@@ -1 +1 @@", true), format!("{}@@ -1 +1 @@{}", ANSI_CYAN, ANSI_RESET));
+        // Unmarked lines (e.g. a truncation note) stay plain.
+        assert_eq!(colorize_diff_line("  ... (+3 more)", true), "  ... (+3 more)");
+    }
+
+    #[test]
+    fn diff_contents_reports_replacements_with_line_numbers() {
+        // A single changed line, with the hunk header pointing at it in both
+        // the old and the new file.
+        assert_eq!(
+            diff_contents(Some("a\nb\nc\n"), Some("a\nB\nc\n")),
+            vec!["@@ -2,1 +2,1 @@", "-b", "+B"]
+        );
+        // No change -> nothing to show.
+        assert!(diff_contents(Some("a\nb\n"), Some("a\nb\n")).is_empty());
+    }
+
+    #[test]
+    fn diff_contents_handles_creation_and_deletion() {
+        // New file: everything is an addition.
+        assert_eq!(
+            diff_contents(None, Some("one\ntwo\n")),
+            vec!["@@ -1,0 +1,2 @@", "+one", "+two"]
+        );
+        // Deleted file: everything is a removal.
+        assert_eq!(
+            diff_contents(Some("one\ntwo\n"), None),
+            vec!["@@ -1,2 +1,0 @@", "-one", "-two"]
+        );
+    }
+
+    #[test]
+    fn diff_contents_splits_scattered_changes_into_hunks() {
+        // The palette-swap shape: changes at the top and the bottom, with
+        // untouched lines in between. The unchanged middle must NOT be
+        // reported as changed (the naive "everything between first and last
+        // change" approach would flood the terminal).
+        let old = "h1 { color: #2d6a4f; }\np { padding: 1em; }\nq { margin: 0; }\nfooter { color: #1b4332; }\n";
+        let new = "h1 { color: #4a2e1b; }\np { padding: 1em; }\nq { margin: 0; }\nfooter { color: #2b1d13; }\n";
+        assert_eq!(
+            diff_contents(Some(old), Some(new)),
+            vec![
+                "@@ -1,1 +1,1 @@",
+                "-h1 { color: #2d6a4f; }",
+                "+h1 { color: #4a2e1b; }",
+                "@@ -4,1 +4,1 @@",
+                "-footer { color: #1b4332; }",
+                "+footer { color: #2b1d13; }",
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_contents_copes_with_insertions_and_huge_rewrites() {
+        // An inserted block: one hunk, additions only.
+        assert_eq!(
+            diff_contents(Some("a\nb\n"), Some("a\nx\ny\nb\n")),
+            vec!["@@ -2,0 +2,2 @@", "+x", "+y"]
+        );
+        // A rewrite too big to align still produces a (capped) report rather
+        // than hanging or blowing up memory.
+        let old: String = (0..1500).map(|i| format!("old {}\n", i)).collect();
+        let new: String = (0..1500).map(|i| format!("new {}\n", i)).collect();
+        let lines = diff_contents(Some(&old), Some(&new));
+        assert_eq!(lines[0], "@@ -1,1500 +1,1500 @@");
+        assert_eq!(lines.len(), 3001);
+    }
+
+    #[test]
+    fn diff_lines_are_capped() {
+        let old: String = (0..200).map(|i| format!("old {}\n", i)).collect();
+        let new: String = (0..200).map(|i| format!("new {}\n", i)).collect();
+        let capped = finish_diff_lines(diff_contents(Some(&old), Some(&new))).expect("diff lines");
+        assert_eq!(capped.len(), MAX_DIFF_LINES + 1);
+        assert!(capped.last().unwrap().contains("more changed lines"));
+    }
+
+    #[test]
+    fn mutation_paths_only_reports_writers() {
+        // Single-file writers.
+        assert_eq!(
+            mutation_paths_for_call("edit", &serde_json::json!({ "path": "src/a.rs" })),
+            vec!["src/a.rs".to_string()]
+        );
+        assert_eq!(
+            mutation_paths_for_call("write", &serde_json::json!({ "path": "out.txt" })),
+            vec!["out.txt".to_string()]
+        );
+        // A patch can touch several files.
+        let patch = "--- a/one.rs\n+++ b/one.rs\n@@ -1 +1 @@\n-a\n+b\n--- a/two.rs\n+++ b/two.rs\n";
+        assert_eq!(
+            mutation_paths_for_call("apply_patch", &serde_json::json!({ "patch": patch })),
+            vec!["one.rs".to_string(), "two.rs".to_string()]
+        );
+        // A file-writing shell command is picked up (same detection as the
+        // approval gate), and a read-only one is not.
+        assert_eq!(
+            mutation_paths_for_call("bash", &serde_json::json!({ "command": "sed -i s/a/b/ s.css" })),
+            vec!["s.css".to_string()]
+        );
+        assert!(mutation_paths_for_call("bash", &serde_json::json!({ "command": "git status" })).is_empty());
+        // Read-only tools never report paths, so nothing is snapshotted.
+        for name in ["read", "list_dir", "glob", "agentgrep", "plan", "git"] {
+            assert!(
+                mutation_paths_for_call(name, &serde_json::json!({ "path": "x.rs" })).is_empty(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_then_diff_shows_the_change_without_git() {
+        // End-to-end of the git-free path: snapshot a real temp file, mutate it
+        // behind our back (as the daemon would), then diff.
+        let dir = std::env::temp_dir().join(format!("jancode-snap-{}", crate::protocol::new_message_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("styles.css");
+        std::fs::write(&file, "body { color: #2d6a4f; }\np { margin: 0; }\n").expect("seed");
+
+        let snapshots = snapshot_for_call("edit", &serde_json::json!({ "path": file }));
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].before.as_deref(), Some("body { color: #2d6a4f; }\np { margin: 0; }\n"));
+
+        // The "daemon" applies the change.
+        std::fs::write(&file, "body { color: #4a2e1b; }\np { margin: 0; }\n").expect("edit");
+        let lines = changed_lines(&snapshots).expect("changed lines");
+        assert_eq!(lines, vec!["@@ -1,1 +1,1 @@", "-body { color: #2d6a4f; }", "+body { color: #4a2e1b; }"]);
+
+        // A no-op call reports nothing.
+        assert!(changed_lines(&snapshot_for_call("edit", &serde_json::json!({ "path": file }))).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_of_missing_file_is_treated_as_a_creation() {
+        let dir = std::env::temp_dir().join(format!("jancode-new-{}", crate::protocol::new_message_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("fresh.txt");
+        let snapshots = snapshot_for_call("write", &serde_json::json!({ "path": file }));
+        assert_eq!(snapshots[0].before, None);
+
+        std::fs::write(&file, "hello\n").expect("write");
+        let lines = changed_lines(&snapshots).expect("changed lines");
+        assert_eq!(lines, vec!["@@ -1,0 +1,1 @@", "+hello"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patch_paths_lists_touched_files() {
+        let patch = "\
+--- a/one.rs
++++ b/one.rs
+@@ -1 +1 @@
+-a
++b
+--- a/two.rs
++++ b/two.rs
+";
+        assert_eq!(patch_paths(patch), "one.rs, two.rs");
+        // Deleted files land on /dev/null and are skipped.
+        assert_eq!(patch_paths("--- a/gone.rs\n+++ /dev/null\n"), "");
+    }
+
+    #[test]
+    fn tool_arg_summary_picks_the_right_field() {
+        assert_eq!(tool_arg_summary("read", &serde_json::json!({ "path": "src/a.rs" })), "src/a.rs");
+        assert_eq!(
+            tool_arg_summary("agentgrep", &serde_json::json!({ "query": "fn main" })),
+            "fn main"
+        );
+        assert_eq!(
+            tool_arg_summary("glob", &serde_json::json!({ "pattern": "**/*.rs" })),
+            "**/*.rs"
+        );
+        assert_eq!(
+            tool_arg_summary("git", &serde_json::json!({ "action": "checkout", "branch": "main" })),
+            "checkout main"
+        );
+        assert_eq!(tool_arg_summary("git", &serde_json::json!({ "action": "status" })), "status");
+        assert_eq!(
+            tool_arg_summary("http_request", &serde_json::json!({ "method": "post", "url": "http://x" })),
+            "POST http://x"
+        );
+        // Long commands are truncated so the status line stays on one line.
+        let long = "x".repeat(200);
+        assert_eq!(
+            tool_arg_summary("bash", &serde_json::json!({ "command": long })).chars().count(),
+            80
+        );
     }
 }

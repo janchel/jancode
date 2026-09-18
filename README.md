@@ -168,6 +168,10 @@ In interactive mode, use these commands:
   editing MCP config (e.g. adding a bearer token) — no daemon restart needed.
   In fact MCP servers are re-read from disk and reconnected on every
   tool-enabled turn, so config edits also apply on your next message.
+- `/diff` — Show the workspace's modified lines with `git diff` (colourised on
+  a terminal). Extra arguments pass straight through: `/diff --staged`,
+  `/diff HEAD`, `/diff src/main.rs`. Read-only; runs locally in the client, so
+  it needs no approval and costs no tokens.
 - `/help` — List available slash commands.
 - `/quit`, `/exit`, `/q` — End the session (handled locally, never sent to the
   model).
@@ -175,7 +179,9 @@ In interactive mode, use these commands:
 Tool-calling is **enabled by default** in interactive mode. Tool activity is
 shown compactly as `[tool] <name> <target>` lines (e.g. `[tool] read
 package.json`); full tool output is fed back to the model but suppressed from
-the terminal so only the AI's final response is prominent.
+the terminal so only the AI's final response is prominent. Changes the model
+makes are shown as a few diff lines under the tool call — see
+[Modified lines](#modified-lines).
 
 #### Response border
 
@@ -205,6 +211,49 @@ auto/best-free>
   (`jancode ... > file`, `| grep`) stays clean, with no ANSI codes or bars.
   Pure client-side string handling — no extra tokens, provider calls, or
   measurable CPU.
+
+#### Modified lines
+
+Whenever the model changes a file, jancode prints **just the lines it changed**
+right below the tool call, so a turn reads like a reviewable diff instead of a
+wall of tool chatter:
+
+```
+[tool] edit src/parser.rs
+  @@ -40,1 +40,1 @@
+  -let tokens = lex(src);
+  +let tokens = lex(&src, &opts)?;
+  @@ -44,1 +44,1 @@
+  -    return parse(&tokens);
+  +    let ast = parse(&tokens)?;
+  +    return Ok(ast);
+[tool] write theme.css
+  @@ -1,0 +1,1 @@
+  +theme = espresso
+```
+
+- Only the **modified** lines are shown — removed lines as `-`, added lines as
+  `+`, hunk headers as `@@`. Unchanged context lines are dropped, and each file
+  is capped at 60 changed lines (the rest is summarised as
+  `... (+N more changed lines)`).
+- Removed lines are **red**, added lines **green**, hunk headers **cyan** — on a
+  terminal only. Redirected output stays plain text.
+- Lines appear only after the daemon reports the call **succeeded**, so denied
+  approvals and failed edits show nothing. A call that changes nothing shows
+  nothing.
+- **What's covered:** every tool that writes a file — `edit`, `apply_patch`,
+  `write`, and file-writing `bash` commands (`sed -i`, `perl -pi`, `tee`,
+  `cat > f`, `>>`). Creating a file shows as all-additions, deleting as
+  all-removals.
+- **How it works:** the moment the model asks for a call, jancode snapshots the
+  files that call will touch, then diffs them against the result once the call
+  succeeds. That means it works in **any directory — no git repository
+  required** — and shows only what *this call* changed, so several edits to one
+  file each display their own delta instead of a growing cumulative diff.
+- Rendered client-side on **stderr** alongside the other `[tool]` lines: no extra
+  tokens, no provider calls, no subprocesses, and stdout stays clean for piping.
+- Turn it off with `[server] show_diffs = false`. For a whole-workspace view
+  (including changes jancode didn't make), use the `/diff` command.
 
 ### Built-in tools
 
@@ -286,8 +335,9 @@ resolve outside the working directory** (`read`, `list_dir`, `glob`,
     or a leading `cd` out of the workspace; or
   - **modifies files in place** — `sed -i`, `awk -i`, `perl -i`, `tee`,
     `touch`, `rm`/`mv`/`cp`/`truncate`/`unlink`/`dd`, `mkdir`, `chmod`/`chown`,
-    or a write redirection (`>`, `>>`). The approval reason names the target
-    file(s), e.g. `modifies file(s) on styles.css via sed`.
+    or a write redirection (`>`, `>>`). Clustered short flags count too, so
+    `perl -pi` and `sed -ni` are caught just like `sed -i`. The approval reason
+    names the target file(s), e.g. `modifies file(s) on styles.css via sed`.
 
   In-workspace read-only commands (`ls`, `cargo test`, `grep -r alpha src`,
   `sed -n '1,5p' file`) run freely. This is a best-effort heuristic, not
@@ -315,6 +365,7 @@ idle_timeout_secs = 300
 approve_mode = "prompt"   # "prompt" | "auto" | "deny"
 response_border = "gutter" # "gutter" (default) | "box" | "none"
 dim_tool_lines = true      # dim [tool]/[approval] status lines
+show_diffs = true          # show the lines each edit/patch changed
 max_tool_loops = 50        # model turns per request (default 50)
 max_total_tool_calls = 75  # total tool calls per request (default 75)
 ```
@@ -369,12 +420,20 @@ into later turns — no manual `/remember` needed.
 - **Capture**: sentences containing preference/decision markers ("we use",
   "always", "prefer", "deployed to", "in this project", ...) are auto-saved to
   `~/.jancode/memory.json`, scoped to the folder you were in.
-- **Injection**: before each response, the top 5 most relevant notes for the
-  current folder are scored by token overlap and appended to the system prompt
-  as "Project memory".
+- **Injection**: before each response, up to 5 relevant notes are scored by
+  token overlap and appended to the system prompt as "Project memory".
+- **Scoping**: notes are scoped to a **directory**, never to keywords. A note
+  applies to the folder it was saved in and to that folder's descendants (a note
+  saved in `~/devops` covers `~/devops/proj`), but **never to a sibling
+  project**. Keyword overlap alone is far too weak a gate — ordinary English
+  ("can you … this … and … project") scores above the relevance threshold — so
+  a note from one project would otherwise be injected into an unrelated one and
+  send the model off to the wrong paths.
 - **Limits**: this is keyword-based, not embeddings + reranking (that's what
-  jcode does). It matches repeated wording well but misses paraphrase. Notes
-  only surface in the folder they came from.
+  jcode does). It matches repeated wording well but misses paraphrase. A note
+  saved in the *current* folder is always injected (the folder boost clears the
+  relevance threshold), so local notes can outweigh a more relevant note from a
+  parent directory.
 - Manage with `/memory` and `/forget <number>`.
 
 ### MCP (Model Context Protocol) servers
