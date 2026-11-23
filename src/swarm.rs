@@ -25,9 +25,6 @@ pub struct SwarmMember {
     pub task_label: Option<String>,
     pub is_headless: bool,
     pub parent_session_id: Option<String>,
-    /// Live turn-context buffer for soft-interrupt notifications addressed to
-    /// this member while it is mid-turn.
-    pub interrupt_queue: Vec<Interrupt>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,20 +37,21 @@ pub struct Interrupt {
 /// Swarm state, held by the server. Each swarm is keyed by a `swarm_id`
 /// (here we use a single implicit swarm per daemon, matching jancode's
 /// single-server model).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SwarmState {
-    pub swarm_id: String,
     pub members: HashMap<String, SwarmMember>,
     /// session_id -> interrupt queue (kept in sync with `members`).
     pub interrupt_queues: HashMap<String, Vec<Interrupt>>,
+    /// Running headless-agent tasks, so `swarm stop` can abort them.
+    pub tasks: HashMap<String, tokio::task::JoinHandle<()>>,
 }
 
 impl SwarmState {
-    pub fn new(swarm_id: String) -> Self {
+    pub fn new() -> Self {
         Self {
-            swarm_id,
             members: HashMap::new(),
             interrupt_queues: HashMap::new(),
+            tasks: HashMap::new(),
         }
     }
 
@@ -87,10 +85,6 @@ impl SwarmState {
         self.members.get(session_id)
     }
 
-    pub fn get_member_mut(&mut self, session_id: &str) -> Option<&mut SwarmMember> {
-        self.members.get_mut(session_id)
-    }
-
     pub fn update_status(&mut self, session_id: &str, status: &str, detail: Option<String>) {
         if let Some(m) = self.members.get_mut(session_id) {
             m.status = status.to_string();
@@ -103,10 +97,7 @@ impl SwarmState {
     /// jancode's behavior of only delivering to swarm members).
     pub fn queue_interrupt(&mut self, session_id: &str, interrupt: Interrupt) {
         if !self.members.contains_key(session_id) {
-            warn!(
-                "interrupt for unknown member {} dropped",
-                session_id
-            );
+            warn!("interrupt for unknown member {} dropped", session_id);
             return;
         }
         self.interrupt_queues
@@ -117,9 +108,7 @@ impl SwarmState {
 
     /// Drain all pending interrupts for a session, returning them in order.
     pub fn drain_interrupts(&mut self, session_id: &str) -> Vec<Interrupt> {
-        self.interrupt_queues
-            .remove(session_id)
-            .unwrap_or_default()
+        self.interrupt_queues.remove(session_id).unwrap_or_default()
     }
 }
 
@@ -138,7 +127,6 @@ pub fn make_member(
         task_label: None,
         is_headless,
         parent_session_id,
-        interrupt_queue: Vec::new(),
     }
 }
 

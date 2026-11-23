@@ -168,6 +168,10 @@ In interactive mode, use these commands:
   editing MCP config (e.g. adding a bearer token) — no daemon restart needed.
   In fact MCP servers are re-read from disk and reconnected on every
   tool-enabled turn, so config edits also apply on your next message.
+- `/diff` — Show the workspace's modified lines with `git diff` (colourised on
+  a terminal). Extra arguments pass straight through: `/diff --staged`,
+  `/diff HEAD`, `/diff src/main.rs`. Read-only; runs locally in the client, so
+  it needs no approval and costs no tokens.
 - `/help` — List available slash commands.
 - `/quit`, `/exit`, `/q` — End the session (handled locally, never sent to the
   model).
@@ -175,7 +179,9 @@ In interactive mode, use these commands:
 Tool-calling is **enabled by default** in interactive mode. Tool activity is
 shown compactly as `[tool] <name> <target>` lines (e.g. `[tool] read
 package.json`); full tool output is fed back to the model but suppressed from
-the terminal so only the AI's final response is prominent.
+the terminal so only the AI's final response is prominent. Changes the model
+makes are shown as a few diff lines under the tool call — see
+[Modified lines](#modified-lines).
 
 #### Response border
 
@@ -206,6 +212,58 @@ auto/best-free>
   Pure client-side string handling — no extra tokens, provider calls, or
   measurable CPU.
 
+#### Waiting indicator
+
+While a turn is in flight, a dim `⠋ thinking…` spinner is shown on stderr as
+soon as you send a message, and it animates through any silent stretch (a slow
+provider, or a reasoning model that hasn't emitted a token yet). It disappears
+the moment real output, a tool call, or an approval prompt appears, so you can
+always tell the agent is still working. Terminal-only: piped/redirected output
+stays clean, and `jancode run` gets the same indicator.
+
+#### Modified lines
+
+Whenever the model changes a file, jancode prints **just the lines it changed**
+right below the tool call, so a turn reads like a reviewable diff instead of a
+wall of tool chatter:
+
+```
+[tool] edit src/parser.rs
+  @@ -40,1 +40,1 @@
+  -let tokens = lex(src);
+  +let tokens = lex(&src, &opts)?;
+  @@ -44,1 +44,1 @@
+  -    return parse(&tokens);
+  +    let ast = parse(&tokens)?;
+  +    return Ok(ast);
+[tool] write theme.css
+  @@ -1,0 +1,1 @@
+  +theme = espresso
+```
+
+- Only the **modified** lines are shown — removed lines as `-`, added lines as
+  `+`, hunk headers as `@@`. Unchanged context lines are dropped, and each file
+  is capped at 60 changed lines (the rest is summarised as
+  `... (+N more changed lines)`).
+- Removed lines are **red**, added lines **green**, hunk headers **cyan** — on a
+  terminal only. Redirected output stays plain text.
+- Lines appear only after the daemon reports the call **succeeded**, so denied
+  approvals and failed edits show nothing. A call that changes nothing shows
+  nothing.
+- **What's covered:** every tool that writes a file — `edit`, `apply_patch`,
+  `write`, and file-writing `bash` commands (`sed -i`, `perl -pi`, `tee`,
+  `cat > f`, `>>`). Creating a file shows as all-additions, deleting as
+  all-removals.
+- **How it works:** the moment the model asks for a call, jancode snapshots the
+  files that call will touch, then diffs them against the result once the call
+  succeeds. That means it works in **any directory — no git repository
+  required** — and shows only what *this call* changed, so several edits to one
+  file each display their own delta instead of a growing cumulative diff.
+- Rendered client-side on **stderr** alongside the other `[tool]` lines: no extra
+  tokens, no provider calls, no subprocesses, and stdout stays clean for piping.
+- Turn it off with `[server] show_diffs = false`. For a whole-workspace view
+  (including changes jancode didn't make), use the `/diff` command.
+
 ### Built-in tools
 
 jancode ships with these tools (plus any discovered via [MCP servers](#mcp-model-context-protocol-servers)):
@@ -229,10 +287,12 @@ jancode ships with these tools (plus any discovered via [MCP servers](#mcp-model
   markers can be fixed with `read`/`edit`/`apply_patch`, then
   `git add` + `rebase --continue` (or `merge` commit) to finish.
 - `fetch_url` — fetch a URL and return its text content (read docs, check
-  pages, pull API data). Read-only, ungated.
+  pages, pull API data). Read-only, ungated. SSRF-guarded: hosts that are (or
+  resolve to) loopback, private, link-local, or CGNAT addresses — e.g.
+  `169.254.169.254` — are refused.
 - `http_request` — raw HTTP calls (GET/POST/PUT/PATCH/DELETE/HEAD) with
   headers, JSON or string body. GET/HEAD/OPTIONS run freely; other methods
-  require approval.
+  require approval. Same SSRF guard as `fetch_url`.
 - `docker` — manage local containers/images: `ps`, `images`, `logs`,
   `inspect`, `stats` (read-only), and `exec`, `run`, `build`, `stop`, `rm`,
   `pull`, `compose` (require approval).
@@ -241,6 +301,18 @@ jancode ships with these tools (plus any discovered via [MCP servers](#mcp-model
   statements (SELECT/WITH/SHOW/EXPLAIN/PRAGMA) are ungated; anything else
   requires approval. Default target comes from `[database]` url in
   `config.toml`.
+- `jq` — query JSON/JSONL with a jq filter, from a file (`path`) or inline
+  text (`json`). Read-only; in-workspace files and inline text are ungated,
+  outside paths require approval.
+- `gh` — run the GitHub CLI: pull requests, issues, actions runs, and repo
+  queries. Read actions (`pr_list`, `issue_view`, `run_list`, …) run freely;
+  `pr_create`/`pr_merge`/`pr_comment`/`issue_create`/`run_rerun`/`api` and
+  other remote mutations require approval. Requires `gh` installed and
+  authenticated.
+- `test` — run the project’s test suite (`cargo`, `npm`, `pnpm`, `yarn`,
+  `pytest`, `go`, or a `custom` command) and return a condensed summary
+  (failing tests + tail) instead of raw output. Known runners are ungated;
+  `custom` requires approval.
 - `note` — persistent freeform notes in `.jancode-notes.md`
   (`create` / `append` / `show` / `clear`). Ungated; it only touches its own
   file.
@@ -260,9 +332,11 @@ directory.
 
 ### Approval (safe file changes)
 
-File **modifications** (`write`, `edit`, `apply_patch`) and **reads that
-resolve outside the working directory** (`read`, `list_dir`, `glob`,
-`agentgrep`) require consent before the daemon executes them:
+File **modifications** (`write`, `edit`, `apply_patch`) require consent and
+are confined to the workspace (an outside path needs explicit approval; see
+[Workspace confinement](#workspace-confinement)). **Reads that resolve outside
+the working directory** (`read`, `list_dir`, `glob`, `agentgrep`) require
+consent before the daemon executes them:
 
 - In `jancode connect` you get an interactive prompt: `[approval] <tool> —
   <reason>` then `allow? [y/N]`. Answering `n` sends `APPROVAL_DENIED` to the
@@ -274,8 +348,8 @@ resolve outside the working directory** (`read`, `list_dir`, `glob`,
 - `plan`, `note`, and `fetch_url` are intentionally ungated: `plan`/`note` only
   touch their own bookkeeping files, and `fetch_url` only reads. Other tools
   gate selectively: `git` mutating actions, `http_request` non-GET/HEAD
-  methods, `docker` state-changing actions, and non-read-only `sql` statements
-  all require approval.
+  methods, `docker` state-changing actions, non-read-only `sql` statements,
+  `gh` mutating actions, and `test` with a custom command all require approval.
 
   **`bash` is gated when it escapes the workspace OR modifies files.** Because
   `bash` can read, search, or write anywhere on the host, jancode scans the
@@ -286,8 +360,9 @@ resolve outside the working directory** (`read`, `list_dir`, `glob`,
     or a leading `cd` out of the workspace; or
   - **modifies files in place** — `sed -i`, `awk -i`, `perl -i`, `tee`,
     `touch`, `rm`/`mv`/`cp`/`truncate`/`unlink`/`dd`, `mkdir`, `chmod`/`chown`,
-    or a write redirection (`>`, `>>`). The approval reason names the target
-    file(s), e.g. `modifies file(s) on styles.css via sed`.
+    or a write redirection (`>`, `>>`). Clustered short flags count too, so
+    `perl -pi` and `sed -ni` are caught just like `sed -i`. The approval reason
+    names the target file(s), e.g. `modifies file(s) on styles.css via sed`.
 
   In-workspace read-only commands (`ls`, `cargo test`, `grep -r alpha src`,
   `sed -n '1,5p' file`) run freely. This is a best-effort heuristic, not
@@ -315,6 +390,7 @@ idle_timeout_secs = 300
 approve_mode = "prompt"   # "prompt" | "auto" | "deny"
 response_border = "gutter" # "gutter" (default) | "box" | "none"
 dim_tool_lines = true      # dim [tool]/[approval] status lines
+show_diffs = true          # show the lines each edit/patch changed
 max_tool_loops = 50        # model turns per request (default 50)
 max_total_tool_calls = 75  # total tool calls per request (default 75)
 ```
@@ -354,9 +430,15 @@ following the same convention as other CLI agents (opencode, antigravity):
   workspace itself is normalized to a relative form (e.g. `cd /home/u/proj/src`
   → `cd src`) so commands read cleanly — but a `cd` that leaves the workspace
   is left untouched so the approval gate still sees it.
-- Reads, edits, and bash commands that stay inside the workspace run freely
-  (subject to the mutation gate above); anything that touches a location
-  **outside** the workspace requires approval.
+- Reads and bash commands that stay inside the workspace run freely (subject to
+  the mutation gate above); anything that touches a location **outside** the
+  workspace requires approval.
+- **Writes are confined.** `write`, `edit`, and `apply_patch` resolve and
+  lexically normalize their target (`..`/absolute paths included) and refuse
+  anything outside the workspace unless you explicitly approve that exact path
+  in an interactive session. Headless `run` and swarm agents never get an
+  outside-write exception, so a spawned agent cannot escape its parent's
+  workspace.
 - Running `jancode connect` in different folders gives each its own isolated
   workspace, session history, and approval cache — you can work on multiple
   projects independently.
@@ -369,12 +451,20 @@ into later turns — no manual `/remember` needed.
 - **Capture**: sentences containing preference/decision markers ("we use",
   "always", "prefer", "deployed to", "in this project", ...) are auto-saved to
   `~/.jancode/memory.json`, scoped to the folder you were in.
-- **Injection**: before each response, the top 5 most relevant notes for the
-  current folder are scored by token overlap and appended to the system prompt
-  as "Project memory".
+- **Injection**: before each response, up to 5 relevant notes are scored by
+  token overlap and appended to the system prompt as "Project memory".
+- **Scoping**: notes are scoped to a **directory**, never to keywords. A note
+  applies to the folder it was saved in and to that folder's descendants (a note
+  saved in `~/devops` covers `~/devops/proj`), but **never to a sibling
+  project**. Keyword overlap alone is far too weak a gate — ordinary English
+  ("can you … this … and … project") scores above the relevance threshold — so
+  a note from one project would otherwise be injected into an unrelated one and
+  send the model off to the wrong paths.
 - **Limits**: this is keyword-based, not embeddings + reranking (that's what
-  jcode does). It matches repeated wording well but misses paraphrase. Notes
-  only surface in the folder they came from.
+  jcode does). It matches repeated wording well but misses paraphrase. A note
+  saved in the *current* folder is always injected (the folder boost clears the
+  relevance threshold), so local notes can outweigh a more relevant note from a
+  parent directory.
 - Manage with `/memory` and `/forget <number>`.
 
 ### MCP (Model Context Protocol) servers
@@ -671,7 +761,10 @@ agents. In interactive mode you'll see a line like
 ## Core mechanics
 
 - **Unix socket IPC** (`jancode.sock`) under `JANCODE_RUNTIME_DIR` — clients and the
-  daemon communicate over a local socket, no HTTP port to manage.
+  daemon communicate over a local socket, no HTTP port to manage. The socket is
+  created owner-only (`0600`), and a second `serve` refuses to start while
+  another live daemon owns the path. Session transcripts and `config.toml` are
+  likewise written owner-only.
 - **`JANCODE_HOME` sandboxing** — config and state are isolated to a single
   directory you control.
 - **Lazy daemon spawn** — `run` and `connect` wake the daemon on demand, so

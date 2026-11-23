@@ -1,9 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-mod client;
 mod agents;
+mod client;
 mod config;
 mod mcp;
 mod memory;
@@ -85,7 +85,12 @@ async fn main() -> Result<()> {
         .init();
     match cli.command {
         Commands::Serve => server::run().await,
-        Commands::Run { prompt, model, tools, mcp } => client::run_prompt(&prompt, model, tools, mcp).await,
+        Commands::Run {
+            prompt,
+            model,
+            tools,
+            mcp,
+        } => client::run_prompt(&prompt, model, tools, mcp).await,
         Commands::Connect => client::connect().await,
         Commands::Swarm(sub) => client::handle_swarm(sub).await,
     }

@@ -12,6 +12,9 @@ pub enum Request {
         #[serde(default)]
         session_id: Option<String>,
         content: String,
+        /// Tool allow-list. When present, only these built-in tools are
+        /// registered (MCP tools are added too when `mcp` is true); when
+        /// absent, tool-calling is disabled for the turn.
         #[serde(default)]
         tools: Option<Vec<String>>,
         /// Opt in to MCP tools for this turn only. MCP servers are NOT connected
@@ -32,12 +35,24 @@ pub enum Request {
         #[serde(default)]
         interactive: bool,
     },
-    Cancel { id: u64, session_id: Option<String> },
-    Ping { id: u64 },
-    GetHistory { id: u64, session_id: Option<String> },
+    Cancel {
+        id: u64,
+        session_id: Option<String>,
+    },
+    Ping {
+        id: u64,
+    },
+    /// Fetch one session's history. `session_id` is required; omitting it
+    /// returns an empty list (never another session's messages).
+    GetHistory {
+        id: u64,
+        session_id: Option<String>,
+    },
     /// Probe configured MCP servers: connect, initialize, and list their tools.
     /// Responded with `Event::McpInfo`. Safe read-only introspection.
-    McpProbe { id: u64 },
+    McpProbe {
+        id: u64,
+    },
 
     /// Client reply to `Event::ApprovalRequired`. `approved` decides whether the
     /// risky tool call may proceed. The server waits (with a timeout) for this
@@ -85,9 +100,14 @@ pub enum Request {
         force: bool,
     },
     /// Snapshot of a single swarm member's live state.
-    SwarmStatus { id: u64, session_id: Option<String> },
+    SwarmStatus {
+        id: u64,
+        session_id: Option<String>,
+    },
     /// List every member of the current swarm.
-    SwarmList { id: u64 },
+    SwarmList {
+        id: u64,
+    },
 }
 
 /// Server -> Client event. Streamed responses are a sequence of `TextDelta`
@@ -95,12 +115,27 @@ pub enum Request {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    Ack { id: u64 },
-    TextDelta { id: Option<u64>, text: String },
-    Done { id: Option<u64> },
-    Error { id: Option<u64>, message: String },
-    History { id: u64, messages: Vec<Message> },
-    Pong { id: u64 },
+    Ack {
+        id: u64,
+    },
+    TextDelta {
+        id: Option<u64>,
+        text: String,
+    },
+    Done {
+        id: Option<u64>,
+    },
+    Error {
+        id: Option<u64>,
+        message: String,
+    },
+    History {
+        id: u64,
+        messages: Vec<Message>,
+    },
+    Pong {
+        id: u64,
+    },
     /// Response to `Request::McpProbe`: per-server connection status and the
     /// tools they expose.
     McpInfo {
@@ -122,7 +157,11 @@ pub enum Event {
 
     // ---- Swarm / multi-agent ----
     /// A new agent session was spawned.
-    Spawned { id: u64, new_session_id: String, label: Option<String> },
+    Spawned {
+        id: u64,
+        new_session_id: String,
+        label: Option<String>,
+    },
     /// A soft-interrupt notification (DM, broadcast, or spawn completion report)
     /// addressed to this session. The client should inject it into the agent's
     /// current turn at the next safe point.
@@ -141,20 +180,32 @@ pub enum Event {
         task_label: Option<String>,
     },
     /// AI thinking status.
-    Status { id: Option<u64>, message: String },
+    Status {
+        id: Option<u64>,
+        message: String,
+    },
     /// Full member roster for the current swarm.
     MemberList {
         id: u64,
         members: Vec<MemberInfo>,
     },
     /// A session was stopped / removed from the swarm.
-    Stopped { id: u64, session_id: String },
+    Stopped {
+        id: u64,
+        session_id: String,
+    },
     /// The model requested execution of one or more tools. The client may
     /// render these for the user. The server executes them and continues the
     /// turn automatically.
-    ToolCall { id: Option<u64>, calls: Vec<ToolCall> },
+    ToolCall {
+        id: Option<u64>,
+        calls: Vec<ToolCall>,
+    },
     /// The result of executing a tool call. The client may render these.
-    ToolResult { id: Option<u64>, results: Vec<ToolResultEntry> },
+    ToolResult {
+        id: Option<u64>,
+        results: Vec<ToolResultEntry>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

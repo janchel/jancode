@@ -2,14 +2,14 @@ use std::path::Path;
 
 /// Instruction files injected into the system prompt, following the
 /// AGENTS.md / CLAUDE.md ecosystem convention.
-const INSTRUCTION_FILENAMES: &[&str] = &["AGENTS.md", "agents.md", "CLAUDE.md", ".claude/CLAUDE.md"];
+const INSTRUCTION_FILENAMES: &[&str] =
+    &["AGENTS.md", "agents.md", "CLAUDE.md", ".claude/CLAUDE.md"];
 
 /// Collect project instructions for a working directory and render them as a
 /// markdown block for the system prompt. Sources, in trust order (later
-/// overrides earlier):
-///   1. global `~/.config/jancode/AGENTS.md` (machine-wide rules),
-///   2. every AGENTS.md/CLAUDE.md found walking up from `working_dir` to the
-///      filesystem root — closest to the work wins.
+/// overrides earlier): the global `~/.config/jancode/AGENTS.md` (machine-wide
+/// rules), then every AGENTS.md/CLAUDE.md found walking up from `working_dir`
+/// to the filesystem root, with the closest file to the work winning.
 /// Returns an empty string when nothing is found, so callers can skip the
 /// system-prompt section cheaply.
 pub fn load_instructions(working_dir: &str) -> String {

@@ -87,14 +87,12 @@ pub struct ProviderConfig {
     pub models: Vec<String>,
     /// How tool-call history is sent back to the provider. Some providers
     /// (e.g. Gemma via LM Studio) reject the OpenAI `tool_calls`/`tool` message
-    /// roles in the request. Values:
-    ///   - "openai":    send `tool_calls` + `tool` roles (default; works with
-    ///                  OpenAI and most providers).
-    ///   - "flattened": convert tool-call history into plain user/assistant
-    ///                  messages (for providers that reject tool roles).
-    ///   - "auto":      start with "openai"; if the provider rejects the tool
-    ///                  roles or emits malformed tool calls, fall back to
-    ///                  "flattened" automatically.
+    /// roles in the request. `"openai"` (the default) sends `tool_calls` +
+    /// `tool` roles and works with OpenAI and most providers; `"flattened"`
+    /// converts tool-call history into plain user/assistant messages for
+    /// providers that reject tool roles; `"auto"` starts with `"openai"` and
+    /// falls back to `"flattened"` automatically if the provider rejects the
+    /// tool roles or emits malformed tool calls.
     #[serde(default = "default_tool_call_style")]
     pub tool_call_style: String,
     /// Whether this provider/model supports structured tool calling at all.
@@ -122,19 +120,17 @@ pub struct ServerConfig {
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_secs: u64,
     /// Approval policy for risky tool calls (file writes/edits/patches, and
-    /// reads outside the working directory). Values:
-    ///   - "auto":   always allow (no prompts).
-    ///   - "prompt": ask interactive sessions; headless `run`/swarm auto-allow.
-    ///   - "deny":   always deny risky calls.
+    /// reads outside the working directory). `"auto"` always allows (no
+    /// prompts); `"prompt"` asks interactive sessions while headless
+    /// `run`/swarm auto-allow; `"deny"` always blocks risky calls.
     #[serde(default = "default_approve_mode")]
     pub approve_mode: String,
     /// How aggressively the `bash` tool is gated when its command references
-    /// files/directories outside the working directory. Values:
-    ///   - "off":    never gate `bash` (old behavior).
-    ///   - "basic":  gate on obvious escapes (absolute paths, `~`, `$HOME`,
-    ///               `..`, leading `cd` out of the workspace). Default.
-    ///   - "strict": also gate on any `cd`, `$PWD`/`$OLDPWD` tricks, and
-    ///               commands that read env vars pointing outside.
+    /// files/directories outside the working directory. `"off"` never gates
+    /// `bash` (old behavior); `"basic"` (the default) gates on obvious escapes
+    /// (absolute paths, `~`, `$HOME`, `..`, a leading `cd` out of the
+    /// workspace); `"strict"` also gates on any `cd`, `$PWD`/`$OLDPWD` tricks,
+    /// and commands that read env vars pointing outside.
     #[serde(default = "default_bash_gate")]
     pub bash_gate: String,
     /// Whether to print the model's reasoning/thinking tokens as `[thinking]`
@@ -143,11 +139,11 @@ pub struct ServerConfig {
     #[serde(default = "default_show_thinking")]
     pub show_thinking: bool,
     /// Draw a border/box around the model's responses so they stand out from
-    /// tool output and user input (helps a lot in long sessions). Values:
-    ///   - "gutter": prefix each response line with a dim `│ ` bar. Default.
-    ///   - "box":    like "gutter", plus top/bottom `─` rules around the reply.
-    ///   - "none":   plain output (old behavior).
-    /// Pure client-side rendering; no extra tokens or provider calls.
+    /// tool output and user input (helps a lot in long sessions). `"gutter"`
+    /// (the default) prefixes each response line with a dim `│ ` bar; `"box"`
+    /// adds top/bottom `─` rules around the reply; `"none"` is plain output
+    /// (old behavior). Pure client-side rendering; no extra tokens or provider
+    /// calls.
     #[serde(default = "default_response_border")]
     pub response_border: String,
     /// Dim the `[tool]` / `[approval]` / `[thinking]` status lines so they
@@ -155,6 +151,14 @@ pub struct ServerConfig {
     /// piped). Default true.
     #[serde(default = "default_dim_tool_lines")]
     pub dim_tool_lines: bool,
+    /// Show the lines the model changed, right below each successful
+    /// `edit` / `apply_patch` tool call (a compact `-`/`+` diff, colourised on
+    /// a terminal). Only the modified lines are shown — context lines are
+    /// dropped. Rendered client-side from the tool-call arguments; costs no
+    /// extra tokens or provider calls. Default true; set `false` to keep the
+    /// session minimal.
+    #[serde(default = "default_show_diffs")]
+    pub show_diffs: bool,
     /// Maximum number of model turns (tool-calling iterations) in a single
     /// request before jancode gives up. Larger projects need more exploration
     /// turns. Default 50. The per-call repeat/error/denial guards still apply,
@@ -208,6 +212,10 @@ fn default_dim_tool_lines() -> bool {
     true
 }
 
+fn default_show_diffs() -> bool {
+    true
+}
+
 fn default_max_tool_loops() -> u32 {
     50
 }
@@ -229,6 +237,7 @@ impl Default for ServerConfig {
             show_thinking: default_show_thinking(),
             response_border: default_response_border(),
             dim_tool_lines: default_dim_tool_lines(),
+            show_diffs: default_show_diffs(),
             max_tool_loops: default_max_tool_loops(),
             max_total_tool_calls: default_max_total_tool_calls(),
         }
@@ -245,20 +254,39 @@ pub fn config_path() -> PathBuf {
     jancode_dir().join("config.toml")
 }
 
+/// Best-effort writability probe (create + remove a temporary file). Used to
+/// avoid silently sharing a system runtime dir the current user can't write.
+fn dir_is_writable(path: &std::path::Path) -> bool {
+    if std::fs::create_dir_all(path).is_err() {
+        return false;
+    }
+    let probe = path.join(format!(".jancode-write-{}", std::process::id()));
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 pub fn runtime_dir() -> PathBuf {
     std::env::var("JANCODE_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            // Prefer the systemd-managed runtime dir (/run/jancode) when it
-            // exists, so a client run from the shell connects to the same
-            // daemon the systemd service started. Otherwise fall back to the
-            // XDG runtime dir (per-user) or a temp dir.
+            // Prefer the systemd-managed runtime dir (/run/jancode) when the
+            // current user can actually use it, so a client run from the shell
+            // connects to the same daemon the systemd service started. A
+            // root-owned /run/jancode must not lure a non-root user into a
+            // permission error (or a second daemon); fall back to the per-user
+            // XDG runtime dir or a temp dir.
             let systemd_dir = PathBuf::from("/run/jancode");
-            if systemd_dir.exists() {
+            if systemd_dir.exists() && dir_is_writable(&systemd_dir) {
                 systemd_dir
             } else {
-                dirs::runtime_dir()
-                    .unwrap_or_else(|| std::env::temp_dir().join(format!("jancode-{}", std::process::id())))
+                dirs::runtime_dir().unwrap_or_else(|| {
+                    std::env::temp_dir().join(format!("jancode-{}", std::process::id()))
+                })
             }
         })
 }
@@ -272,8 +300,10 @@ pub fn load() -> Result<Config> {
     if !path.exists() {
         return Ok(Config::default());
     }
-    let data = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let mut cfg: Config = toml::from_str(&data).with_context(|| format!("parsing {}", path.display()))?;
+    let data =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let mut cfg: Config =
+        toml::from_str(&data).with_context(|| format!("parsing {}", path.display()))?;
     // If `default_provider` wasn't deserialized (empty), fall back to the first
     // provider's name so `resolve_provider` picks a sensible default.
     if cfg.default_provider.is_empty() && !cfg.providers.is_empty() {
@@ -320,6 +350,7 @@ mod tests {
         assert_eq!(cfg.server.max_total_tool_calls, 75);
         assert_eq!(cfg.server.response_border, "gutter");
         assert!(cfg.server.dim_tool_lines);
+        assert!(cfg.server.show_diffs);
         assert_eq!(cfg.server.idle_timeout_secs, 300);
         assert_eq!(cfg.server.approve_mode, "prompt");
         assert_eq!(cfg.server.bash_gate, "basic");
@@ -328,11 +359,12 @@ mod tests {
     #[test]
     fn server_limits_override() {
         let cfg: Config = toml::from_str(
-            "[server]\nmax_tool_loops = 120\nmax_total_tool_calls = 200\nresponse_border = \"none\"\n",
+            "[server]\nmax_tool_loops = 120\nmax_total_tool_calls = 200\nresponse_border = \"none\"\nshow_diffs = false\n",
         )
         .expect("override config parses");
         assert_eq!(cfg.server.max_tool_loops, 120);
         assert_eq!(cfg.server.max_total_tool_calls, 200);
         assert_eq!(cfg.server.response_border, "none");
+        assert!(!cfg.server.show_diffs);
     }
 }
