@@ -179,6 +179,14 @@ idle_timeout_secs = 300
 # [tools]
 # allowed_private_hosts = ["192.168.5.0/24", "jenkins.local"]
 
+# Approval policy rules: skip prompts for specific tools/commands/hosts, or
+# always deny a tool.
+# [security]
+# allow_tools = ["edit", "apply_patch"]
+# deny_tools = ["docker"]
+# allow_bash_patterns = ["^cargo (test|clippy)"]
+# allow_hosts = ["server1"]
+
 # Single-provider setup (legacy): use the `[provider]` table.
 [provider]
 base_url = "https://api.openai.com/v1"

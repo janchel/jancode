@@ -937,6 +937,9 @@ pub async fn connect() -> Result<()> {
     // MCP tools are opt-in per turn (only `/mcp <message>` sets this). Ordinary
     // turns skip MCP entirely so a slow/down server can't slow every message.
     let mut mcp_requested = false;
+    // Plan mode: read-only tools run freely, gated (mutating) operations are
+    // auto-denied. Toggled with /plan.
+    let mut plan_mode = false;
     let mut session_id = Some(format!("connect-{}", crate::protocol::new_message_id()));
     println!(
         "swarm session id: {} (spawn agents with `jancode swarm spawn --parent {}`)",
@@ -1016,6 +1019,14 @@ pub async fn connect() -> Result<()> {
         }
         if input == "/quit" || input == "/exit" || input == "/q" {
             break;
+        }
+        if input == "/plan" {
+            plan_mode = !plan_mode;
+            println!(
+                "plan mode: {} (read-only tools run; mutating operations are denied)",
+                if plan_mode { "ON" } else { "off" }
+            );
+            continue;
         }
         if input == "/tools" || input.starts_with("/tools ") {
             let remainder = input
@@ -1581,7 +1592,7 @@ pub async fn connect() -> Result<()> {
             continue;
         }
         if input == "/help" {
-            println!("Available commands: /quit, /exit, /q (quit), /tools (toggle tool calling), /model (list models and switch), /provider (list/switch providers), /diff (show modified lines via git diff), /mcp (list MCP servers / send with MCP tools), /mcp_tools (list tools exposed by MCP servers), /mcp_status (MCP server connection status), /mcp_reconnect (reload config + reconnect MCP servers), /session (list sessions), /resume <number>, /export [number] [path] (write a session as Markdown), /search <text> (find matches across sessions), /memory (list memories), /forget <number>, /help (Ctrl+C cancels the running request; Ctrl+D quits)");
+            println!("Available commands: /quit, /exit, /q (quit), /plan (toggle plan mode: read-only, mutations denied), /tools (toggle tool calling), /model (list models and switch), /provider (list/switch providers), /diff (show modified lines via git diff), /mcp (list MCP servers / send with MCP tools), /mcp_tools (list tools exposed by MCP servers), /mcp_status (MCP server connection status), /mcp_reconnect (reload config + reconnect MCP servers), /session (list sessions), /resume <number>, /export [number] [path] (write a session as Markdown), /search <text> (find matches across sessions), /memory (list memories), /forget <number>, /help (Ctrl+C cancels the running request; Ctrl+D quits)");
             continue;
         }
         // Drain any queued Ctrl+C first so a stray keypress while idle can't
@@ -1612,6 +1623,7 @@ pub async fn connect() -> Result<()> {
             provider: current_provider.clone(),
             cwd,
             interactive: true,
+            plan_mode,
             // MCP tools only for turns started with `/mcp <message>`.
             mcp: mcp_requested,
         };
@@ -1857,6 +1869,7 @@ pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool, mcp: b
         provider: None,
         cwd,
         interactive: false,
+        plan_mode: false,
     };
     let data = serde_json::to_string(&req)?;
     w.write_all(data.as_bytes()).await?;

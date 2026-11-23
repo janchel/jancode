@@ -230,6 +230,7 @@ async fn handle_client(
                 provider,
                 cwd,
                 interactive,
+                plan_mode,
             } => {
                 let session_id_s = session_id.unwrap_or_else(|| format!("session-{}", id));
                 let working_dir = cwd.clone().unwrap_or_else(|| {
@@ -369,6 +370,7 @@ async fn handle_client(
                         content,
                         tool_registry,
                         interactive,
+                        plan_mode,
                         provider,
                     )
                     .await
@@ -779,6 +781,32 @@ fn gate_tool(name: &str, input: &Value, ctx: &ToolContext) -> Option<ApprovalGat
     }
 }
 
+/// True when `[security]` allow rules cover this call (so it shouldn't prompt).
+fn policy_allows(name: &str, input: &Value, sec: &crate::config::SecurityConfig) -> bool {
+    if sec.allow_tools.iter().any(|t| t == name) {
+        return true;
+    }
+    if name == "bash" {
+        if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+            for pat in &sec.allow_bash_patterns {
+                if let Ok(re) = regex::Regex::new(pat) {
+                    if re.is_match(cmd) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    if matches!(name, "ssh" | "ssh_copy") {
+        if let Some(host) = input.get("host").and_then(|v| v.as_str()) {
+            if sec.allow_hosts.iter().any(|h| h == host) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Normalize a path string for use as a cache key.
 /// Handles variations like "index.html", "./index.html", "dir/../index.html"
 /// by resolving to a canonical form without touching the filesystem.
@@ -826,6 +854,7 @@ async fn handle_message_turn(
     content: String,
     tool_registry: Option<crate::tools::ToolRegistry>,
     interactive: bool,
+    plan_mode: bool,
     provider: Option<String>,
 ) -> Result<()> {
     // Build the tool definitions to send to the provider. If the active
@@ -1013,7 +1042,12 @@ async fn handle_message_turn(
             .collect::<Vec<_>>()
             .join("\n");
 
-        let instructions = crate::agents::load_instructions(&working_dir);
+        let mut instructions = crate::agents::load_instructions(&working_dir);
+        if plan_mode {
+            instructions.push_str(
+                "\n\n# Plan mode (active)\nRead-only investigation is allowed, but every mutating operation is denied automatically. Investigate and produce a concrete plan; do not attempt writes, edits, state-changing commands, or remote changes.\n",
+            );
+        }
 
         // Signal the remaining tool budget so the model wraps up instead of
         // exploring forever. max_total_tool_calls is the hard cap.
@@ -1293,7 +1327,12 @@ async fn handle_message_turn(
                 let mut plan: Vec<ApprovalPlan> = Vec::new();
                 for tc in &tool_calls {
                     let tool = tool_registry.as_ref().and_then(|r| r.find(&tc.name));
-                    let gate = gate_tool(&tc.name, &tc.input, &ctx);
+                    let raw_gate = gate_tool(&tc.name, &tc.input, &ctx);
+                    let gate = if !plan_mode && policy_allows(&tc.name, &tc.input, &cfg.security) {
+                        None
+                    } else {
+                        raw_gate
+                    };
                     let group_key = if read_only_tools.iter().any(|t| t == &tc.name) {
                         if let Some(g) = &gate {
                             let (_, norm) = resolve_gate_key(g);
@@ -1341,137 +1380,170 @@ async fn handle_message_turn(
                         },
                     )
                     .await?;
-                    let (approved, deny_reason) = match &ap.gate {
-                        None => (true, None),
-                        Some(g) => match cfg.server.approve_mode.as_str() {
-                            "auto" => (true, None),
-                            "deny" => (false, Some(g.reason.clone())),
-                            _ => {
-                                if interactive {
-                                    let (path_key, norm_key) = resolve_gate_key(g);
-                                    info!("approval check: tool={} path_key={} norm_key={} cache_size={} cache_contains={}",
+                    let force_deny = cfg.security.deny_tools.iter().any(|t| t == &ap.tc.name);
+                    let (approved, deny_reason) = if force_deny {
+                        (
+                            false,
+                            Some(format!(
+                                "'{}' is denied by [security] deny_tools",
+                                ap.tc.name
+                            )),
+                        )
+                    } else if plan_mode {
+                        match &ap.gate {
+                            None => (true, None),
+                            Some(_) => (
+                                false,
+                                Some("plan mode: mutating operations are disabled".to_string()),
+                            ),
+                        }
+                    } else {
+                        match &ap.gate {
+                            None => (true, None),
+                            Some(g) => match cfg.server.approve_mode.as_str() {
+                                "auto" => (true, None),
+                                "deny" => (false, Some(g.reason.clone())),
+                                _ => {
+                                    if interactive {
+                                        let (path_key, norm_key) = resolve_gate_key(g);
+                                        info!("approval check: tool={} path_key={} norm_key={} cache_size={} cache_contains={}",
                                         ap.tc.name, path_key, norm_key, approved_paths.len(), approved_paths.contains(&norm_key));
-                                    // Already approved this exact path this session.
-                                    if !norm_key.is_empty() && approved_paths.contains(&norm_key) {
-                                        info!("auto-approving {} (already approved in this session): {}", ap.tc.name, g.reason);
-                                        (true, None)
-                                    } else if !ap.group_key.is_empty()
-                                        && group_decisions.contains_key(&ap.group_key)
-                                    {
-                                        // Another read-only call already prompted for this directory.
-                                        let ok = group_decisions
-                                            .get(&ap.group_key)
-                                            .copied()
-                                            .unwrap_or(false);
-                                        if ok && !norm_key.is_empty() {
-                                            approved_paths.insert(norm_key);
-                                        }
-                                        (ok, if ok { None } else { Some(g.reason.clone()) })
-                                    } else {
-                                        // Prompt once. For a read-only group,
-                                        // list the files being read so the user
-                                        // knows what they're approving; otherwise
-                                        // describe the individual tool.
-                                        let prompt_path = if !ap.group_key.is_empty() {
-                                            Some(ap.group_key.clone())
+                                        // Already approved this exact path this session.
+                                        if !norm_key.is_empty()
+                                            && approved_paths.contains(&norm_key)
+                                        {
+                                            info!("auto-approving {} (already approved in this session): {}", ap.tc.name, g.reason);
+                                            (true, None)
+                                        } else if !ap.group_key.is_empty()
+                                            && group_decisions.contains_key(&ap.group_key)
+                                        {
+                                            // Another read-only call already prompted for this directory.
+                                            let ok = group_decisions
+                                                .get(&ap.group_key)
+                                                .copied()
+                                                .unwrap_or(false);
+                                            if ok && !norm_key.is_empty() {
+                                                approved_paths.insert(norm_key);
+                                            }
+                                            (ok, if ok { None } else { Some(g.reason.clone()) })
                                         } else {
-                                            g.path.clone()
-                                        };
-                                        let prompt_reason = if !ap.group_key.is_empty() {
-                                            // Collect all file paths in this
-                                            // directory group for the prompt.
-                                            let files = plan
-                                                .iter()
-                                                .filter(|p| p.group_key == ap.group_key)
-                                                .map(|p| {
-                                                    let (_, n) =
-                                                        resolve_gate_key(p.gate.as_ref().unwrap());
-                                                    n
-                                                })
-                                                .filter(|n| !n.is_empty())
-                                                .collect::<Vec<_>>();
-                                            if files.len() > 1 {
-                                                format!(
+                                            // Prompt once. For a read-only group,
+                                            // list the files being read so the user
+                                            // knows what they're approving; otherwise
+                                            // describe the individual tool.
+                                            let prompt_path = if !ap.group_key.is_empty() {
+                                                Some(ap.group_key.clone())
+                                            } else {
+                                                g.path.clone()
+                                            };
+                                            let prompt_reason = if !ap.group_key.is_empty() {
+                                                // Collect all file paths in this
+                                                // directory group for the prompt.
+                                                let files = plan
+                                                    .iter()
+                                                    .filter(|p| p.group_key == ap.group_key)
+                                                    .map(|p| {
+                                                        let (_, n) = resolve_gate_key(
+                                                            p.gate.as_ref().unwrap(),
+                                                        );
+                                                        n
+                                                    })
+                                                    .filter(|n| !n.is_empty())
+                                                    .collect::<Vec<_>>();
+                                                if files.len() > 1 {
+                                                    format!(
                                                     "read {} files outside workspace in {}:\n  {}",
                                                     files.len(),
                                                     ap.group_key,
                                                     files.join("\n  ")
                                                 )
+                                                } else {
+                                                    format!(
+                                                        "read outside workspace ({})",
+                                                        ap.group_key
+                                                    )
+                                                }
                                             } else {
-                                                format!("read outside workspace ({})", ap.group_key)
-                                            }
-                                        } else {
-                                            g.reason.clone()
-                                        };
-                                        send(
-                                            w,
-                                            &Event::ApprovalRequired {
-                                                id,
-                                                tool_call_id: ap.tc.id.clone(),
-                                                tool_name: ap.tc.name.clone(),
-                                                path: prompt_path,
-                                                reason: prompt_reason,
-                                            },
-                                        )
-                                        .await?;
-                                        info!("asking approval for {} ({})", ap.tc.name, g.reason);
-                                        let key = format!("{}:{}", id, ap.tc.id);
-                                        let (tx, rx) = tokio::sync::oneshot::channel();
-                                        approvals.write().await.insert(key.clone(), tx);
-                                        let decision = tokio::time::timeout(
-                                            std::time::Duration::from_secs(300),
-                                            rx,
-                                        )
-                                        .await;
-                                        approvals.write().await.remove(&key);
-                                        let ok = matches!(decision, Ok(Ok(true)));
-                                        // Cache the group decision so sibling
-                                        // read-only calls in the same directory
-                                        // don't re-prompt.
-                                        if !ap.group_key.is_empty() {
-                                            group_decisions.insert(ap.group_key.clone(), ok);
-                                        }
-                                        if ok && !norm_key.is_empty() {
-                                            approved_paths.insert(norm_key.clone());
-                                            info!("inserted into approval cache: norm_key={} cache_size={}", norm_key, approved_paths.len());
-                                        }
-                                        // Also extract paths from apply_patch patches to populate cache
-                                        if ok && ap.tc.name == "apply_patch" {
+                                                g.reason.clone()
+                                            };
+                                            send(
+                                                w,
+                                                &Event::ApprovalRequired {
+                                                    id,
+                                                    tool_call_id: ap.tc.id.clone(),
+                                                    tool_name: ap.tc.name.clone(),
+                                                    path: prompt_path,
+                                                    reason: prompt_reason,
+                                                },
+                                            )
+                                            .await?;
                                             info!(
+                                                "asking approval for {} ({})",
+                                                ap.tc.name, g.reason
+                                            );
+                                            let key = format!("{}:{}", id, ap.tc.id);
+                                            let (tx, rx) = tokio::sync::oneshot::channel();
+                                            approvals.write().await.insert(key.clone(), tx);
+                                            let decision = tokio::time::timeout(
+                                                std::time::Duration::from_secs(300),
+                                                rx,
+                                            )
+                                            .await;
+                                            approvals.write().await.remove(&key);
+                                            let ok = matches!(decision, Ok(Ok(true)));
+                                            // Cache the group decision so sibling
+                                            // read-only calls in the same directory
+                                            // don't re-prompt.
+                                            if !ap.group_key.is_empty() {
+                                                group_decisions.insert(ap.group_key.clone(), ok);
+                                            }
+                                            if ok && !norm_key.is_empty() {
+                                                approved_paths.insert(norm_key.clone());
+                                                info!("inserted into approval cache: norm_key={} cache_size={}", norm_key, approved_paths.len());
+                                            }
+                                            // Also extract paths from apply_patch patches to populate cache
+                                            if ok && ap.tc.name == "apply_patch" {
+                                                info!(
                                                 "apply_patch approved, extracting paths from patch"
                                             );
-                                            if let Some(patch) =
-                                                ap.tc.input.get("patch").and_then(|v| v.as_str())
-                                            {
-                                                let extracted = extract_patch_paths(patch);
-                                                info!(
-                                                    "extract_patch_paths returned: {:?}",
-                                                    extracted
-                                                );
-                                                for p in extracted {
-                                                    if !p.is_empty() {
-                                                        approved_paths.insert(p.clone());
-                                                        info!(
+                                                if let Some(patch) = ap
+                                                    .tc
+                                                    .input
+                                                    .get("patch")
+                                                    .and_then(|v| v.as_str())
+                                                {
+                                                    let extracted = extract_patch_paths(patch);
+                                                    info!(
+                                                        "extract_patch_paths returned: {:?}",
+                                                        extracted
+                                                    );
+                                                    for p in extracted {
+                                                        if !p.is_empty() {
+                                                            approved_paths.insert(p.clone());
+                                                            info!(
                                                             "inserted patch path into cache: {}",
                                                             p
                                                         );
+                                                        }
                                                     }
+                                                } else {
+                                                    info!(
+                                                        "apply_patch has no patch field in input"
+                                                    );
                                                 }
-                                            } else {
-                                                info!("apply_patch has no patch field in input");
                                             }
+                                            (ok, if ok { None } else { Some(g.reason.clone()) })
                                         }
-                                        (ok, if ok { None } else { Some(g.reason.clone()) })
+                                    } else {
+                                        info!(
+                                            "auto-approving {} in non-interactive mode: {}",
+                                            ap.tc.name, g.reason
+                                        );
+                                        (true, None)
                                     }
-                                } else {
-                                    info!(
-                                        "auto-approving {} in non-interactive mode: {}",
-                                        ap.tc.name, g.reason
-                                    );
-                                    (true, None)
                                 }
-                            }
-                        },
+                            },
+                        }
                     };
                     // If the user approved an outside-workspace write, record it
                     // so the tool's confinement check allows exactly that path.
@@ -2807,5 +2879,37 @@ mod tests {
             &ctx
         )
         .is_some());
+    }
+
+    #[test]
+    fn security_policy_rules() {
+        let sec = crate::config::SecurityConfig {
+            allow_tools: vec!["edit".to_string()],
+            deny_tools: vec!["docker".to_string()],
+            allow_bash_patterns: vec!["^cargo test".to_string()],
+            allow_hosts: vec!["server1".to_string()],
+        };
+        assert!(policy_allows("edit", &serde_json::json!({}), &sec));
+        assert!(policy_allows(
+            "bash",
+            &serde_json::json!({"command": "cargo test -p x"}),
+            &sec
+        ));
+        assert!(!policy_allows(
+            "bash",
+            &serde_json::json!({"command": "rm -rf /"}),
+            &sec
+        ));
+        assert!(policy_allows(
+            "ssh",
+            &serde_json::json!({"host": "server1"}),
+            &sec
+        ));
+        assert!(!policy_allows(
+            "ssh",
+            &serde_json::json!({"host": "other"}),
+            &sec
+        ));
+        assert!(!policy_allows("read", &serde_json::json!({}), &sec));
     }
 }

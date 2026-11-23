@@ -23,6 +23,26 @@ pub struct Config {
     pub database: DatabaseConfig,
     #[serde(default)]
     pub tools: ToolsConfig,
+    #[serde(default)]
+    pub security: SecurityConfig,
+}
+
+/// Approval policy rules. These reduce prompt fatigue (allow) or force a
+/// prompt/deny (deny) for specific tools, bash commands, or SSH hosts.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct SecurityConfig {
+    /// Tools that never prompt, even if they would normally be gated.
+    #[serde(default)]
+    pub allow_tools: Vec<String>,
+    /// Tools that are always denied.
+    #[serde(default)]
+    pub deny_tools: Vec<String>,
+    /// Bash commands matching any regex never prompt.
+    #[serde(default)]
+    pub allow_bash_patterns: Vec<String>,
+    /// SSH hosts (`ssh`/`ssh_copy`) that never prompt.
+    #[serde(default)]
+    pub allow_hosts: Vec<String>,
 }
 
 /// Tool-level settings that don't belong to a single tool.

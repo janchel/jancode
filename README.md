@@ -382,6 +382,14 @@ consent before the daemon executes them:
   create/run/copy/destroy actions, every `ssh` call, every `ssh_copy`
   transfer, `download`, and `jenkins` artifact downloads require approval.
 
+- **Plan mode** (`/plan` in `connect`) lets read-only tools run freely and
+  auto-denies every gated operation, so the model can investigate and plan
+  without modifying anything.
+- **`[security]` rules** in `config.toml` reduce prompt fatigue or block tools:
+  `allow_tools` (never prompt), `deny_tools` (always deny),
+  `allow_bash_patterns` (regexes that skip the bash gate), and `allow_hosts`
+  (SSH hosts that never prompt).
+
   **`bash` is gated when it escapes the workspace OR modifies files.** Because
   `bash` can read, search, or write anywhere on the host, jancode scans the
   command and asks for approval when it:

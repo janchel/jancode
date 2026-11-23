@@ -34,6 +34,10 @@ pub enum Request {
         /// (`Event::ApprovalRequired`). Headless clients leave this false.
         #[serde(default)]
         interactive: bool,
+        /// Plan mode: read-only tools run freely, but any gated (mutating)
+        /// operation is auto-denied instead of prompting.
+        #[serde(default)]
+        plan_mode: bool,
     },
     Cancel {
         id: u64,
