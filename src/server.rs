@@ -747,6 +747,34 @@ fn gate_tool(name: &str, input: &Value, ctx: &ToolContext) -> Option<ApprovalGat
                 reason: format!("scp {} {}:{}", action, host, remote_path),
             })
         }
+        "download" => {
+            // Network read, but it writes a file into the workspace.
+            let p = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            let full = ctx.resolve_path(p);
+            Some(ApprovalGate {
+                path: Some(full.display().to_string()),
+                reason: format!(
+                    "download {} to {}",
+                    input.get("url").and_then(|v| v.as_str()).unwrap_or("<url>"),
+                    full.display()
+                ),
+            })
+        }
+        "jenkins" => {
+            // GET actions (job_info/console/artifacts) are read-only; only the
+            // artifact download writes to the workspace.
+            let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            if action == "artifact" {
+                let p = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+                let full = ctx.resolve_path(p);
+                Some(ApprovalGate {
+                    path: Some(full.display().to_string()),
+                    reason: format!("download jenkins artifact to {}", full.display()),
+                })
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -827,6 +855,7 @@ async fn handle_message_turn(
         std::path::PathBuf::from(&working_dir),
         cfg.database.url.clone(),
         cfg.server.bash_gate.clone(),
+        cfg.tools.allowed_private_hosts.clone(),
     );
 
     // Per-session approval cache: tracks file paths the user has already approved
@@ -1798,6 +1827,7 @@ async fn run_headless_agent(
         std::path::PathBuf::from(&working_dir),
         cfg.database.url.clone(),
         cfg.server.bash_gate.clone(),
+        cfg.tools.allowed_private_hosts.clone(),
     );
 
     let instructions = crate::agents::load_instructions(&working_dir);
@@ -2442,6 +2472,7 @@ mod tests {
             std::path::PathBuf::from("/work/proj"),
             String::new(),
             "basic".to_string(),
+            Vec::new(),
         );
         // write/edit/apply_patch always gate.
         assert!(gate_tool("write", &serde_json::json!({"path": "x.rs"}), &ctx).is_some());
@@ -2752,6 +2783,27 @@ mod tests {
         assert!(gate_tool(
             "ssh_copy",
             &serde_json::json!({"action": "copy_from", "host": "server1", "path": "out.log", "remote_path": "/var/log/nginx/error.log"}),
+            &ctx
+        )
+        .is_some());
+
+        // download writes to the workspace; jenkins reads are ungated, artifact
+        // download gates.
+        assert!(gate_tool(
+            "download",
+            &serde_json::json!({"url": "https://x/y.zip", "path": "y.zip"}),
+            &ctx
+        )
+        .is_some());
+        assert!(gate_tool(
+            "jenkins",
+            &serde_json::json!({"action": "console", "base_url": "https://j", "job": "a"}),
+            &ctx
+        )
+        .is_none());
+        assert!(gate_tool(
+            "jenkins",
+            &serde_json::json!({"action": "artifact", "base_url": "https://j", "job": "a", "artifact": "a.zip", "path": "a.zip"}),
             &ctx
         )
         .is_some());

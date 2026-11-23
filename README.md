@@ -326,6 +326,14 @@ jancode ships with these tools (plus any discovered via [MCP servers](#mcp-model
 - `ssh_copy` — copy files with `scp`: `copy_to` (workspace → remote) and
   `copy_from` (remote → workspace), with `recursive` for directories. Local
   paths are workspace-confined; always approval-gated.
+- `download` — download a URL to a workspace file (binary-safe, streamed,
+  500 MB cap) with optional headers. Internal hosts must be listed in
+  `[tools] allowed_private_hosts`. Approval-gated (writes to the workspace).
+- `jenkins` — read Jenkins job info (`/api/json`), console log
+  (`/consoleText`), and artifact lists; download artifacts. Basic auth from
+  `JENKINS_API_TOKEN` + `JENKINS_USER` (or `token_env`/`user`); internal hosts
+  honor `[tools] allowed_private_hosts`. GET actions are ungated; artifact
+  download is gated.
 - `note` — persistent freeform notes in `.jancode-notes.md`
   (`create` / `append` / `show` / `clear`). Ungated; it only touches its own
   file.
@@ -371,8 +379,8 @@ consent before the daemon executes them:
   gate selectively: `git` mutating actions, `http_request` non-GET/HEAD
   methods, `docker` state-changing actions, non-read-only `sql` statements,
   `gh` mutating actions, `test` with a custom command, `sandbox`
-  create/run/copy/destroy actions, every `ssh` call, and every `ssh_copy`
-  transfer require approval.
+  create/run/copy/destroy actions, every `ssh` call, every `ssh_copy`
+  transfer, `download`, and `jenkins` artifact downloads require approval.
 
   **`bash` is gated when it escapes the workspace OR modifies files.** Because
   `bash` can read, search, or write anywhere on the host, jancode scans the

@@ -494,6 +494,8 @@ fn tool_arg_summary(name: &str, input: &serde_json::Value) -> String {
                 )
             }
         }
+        "download" => join_nonempty(&[arg("url"), &format!("-> {}", arg("path"))]),
+        "jenkins" => join_nonempty(&[arg("action"), arg("job")]),
         "git" => git_arg_summary(input),
         // Unknown (e.g. MCP) tools: show a truncated JSON dump of the arguments
         // so the call is still identifiable.

@@ -173,6 +173,12 @@ idle_timeout_secs = 300
 # max_tool_loops = 50
 # max_total_tool_calls = 75
 
+# Hosts/CIDRs the web tools (fetch_url/http_request/download/jenkins) may reach
+# even when they resolve to private/loopback addresses, e.g. an internal
+# Jenkins. Exact names, domain suffixes, or IPv4 CIDRs.
+# [tools]
+# allowed_private_hosts = ["192.168.5.0/24", "jenkins.local"]
+
 # Single-provider setup (legacy): use the `[provider]` table.
 [provider]
 base_url = "https://api.openai.com/v1"

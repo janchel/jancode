@@ -21,6 +21,19 @@ pub struct Config {
     pub mcp: McpConfig,
     #[serde(default)]
     pub database: DatabaseConfig,
+    #[serde(default)]
+    pub tools: ToolsConfig,
+}
+
+/// Tool-level settings that don't belong to a single tool.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ToolsConfig {
+    /// Hosts/CIDRs the web tools (`fetch_url`, `http_request`, `download`,
+    /// `jenkins`) may reach even though they resolve to private/loopback
+    /// addresses. Exact names (`jenkins.local`), suffixes (`internal`), or
+    /// IPv4 CIDRs (`192.168.5.0/24`).
+    #[serde(default)]
+    pub allowed_private_hosts: Vec<String>,
 }
 
 /// Optional database used by the `sql` tool. When a query runs without an
