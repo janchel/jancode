@@ -466,6 +466,14 @@ fn tool_arg_summary(name: &str, input: &serde_json::Value) -> String {
         "jq" => join_nonempty(&[arg("filter"), arg("path")]),
         "gh" => join_nonempty(&[arg("action"), arg("repo")]),
         "test" => arg("runner").to_string(),
+        "sandbox" => join_nonempty(&[
+            arg("action"),
+            if arg("image").is_empty() {
+                arg("sandbox")
+            } else {
+                arg("image")
+            },
+        ]),
         "git" => git_arg_summary(input),
         // Unknown (e.g. MCP) tools: show a truncated JSON dump of the arguments
         // so the call is still identifiable.

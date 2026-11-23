@@ -96,6 +96,7 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "jq",
     "gh",
     "test",
+    "sandbox",
 ];
 
 /// Resolve a path for a *writing* tool and enforce workspace confinement.
@@ -604,6 +605,7 @@ pub fn default_registry() -> ToolRegistry {
     r.register(JqTool);
     r.register(GhTool);
     r.register(TestTool);
+    r.register(SandboxTool);
     r
 }
 
@@ -3091,6 +3093,362 @@ impl Tool for TestTool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// sandbox
+// ---------------------------------------------------------------------------
+
+/// Ephemeral, resource-limited Docker sandboxes for the model to run commands
+/// and test configurations in. Containers get a unique name and a
+/// `jancode.sandbox` label, default to no network, dropped capabilities and
+/// memory/CPU/PID limits, and are force-removed after a one-shot `run` (or
+/// explicitly via `destroy`).
+pub struct SandboxTool;
+
+const SANDBOX_ACTIONS: &[&str] = &[
+    "run", "create", "exec", "copy_in", "copy_out", "destroy", "list",
+];
+
+/// Images the sandbox may pull when absent. Anything not listed must already
+/// exist locally (`--pull=never`), so the model can't fetch arbitrary images.
+const SANDBOX_IMAGE_ALLOWLIST: &[&str] = &[
+    "nginx",
+    "python",
+    "node",
+    "alpine",
+    "ubuntu",
+    "debian",
+    "postgres",
+    "redis",
+    "mysql",
+    "mariadb",
+    "busybox",
+    "curlimages/curl",
+    "golang",
+    "rust",
+    "openjdk",
+    "eclipse-temurin",
+    "httpd",
+    "traefik",
+    "caddy",
+    "memcached",
+    "rabbitmq",
+];
+
+fn sandbox_image_allowed(image: &str) -> bool {
+    let base = image.split('@').next().unwrap_or(image);
+    SANDBOX_IMAGE_ALLOWLIST.iter().any(|a| {
+        base == *a || base.starts_with(&format!("{}:", a)) || base.starts_with(&format!("{}/", a))
+    })
+}
+
+/// `--pull` policy: allow-listed images may be pulled; anything else must be
+/// present locally.
+fn sandbox_pull_policy(image: &str) -> &'static str {
+    if sandbox_image_allowed(image) {
+        "missing"
+    } else {
+        "never"
+    }
+}
+
+fn sandbox_name() -> String {
+    format!("jancode-sbx-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Hardening flags applied to every sandbox container.
+fn sandbox_flags(name: &str) -> Vec<String> {
+    vec![
+        "--name".into(),
+        name.to_string(),
+        "--label".into(),
+        format!("jancode.sandbox={}", name),
+        "--network".into(),
+        "none".into(),
+        "--memory".into(),
+        "512m".into(),
+        "--cpus".into(),
+        "1".into(),
+        "--pids-limit".into(),
+        "256".into(),
+        "--cap-drop".into(),
+        "ALL".into(),
+        "--security-opt".into(),
+        "no-new-privileges".into(),
+    ]
+}
+
+/// Parse a `host:container[:ro]` mount. Host paths are confined to the
+/// workspace; container paths must be absolute.
+fn parse_sandbox_mount(spec: &str, ctx: &ToolContext) -> Result<(String, String, bool)> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        anyhow::bail!("invalid mount '{}' (expected host:container[:ro])", spec);
+    }
+    let host = resolve_within(ctx, parts[0])?;
+    let container = parts[1];
+    if !container.starts_with('/') {
+        anyhow::bail!("invalid mount '{}': container path must be absolute", spec);
+    }
+    let ro = matches!(parts.get(2), Some(&"ro") | Some(&"r"));
+    Ok((host.display().to_string(), container.to_string(), ro))
+}
+
+fn sandbox_mount_args(mounts: &[String], ctx: &ToolContext) -> Result<Vec<String>> {
+    let mut args = Vec::new();
+    for m in mounts {
+        let (host, container, ro) = parse_sandbox_mount(m, ctx)?;
+        args.push("-v".into());
+        args.push(format!(
+            "{}:{}{}",
+            host,
+            container,
+            if ro { ":ro" } else { "" }
+        ));
+    }
+    Ok(args)
+}
+
+#[async_trait]
+impl Tool for SandboxTool {
+    fn name(&self) -> &str {
+        "sandbox"
+    }
+
+    fn description(&self) -> &str {
+        "Run commands in an ephemeral, isolated Docker container. Actions:\n\
+         - run: one-shot command; output returned, container removed\n\
+         - create: start a background sandbox; returns its id\n\
+         - exec: run a command inside an existing sandbox\n\
+         - copy_in: copy a workspace file/dir into the sandbox\n\
+         - copy_out: copy a sandbox file/dir into the workspace\n\
+         - destroy: remove a sandbox; list: list jancode sandboxes\n\
+         Containers have no network, dropped capabilities, and memory/CPU/PID\n\
+         limits. Only allow-listed images can be pulled; others must be local.\n\
+         State-changing actions require approval."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": SANDBOX_ACTIONS, "description": "Sandbox operation." },
+                "image": { "type": "string", "description": "Image for run/create." },
+                "sandbox": { "type": "string", "description": "Sandbox id/name for exec/copy_in/copy_out/destroy." },
+                "command": { "type": "string", "description": "Shell command for run/exec/create." },
+                "command_args": { "type": "array", "items": { "type": "string" }, "description": "Explicit argv for run/create/exec." },
+                "stdin": { "type": "string", "description": "Text fed to the command's stdin (run/exec)." },
+                "mounts": { "type": "array", "items": { "type": "string" }, "description": "Mounts 'host:container[:ro]' (run/create); host paths are confined to the workspace." },
+                "container_path": { "type": "string", "description": "Path inside the sandbox (copy_in/copy_out)." },
+                "path": { "type": "string", "description": "Host path (copy_in source, copy_out destination)." },
+                "timeout_secs": { "type": "integer", "description": "Timeout in seconds (default 120)." }
+            },
+            "required": ["action"]
+        })
+    }
+
+    async fn execute(&self, input: &Value, ctx: &ToolContext) -> Result<String> {
+        let action = input
+            .get("action")
+            .and_then(|v| v.as_str())
+            .context("missing 'action'")?;
+        let timeout = input
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(120);
+        let str_arg = |k: &str| {
+            input
+                .get(k)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        };
+        let argv_arg = |k: &str| -> Vec<String> {
+            input
+                .get(k)
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        match action {
+            "list" => run_cli(
+                "docker",
+                ctx,
+                vec![
+                    "ps".into(),
+                    "-a".into(),
+                    "--filter".into(),
+                    "label=jancode.sandbox".into(),
+                    "--format".into(),
+                    "{{.Names}}\t{{.Image}}\t{{.Status}}".into(),
+                ],
+                30,
+                &[],
+            )
+            .await
+            .map(|s| {
+                if s.trim().is_empty() {
+                    "(no jancode sandboxes)".to_string()
+                } else {
+                    s
+                }
+            }),
+            "run" => {
+                let image = str_arg("image")
+                    .context("sandbox run: missing 'image'")?
+                    .to_string();
+                let name = sandbox_name();
+                let mut args: Vec<String> = vec!["run".into(), "--rm".into()];
+                args.extend(sandbox_flags(&name));
+                args.push("--pull".into());
+                args.push(sandbox_pull_policy(&image).into());
+                // `-i` keeps stdin attached so the piped config/script is read.
+                if str_arg("stdin").is_some() {
+                    args.push("-i".into());
+                }
+                args.extend(sandbox_mount_args(&argv_arg("mounts"), ctx)?);
+                args.push(image.clone());
+
+                let mut cmd_args = argv_arg("command_args");
+                if cmd_args.is_empty() {
+                    match str_arg("command") {
+                        Some(c) => cmd_args = vec!["sh".into(), "-lc".into(), c.to_string()],
+                        None => {
+                            return Ok("sandbox run: need 'command' or 'command_args'".to_string())
+                        }
+                    }
+                }
+                args.extend(cmd_args);
+
+                let result = match str_arg("stdin") {
+                    Some(data) => run_cli_with_stdin("docker", ctx, args, data, timeout, &[]).await,
+                    None => run_cli("docker", ctx, args, timeout, &[]).await,
+                };
+                // Always try to remove the sandbox, even on timeout/error.
+                let _ = run_cli(
+                    "docker",
+                    ctx,
+                    vec!["rm".into(), "-f".into(), name.clone()],
+                    30,
+                    &[],
+                )
+                .await;
+                result
+            }
+            "create" => {
+                let image = str_arg("image")
+                    .context("sandbox create: missing 'image'")?
+                    .to_string();
+                let name = sandbox_name();
+                let mut args: Vec<String> = vec!["run".into(), "-d".into()];
+                args.extend(sandbox_flags(&name));
+                args.push("--pull".into());
+                args.push(sandbox_pull_policy(&image).into());
+                args.extend(sandbox_mount_args(&argv_arg("mounts"), ctx)?);
+                args.push(image.clone());
+
+                let cmd_args = argv_arg("command_args");
+                if !cmd_args.is_empty() {
+                    args.extend(cmd_args);
+                } else if let Some(c) = str_arg("command") {
+                    args.push("sh".into());
+                    args.push("-lc".into());
+                    args.push(c.to_string());
+                }
+
+                let output = run_cli("docker", ctx, args, timeout, &[]).await?;
+                Ok(format!("sandbox {} (image {})\n{}", name, image, output))
+            }
+            "exec" => {
+                let name = str_arg("sandbox")
+                    .context("sandbox exec: missing 'sandbox'")?
+                    .to_string();
+                let mut args: Vec<String> = vec!["exec".into()];
+                if str_arg("stdin").is_some() {
+                    args.push("-i".into());
+                }
+                args.push(name);
+                let cmd_args = argv_arg("command_args");
+                if !cmd_args.is_empty() {
+                    args.extend(cmd_args);
+                } else if let Some(c) = str_arg("command") {
+                    args.push("sh".into());
+                    args.push("-lc".into());
+                    args.push(c.to_string());
+                } else {
+                    return Ok("sandbox exec: need 'command' or 'command_args'".to_string());
+                }
+                match str_arg("stdin") {
+                    Some(data) => run_cli_with_stdin("docker", ctx, args, data, timeout, &[]).await,
+                    None => run_cli("docker", ctx, args, timeout, &[]).await,
+                }
+            }
+            "copy_in" => {
+                let name = str_arg("sandbox")
+                    .context("sandbox copy_in: missing 'sandbox'")?
+                    .to_string();
+                let src = str_arg("path")
+                    .context("sandbox copy_in: missing 'path'")?
+                    .to_string();
+                let host = resolve_within(ctx, &src)?;
+                let container_path = str_arg("container_path").unwrap_or("/");
+                run_cli(
+                    "docker",
+                    ctx,
+                    vec![
+                        "cp".into(),
+                        host.display().to_string(),
+                        format!("{}:{}", name, container_path),
+                    ],
+                    60,
+                    &[],
+                )
+                .await
+            }
+            "copy_out" => {
+                let name = str_arg("sandbox")
+                    .context("sandbox copy_out: missing 'sandbox'")?
+                    .to_string();
+                let container_path = str_arg("container_path")
+                    .context("sandbox copy_out: missing 'container_path'")?;
+                let dest = str_arg("path")
+                    .context("sandbox copy_out: missing 'path'")?
+                    .to_string();
+                let host = resolve_within(ctx, &dest)?;
+                if let Some(parent) = host.parent() {
+                    tokio::fs::create_dir_all(parent).await.ok();
+                }
+                run_cli(
+                    "docker",
+                    ctx,
+                    vec![
+                        "cp".into(),
+                        format!("{}:{}", name, container_path),
+                        host.display().to_string(),
+                    ],
+                    60,
+                    &[],
+                )
+                .await
+            }
+            "destroy" => {
+                let name = str_arg("sandbox")
+                    .context("sandbox destroy: missing 'sandbox'")?
+                    .to_string();
+                run_cli("docker", ctx, vec!["rm".into(), "-f".into(), name], 30, &[]).await
+            }
+            other => Ok(format!(
+                "sandbox: unknown action '{}' (available: {})",
+                other,
+                SANDBOX_ACTIONS.join(", ")
+            )),
+        }
+    }
+}
+
 fn parse_mysql_url(url: &str) -> Option<(String, String, String, String)> {
     let rest = url.strip_prefix("mysql://")?;
     let (auth, hostport) = match rest.split_once('@') {
@@ -3574,6 +3932,55 @@ mod tests {
         let s = summarize_test_output("test result: ok. 3 passed; 0 failed\n");
         assert!(!s.contains("FAILING:"));
         assert!(s.contains("test result: ok"));
+    }
+
+    #[test]
+    fn sandbox_image_policy() {
+        assert!(sandbox_image_allowed("nginx"));
+        assert!(sandbox_image_allowed("nginx:1.27"));
+        assert!(sandbox_image_allowed("python:3.12-alpine"));
+        assert!(sandbox_image_allowed("curlimages/curl:8"));
+        assert!(!sandbox_image_allowed("evil.example.com/x"));
+        assert_eq!(sandbox_pull_policy("nginx:1.27"), "missing");
+        assert_eq!(sandbox_pull_policy("puppetterm:latest"), "never");
+    }
+
+    #[test]
+    fn sandbox_mount_parsing_confines_host() {
+        let ctx = ToolContext::new(
+            Path::new("/work/proj").to_path_buf(),
+            String::new(),
+            "basic".to_string(),
+        );
+        let (host, container, ro) =
+            parse_sandbox_mount("nginx.conf:/etc/nginx/nginx.conf:ro", &ctx).unwrap();
+        assert_eq!(host, "/work/proj/nginx.conf");
+        assert_eq!(container, "/etc/nginx/nginx.conf");
+        assert!(ro);
+        assert!(parse_sandbox_mount("../x:/x", &ctx).is_err());
+        assert!(parse_sandbox_mount("x:rel/path", &ctx).is_err());
+        assert!(parse_sandbox_mount("bad", &ctx).is_err());
+    }
+
+    #[test]
+    fn sandbox_flags_are_hardened() {
+        let flags = sandbox_flags("jancode-sbx-x");
+        let joined = flags.join(" ");
+        for expected in [
+            "--network none",
+            "--cap-drop ALL",
+            "--memory 512m",
+            "--cpus 1",
+            "--pids-limit 256",
+            "no-new-privileges",
+        ] {
+            assert!(
+                joined.contains(expected),
+                "missing {} in {}",
+                expected,
+                joined
+            );
+        }
     }
 
     #[test]

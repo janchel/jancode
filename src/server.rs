@@ -710,6 +710,20 @@ fn gate_tool(name: &str, input: &Value, ctx: &ToolContext) -> Option<ApprovalGat
                 None
             }
         }
+        "sandbox" => {
+            // `exec` stays inside an already-hardened, network-isolated
+            // container; creating, feeding, extracting, or removing a sandbox
+            // is gated.
+            let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            if matches!(action, "list" | "exec") {
+                None
+            } else {
+                Some(ApprovalGate {
+                    path: None,
+                    reason: format!("sandbox {}", action),
+                })
+            }
+        }
         _ => None,
     }
 }
@@ -2666,6 +2680,33 @@ mod tests {
         assert!(gate_tool(
             "test",
             &serde_json::json!({"runner": "custom", "args": ["make", "test"]}),
+            &ctx
+        )
+        .is_some());
+
+        // sandbox: list/exec ungated; create/run/copy/destroy gated.
+        assert!(gate_tool("sandbox", &serde_json::json!({"action": "list"}), &ctx).is_none());
+        assert!(gate_tool(
+            "sandbox",
+            &serde_json::json!({"action": "exec", "sandbox": "x", "command": "ls"}),
+            &ctx
+        )
+        .is_none());
+        assert!(gate_tool(
+            "sandbox",
+            &serde_json::json!({"action": "run", "image": "nginx", "command": "nginx -t"}),
+            &ctx
+        )
+        .is_some());
+        assert!(gate_tool(
+            "sandbox",
+            &serde_json::json!({"action": "create", "image": "nginx"}),
+            &ctx
+        )
+        .is_some());
+        assert!(gate_tool(
+            "sandbox",
+            &serde_json::json!({"action": "destroy", "sandbox": "x"}),
             &ctx
         )
         .is_some());

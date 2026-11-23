@@ -313,6 +313,13 @@ jancode ships with these tools (plus any discovered via [MCP servers](#mcp-model
   `pytest`, `go`, or a `custom` command) and return a condensed summary
   (failing tests + tail) instead of raw output. Known runners are ungated;
   `custom` requires approval.
+- `sandbox` — run commands in an ephemeral, isolated Docker container:
+  `run` (one-shot, auto-removed), plus `create` / `exec` / `copy_in` /
+  `copy_out` / `destroy` / `list` for a multi-step sandbox. Containers get no
+  network, dropped capabilities, and memory/CPU/PID limits; only allow-listed
+  images can be pulled, anything else must already be local. Host paths for
+  mounts/copies are confined to the workspace. `create`/`run`/`copy_in`/
+  `copy_out`/`destroy` require approval; `list`/`exec` run freely.
 - `note` — persistent freeform notes in `.jancode-notes.md`
   (`create` / `append` / `show` / `clear`). Ungated; it only touches its own
   file.
@@ -349,7 +356,8 @@ consent before the daemon executes them:
   touch their own bookkeeping files, and `fetch_url` only reads. Other tools
   gate selectively: `git` mutating actions, `http_request` non-GET/HEAD
   methods, `docker` state-changing actions, non-read-only `sql` statements,
-  `gh` mutating actions, and `test` with a custom command all require approval.
+  `gh` mutating actions, `test` with a custom command, and `sandbox`
+  create/run/copy/destroy actions all require approval.
 
   **`bash` is gated when it escapes the workspace OR modifies files.** Because
   `bash` can read, search, or write anywhere on the host, jancode scans the
