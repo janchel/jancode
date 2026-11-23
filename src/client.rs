@@ -501,6 +501,76 @@ fn tool_arg_summary(name: &str, input: &serde_json::Value) -> String {
     }
 }
 
+/// Format an epoch-millis timestamp for export/search output.
+fn fmt_epoch_ms(ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+        .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// Render a stored session as Markdown (`/export`).
+fn render_session_markdown(s: &crate::storage::Session) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# jancode session {}\n\n", s.id));
+    out.push_str(&format!("- title: {}\n", s.title));
+    out.push_str(&format!("- model: {}\n", s.model));
+    out.push_str(&format!("- working dir: {}\n", s.working_dir));
+    out.push_str(&format!("- created: {}\n", fmt_epoch_ms(s.created_at_ms)));
+    out.push_str(&format!("- updated: {}\n", fmt_epoch_ms(s.updated_at_ms)));
+    out.push_str(&format!("- messages: {}\n\n", s.messages.len()));
+    for m in &s.messages {
+        out.push_str(&format!(
+            "## {} ({})\n\n",
+            m.role,
+            fmt_epoch_ms(m.timestamp_ms)
+        ));
+        if !m.content.is_empty() {
+            out.push_str(&m.content);
+            out.push_str("\n\n");
+        }
+        if let Some(calls) = &m.tool_calls {
+            for c in calls {
+                out.push_str(&format!("[tool] {}{}\n", c.name, c.arguments));
+            }
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// A short single-line snippet around the first case-insensitive match.
+fn search_snippet(text: &str, query: &str, radius: usize) -> String {
+    let lower = text.to_lowercase();
+    let ql = query.to_lowercase();
+    let (start, end) = match lower.find(&ql) {
+        Some(pos) => {
+            let start = pos.saturating_sub(radius);
+            let end = (pos + ql.len() + radius).min(text.len());
+            (start, end)
+        }
+        None => (0, text.len().min(radius * 2)),
+    };
+    let mut start = start;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut end = end;
+    while end < text.len() && !text.is_char_boundary(end) {
+        end += 1;
+    }
+    text[start..end.max(start)].replace('\n', " ")
+}
+
+/// Case-insensitive matches in a session's message contents.
+fn session_matches(s: &crate::storage::Session, query: &str) -> Vec<String> {
+    let ql = query.to_lowercase();
+    s.messages
+        .iter()
+        .filter(|m| m.content.to_lowercase().contains(&ql))
+        .map(|m| m.content.clone())
+        .collect()
+}
+
 /// Join the non-empty parts of a summary with a space.
 fn join_nonempty(parts: &[&str]) -> String {
     parts
@@ -1356,6 +1426,89 @@ pub async fn connect() -> Result<()> {
             }
             continue;
         }
+        if input == "/export" || input.starts_with("/export ") {
+            let rest = input.strip_prefix("/export").unwrap_or("").trim();
+            let mut parts = rest.split_whitespace();
+            let first = parts.next();
+            let second = parts.next();
+            // `/export [number] [path]`; without a number, export the current
+            // session to `./jancode-session-<id>.md`.
+            let (session, path) = match first.and_then(|s| s.parse::<usize>().ok()) {
+                Some(n) if n >= 1 => {
+                    if sessions_cache.is_empty() {
+                        println!("no session list; run /session first");
+                        continue;
+                    }
+                    match sessions_cache.get(n - 1) {
+                        Some(s) => (s.clone(), second.map(|p| p.to_string())),
+                        None => {
+                            println!("no session at number {}", n);
+                            continue;
+                        }
+                    }
+                }
+                _ => {
+                    let id = match session_id.as_deref() {
+                        Some(id) if !id.is_empty() => id.to_string(),
+                        _ => {
+                            println!("no current session to export");
+                            continue;
+                        }
+                    };
+                    match crate::storage::load_session(&id).await {
+                        Ok(Some(s)) => (s, first.map(|p| p.to_string())),
+                        Ok(None) | Err(_) => {
+                            println!("could not load session {}", id);
+                            continue;
+                        }
+                    }
+                }
+            };
+            let path = path.unwrap_or_else(|| format!("jancode-session-{}.md", session.id));
+            match std::fs::write(&path, render_session_markdown(&session)) {
+                Ok(_) => println!("exported {} messages to {}", session.messages.len(), path),
+                Err(e) => println!("export failed: {}", e),
+            }
+            continue;
+        }
+        if input == "/search" || input.starts_with("/search ") {
+            let query = input
+                .strip_prefix("/search")
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if query.is_empty() {
+                println!("usage: /search <text>");
+                continue;
+            }
+            let all = crate::storage::list_sessions().await.unwrap_or_default();
+            let mut shown = 0;
+            for s in &all {
+                let hits = session_matches(s, &query);
+                if hits.is_empty() {
+                    continue;
+                }
+                println!(
+                    "session {} | {} | {} | {}",
+                    s.id,
+                    s.title,
+                    s.working_dir,
+                    fmt_epoch_ms(s.updated_at_ms)
+                );
+                for h in hits.iter().take(5) {
+                    println!("  …{}…", search_snippet(h, &query, 60));
+                    shown += 1;
+                }
+                if shown >= 25 {
+                    println!("(more matches truncated)");
+                    break;
+                }
+            }
+            if shown == 0 {
+                println!("no matches for '{}'", query);
+            }
+            continue;
+        }
         if input == "/memory" {
             let cwd = std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
@@ -1426,7 +1579,7 @@ pub async fn connect() -> Result<()> {
             continue;
         }
         if input == "/help" {
-            println!("Available commands: /quit, /exit, /q (quit), /tools (toggle tool calling), /model (list models and switch), /provider (list/switch providers), /diff (show modified lines via git diff), /mcp (list MCP servers / send with MCP tools), /mcp_tools (list tools exposed by MCP servers), /mcp_status (MCP server connection status), /mcp_reconnect (reload config + reconnect MCP servers), /session (list sessions), /resume <number>, /memory (list memories), /forget <number>, /help (Ctrl+C cancels the running request; Ctrl+D quits)");
+            println!("Available commands: /quit, /exit, /q (quit), /tools (toggle tool calling), /model (list models and switch), /provider (list/switch providers), /diff (show modified lines via git diff), /mcp (list MCP servers / send with MCP tools), /mcp_tools (list tools exposed by MCP servers), /mcp_status (MCP server connection status), /mcp_reconnect (reload config + reconnect MCP servers), /session (list sessions), /resume <number>, /export [number] [path] (write a session as Markdown), /search <text> (find matches across sessions), /memory (list memories), /forget <number>, /help (Ctrl+C cancels the running request; Ctrl+D quits)");
             continue;
         }
         // Drain any queued Ctrl+C first so a stray keypress while idle can't
@@ -2172,5 +2325,64 @@ mod tests {
                 .count(),
             80
         );
+    }
+
+    fn sample_session() -> crate::storage::Session {
+        crate::storage::Session {
+            id: "s1".to_string(),
+            title: "test".to_string(),
+            working_dir: "/w".to_string(),
+            model: "m".to_string(),
+            messages: vec![
+                crate::storage::Message {
+                    role: "user".to_string(),
+                    content: "hello world".to_string(),
+                    timestamp_ms: 0,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                crate::storage::Message {
+                    role: "assistant".to_string(),
+                    content: "hi there".to_string(),
+                    timestamp_ms: 0,
+                    tool_calls: Some(vec![crate::storage::StoredToolCall {
+                        id: "1".to_string(),
+                        name: "read".to_string(),
+                        arguments: "{\"path\":\"x\"}".to_string(),
+                    }]),
+                    tool_call_id: None,
+                },
+            ],
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            approved_paths: Default::default(),
+            is_swarm_member: false,
+            parent_session_id: None,
+            is_headless: false,
+        }
+    }
+
+    #[test]
+    fn export_markdown_contains_messages_and_tool_calls() {
+        let md = render_session_markdown(&sample_session());
+        assert!(md.contains("# jancode session s1"));
+        assert!(md.contains("hello world"));
+        assert!(md.contains("[tool] read"));
+        assert!(md.contains("{\"path\":\"x\"}"));
+    }
+
+    #[test]
+    fn search_snippet_centers_on_match() {
+        let s = search_snippet("0123456789MATCH0123456789", "match", 4);
+        assert!(s.contains("MATCH"));
+        assert!(s.contains("6789"));
+        assert!(s.contains("0123"));
+    }
+
+    #[test]
+    fn session_matches_is_case_insensitive() {
+        let s = sample_session();
+        assert_eq!(session_matches(&s, "HELLO").len(), 1);
+        assert!(session_matches(&s, "nope").is_empty());
     }
 }
