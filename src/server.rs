@@ -1,13 +1,16 @@
 use crate::config::runtime_dir;
 use crate::protocol::{Event, Request};
-use crate::storage::{list_sessions, save_session, Session, Message};
+use crate::storage::{Message, Session};
 use crate::swarm::{self, Interrupt, SwarmState};
-use crate::tools::{is_outside, ToolContext};
+use crate::tools::{is_outside, patch_paths, ToolContext};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::path::Path;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::RwLock;
@@ -35,11 +38,32 @@ pub async fn run() -> Result<()> {
     let cfg = crate::config::load()?;
     let runtime = runtime_dir();
     std::fs::create_dir_all(&runtime).context("creating runtime dir")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700));
+    }
     let socket_path = runtime.join("jancode.sock");
     if socket_path.exists() {
+        // Never unlink a socket another live daemon is listening on: that
+        // would steal its name and leave the old daemon on an unlinked inode.
+        if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+            anyhow::bail!(
+                "jancode daemon already running at {}",
+                socket_path.display()
+            );
+        }
         std::fs::remove_file(&socket_path).context("removing stale socket")?;
     }
     let listener = tokio::net::UnixListener::bind(&socket_path).context("binding unix socket")?;
+    // Owner-only socket: the protocol has no authentication, so file
+    // permissions are the only thing stopping other local users from driving
+    // the agent or reading session history.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600));
+    }
     info!("jancode daemon listening on {}", socket_path.display());
 
     let sessions: SessionMap = Arc::new(RwLock::new(HashMap::new()));
@@ -49,14 +73,20 @@ pub async fn run() -> Result<()> {
 
     // Reconstruct the swarm roster from persisted sessions so spawned agents
     // survive daemon restarts (jancode reloads swarm state from disk).
-    let swarm: SharedSwarm = Arc::new(RwLock::new(SwarmState::new("default".to_string())));
+    let swarm: SharedSwarm = Arc::new(RwLock::new(SwarmState::new()));
     {
         let mut sw = swarm.write().await;
         let live = sessions.read().await;
         for s in live.values() {
-            let is_headless = s.title.starts_with("agent-");
-            let parent = s.title.strip_prefix("agent-").map(|p| p.to_string());
-            let member = swarm::make_member(&s.id, None, parent, is_headless);
+            // Members are persisted on the session. Legacy sessions created
+            // before that field existed are recovered from their title, but
+            // without a parent link (so they remain stoppable).
+            let legacy_agent = s.title.starts_with("agent-");
+            if !s.is_swarm_member && !legacy_agent {
+                continue;
+            }
+            let is_headless = s.is_headless || legacy_agent;
+            let member = swarm::make_member(&s.id, None, s.parent_session_id.clone(), is_headless);
             sw.register_member(member);
         }
     }
@@ -67,35 +97,47 @@ pub async fn run() -> Result<()> {
     let session_clients: SessionClients = Arc::new(RwLock::new(HashMap::new()));
     let active_clients: ActiveClients = Arc::new(AtomicUsize::new(0));
     let idle_secs = cfg.server.idle_timeout_secs;
+    let shutdown = Arc::new(tokio::sync::Notify::new());
     if idle_secs > 0 {
         let watcher = active_clients.clone();
+        let shutdown = shutdown.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(idle_secs)).await;
                 if watcher.load(Ordering::SeqCst) == 0 {
                     info!("idle timeout reached ({}s), shutting down", idle_secs);
-                    std::process::exit(0);
+                    shutdown.notify_one();
+                    return;
                 }
             }
         });
     }
 
     loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let sessions = sessions.clone();
-                let swarm = swarm.clone();
-                let session_clients = session_clients.clone();
-                let active = active_clients.clone();
-                active.fetch_add(1, Ordering::SeqCst);
-                tokio::spawn(async move {
-                    let _ = handle_client(stream, sessions, swarm, session_clients).await;
-                    active.fetch_sub(1, Ordering::SeqCst);
-                });
+        tokio::select! {
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, _)) => {
+                        let sessions = sessions.clone();
+                        let swarm = swarm.clone();
+                        let session_clients = session_clients.clone();
+                        let active = active_clients.clone();
+                        active.fetch_add(1, Ordering::SeqCst);
+                        tokio::spawn(async move {
+                            let _ = handle_client(stream, sessions, swarm, session_clients).await;
+                            active.fetch_sub(1, Ordering::SeqCst);
+                        });
+                    }
+                    Err(e) => error!("accept error: {}", e),
+                }
             }
-            Err(e) => error!("accept error: {}", e),
+            _ = shutdown.notified() => {
+                info!("idle timeout reached, shutting down");
+                break;
+            }
         }
     }
+    Ok(())
 }
 
 /// Reload the config from disk, falling back to the cached copy if the on-disk
@@ -155,30 +197,46 @@ async fn handle_client(
                 let servers = crate::mcp::probe(&live_cfg).await;
                 send(&w, &Event::McpInfo { id, servers }).await?;
             }
-            Request::GetHistory { id, session_id: _ } => {
-                let msgs: Vec<crate::protocol::Message> = {
-                    let s = sessions.read().await;
-                    s.values()
-                        .flat_map(|entry| entry.messages.clone())
-                        .map(|m| crate::protocol::Message {
-                            role: m.role,
-                            content: m.content,
-                        })
-                        .collect()
+            Request::GetHistory { id, session_id } => {
+                // Honor `session_id`: returning every session's messages would
+                // leak other workspaces' transcripts to any connected client.
+                let msgs: Vec<crate::protocol::Message> = match session_id {
+                    Some(sid) => {
+                        let s = sessions.read().await;
+                        s.get(&sid)
+                            .map(|entry| {
+                                entry
+                                    .messages
+                                    .iter()
+                                    .map(|m| crate::protocol::Message {
+                                        role: m.role.clone(),
+                                        content: m.content.clone(),
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    }
+                    None => Vec::new(),
                 };
-                send(
-                    &w,
-                    &Event::History {
-                        id,
-                        messages: msgs,
-                    },
-                )
-                .await?;
+                send(&w, &Event::History { id, messages: msgs }).await?;
             }
-            Request::Message { id, session_id, content, tools, mcp, model, provider, cwd, interactive } => {
+            Request::Message {
+                id,
+                session_id,
+                content,
+                tools,
+                mcp,
+                model,
+                provider,
+                cwd,
+                interactive,
+            } => {
                 let session_id_s = session_id.unwrap_or_else(|| format!("session-{}", id));
                 let working_dir = cwd.clone().unwrap_or_else(|| {
-                    std::env::current_dir().unwrap_or_default().to_string_lossy().to_string()
+                    std::env::current_dir()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string()
                 });
 
                 // An interactive client is a human-attached swarm member: it can
@@ -197,6 +255,21 @@ async fn handle_client(
                             sw.register_member(member);
                         }
                     }
+                    // Persist membership so the roster survives a restart.
+                    let snapshot = {
+                        let mut map = sessions.write().await;
+                        match map.get_mut(&session_id_s) {
+                            Some(entry) => {
+                                entry.is_swarm_member = true;
+                                entry.is_headless = false;
+                                Some(entry.clone())
+                            }
+                            None => None,
+                        }
+                    };
+                    if let Some(snap) = snapshot {
+                        let _ = crate::storage::save_session(&snap).await;
+                    }
                     if let Some(m) = &mirror {
                         session_clients
                             .write()
@@ -209,6 +282,11 @@ async fn handle_client(
                 let enable_tools = tools.is_some();
                 let tool_registry = if enable_tools {
                     let mut reg = crate::tools::default_registry();
+                    // Honor the client's requested names: the allow-list is part
+                    // of the protocol, not decoration.
+                    if let Some(names) = &tools {
+                        reg.retain_names(names);
+                    }
                     // MCP tools are opt-in per turn (client sets `mcp: true` for
                     // `/mcp <message>`). Ordinary turns skip them entirely so a
                     // slow/down MCP server can't add latency to every message.
@@ -231,12 +309,17 @@ async fn handle_client(
                         title: format!("session-{}", id),
                         working_dir: working_dir.clone(),
                         model: model.clone().unwrap_or_else(|| {
-                            crate::config::resolve_provider(cfg.as_ref(), provider.as_deref()).default_model.clone()
+                            crate::config::resolve_provider(cfg.as_ref(), provider.as_deref())
+                                .default_model
+                                .clone()
                         }),
                         messages: Vec::new(),
                         created_at_ms: chrono::Utc::now().timestamp_millis(),
                         updated_at_ms: chrono::Utc::now().timestamp_millis(),
                         approved_paths: HashSet::new(),
+                        is_swarm_member: false,
+                        parent_session_id: None,
+                        is_headless: false,
                     });
                     if let Some(ref m) = model {
                         entry.model = m.clone();
@@ -252,10 +335,17 @@ async fn handle_client(
                 }
 
                 // Automatically remember durable facts the user mentions.
-                let _ = crate::memory::auto_capture(&content, &working_dir);
+                let _ = crate::memory::auto_capture(&content, &working_dir).await;
 
                 send(&w, &Event::Ack { id }).await?;
-                send(&w, &Event::Status { id: Some(id), message: "Thinking...".to_string() }).await?;
+                send(
+                    &w,
+                    &Event::Status {
+                        id: Some(id),
+                        message: "Thinking...".to_string(),
+                    },
+                )
+                .await?;
 
                 // Spawn the turn as its own task so the read loop stays free to
                 // accept `Request::Cancel` (aborts this turn) and
@@ -268,7 +358,7 @@ async fn handle_client(
                 let turn_in_flight = in_flight.clone();
                 let turn_cfg = cfg.clone();
                 let handle = tokio::spawn(async move {
-                    match handle_message_turn(
+                    if let Err(e) = handle_message_turn(
                         &turn_w,
                         turn_sessions,
                         &turn_approvals,
@@ -283,11 +373,15 @@ async fn handle_client(
                     )
                     .await
                     {
-                        Err(e) => {
-                            let _ = send(&turn_w, &Event::Error { id: Some(id), message: e.to_string() }).await;
-                            let _ = send(&turn_w, &Event::Done { id: Some(id) }).await;
-                        }
-                        Ok(()) => {}
+                        let _ = send(
+                            &turn_w,
+                            &Event::Error {
+                                id: Some(id),
+                                message: e.to_string(),
+                            },
+                        )
+                        .await;
+                        let _ = send(&turn_w, &Event::Done { id: Some(id) }).await;
                     }
                     turn_in_flight.write().await.remove(&id);
                 });
@@ -300,7 +394,12 @@ async fn handle_client(
                     let _ = send(&w, &Event::Done { id: Some(id) }).await;
                 }
             }
-            Request::ApprovalResponse { id, tool_call_id, approved, .. } => {
+            Request::ApprovalResponse {
+                id,
+                tool_call_id,
+                approved,
+                ..
+            } => {
                 let key = format!("{}:{}", id, tool_call_id);
                 if let Some(tx) = approvals.write().await.remove(&key) {
                     let _ = tx.send(approved);
@@ -317,8 +416,16 @@ async fn handle_client(
                 label,
             } => {
                 handle_swarm_spawn(
-                    &w, id, &sessions, &swarm, &session_clients, parent_session_id,
-                    &initial_message, model.as_deref(), provider.as_deref(), label.as_deref(),
+                    &w,
+                    id,
+                    &sessions,
+                    &swarm,
+                    &session_clients,
+                    parent_session_id,
+                    &initial_message,
+                    model.as_deref(),
+                    provider.as_deref(),
+                    label.as_deref(),
                 )
                 .await?;
             }
@@ -329,8 +436,12 @@ async fn handle_client(
                 message,
             } => {
                 handle_swarm_dm(
-                    &w, &swarm, &session_clients, from_session_id.as_deref(),
-                    &to_session_id, &message,
+                    &w,
+                    &swarm,
+                    &session_clients,
+                    from_session_id.as_deref(),
+                    &to_session_id,
+                    &message,
                 )
                 .await?;
             }
@@ -340,7 +451,11 @@ async fn handle_client(
                 message,
             } => {
                 handle_swarm_broadcast(
-                    &w, &swarm, &session_clients, from_session_id.as_deref(), &message,
+                    &w,
+                    &swarm,
+                    &session_clients,
+                    from_session_id.as_deref(),
+                    &message,
                 )
                 .await?;
             }
@@ -349,7 +464,7 @@ async fn handle_client(
                 session_id,
                 force,
             } => {
-                handle_swarm_stop(&w, &swarm, id, &session_id, force).await?;
+                handle_swarm_stop(&w, &sessions, &swarm, id, &session_id, force).await?;
             }
             Request::SwarmStatus { id, session_id } => {
                 handle_swarm_status(&w, &swarm, id, session_id.as_deref()).await?;
@@ -386,13 +501,21 @@ fn gate_tool(name: &str, input: &Value, ctx: &ToolContext) -> Option<ApprovalGat
     match name {
         "fetch_url" => None,
         "http_request" => {
-            let method = input.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_uppercase();
+            let method = input
+                .get("method")
+                .and_then(|v| v.as_str())
+                .unwrap_or("GET")
+                .to_uppercase();
             if matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") {
                 None
             } else {
                 Some(ApprovalGate {
                     path: None,
-                    reason: format!("HTTP {} to {}", method, input.get("url").and_then(|v| v.as_str()).unwrap_or("<url>")),
+                    reason: format!(
+                        "HTTP {} to {}",
+                        method,
+                        input.get("url").and_then(|v| v.as_str()).unwrap_or("<url>")
+                    ),
                 })
             }
         }
@@ -416,15 +539,30 @@ fn gate_tool(name: &str, input: &Value, ctx: &ToolContext) -> Option<ApprovalGat
         }
         "sql" => {
             let query = input.get("query").and_then(|v| v.as_str()).unwrap_or("");
-            if crate::tools::sql_is_read_only(query) {
-                None
-            } else {
+            if !crate::tools::sql_is_read_only(query) {
                 let preview: String = query.chars().take(60).collect();
-                Some(ApprovalGate {
+                return Some(ApprovalGate {
                     path: None,
                     reason: format!("run SQL: {}", preview),
-                })
+                });
             }
+            // A read-only query can still read an arbitrary sqlite file; gate
+            // when it resolves outside the workspace.
+            let db = input.get("db").and_then(|v| v.as_str()).unwrap_or("");
+            let is_url = db.starts_with("postgres://")
+                || db.starts_with("postgresql://")
+                || db.starts_with("mysql://");
+            if !db.is_empty() && !is_url {
+                let path = db.strip_prefix("sqlite:").unwrap_or(db);
+                let full = ctx.resolve_path(path);
+                if is_outside(&ctx.working_dir, &full) {
+                    return Some(ApprovalGate {
+                        path: Some(full.display().to_string()),
+                        reason: format!("read database outside workspace ({})", full.display()),
+                    });
+                }
+            }
+            None
         }
         "git" => {
             // Read-only git actions never need approval; anything that mutates
@@ -480,10 +618,17 @@ fn gate_tool(name: &str, input: &Value, ctx: &ToolContext) -> Option<ApprovalGat
                 reason: format!("modify file {}", full.display()),
             })
         }
-        "apply_patch" => Some(ApprovalGate {
-            path: None,
-            reason: "apply a multi-file patch".to_string(),
-        }),
+        "apply_patch" => {
+            // Show the files the patch touches so the approval is meaningful
+            // (and so a `../../` escape is visible before the tool runs).
+            let paths = patch_paths(input.get("patch").and_then(|v| v.as_str()).unwrap_or(""));
+            let reason = if paths.is_empty() {
+                "apply a multi-file patch".to_string()
+            } else {
+                format!("apply a multi-file patch ({})", paths.join(", "))
+            };
+            Some(ApprovalGate { path: None, reason })
+        }
         "read" | "list_dir" | "glob" | "agentgrep" => {
             let p = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
             let full = ctx.resolve_path(p);
@@ -513,28 +658,79 @@ fn gate_tool(name: &str, input: &Value, ctx: &ToolContext) -> Option<ApprovalGat
             // `..`, `~`, `$HOME`, `cd` out of the workspace). The
             // `[server] bash_gate` config controls how aggressive this is.
             let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            crate::tools::bash_escapes_workspace(command, &ctx.working_dir, &ctx.bash_gate).map(|reason| {
-                ApprovalGate {
+            crate::tools::bash_escapes_workspace(command, &ctx.working_dir, &ctx.bash_gate).map(
+                |reason| ApprovalGate {
                     path: None,
                     reason: format!("bash may touch outside workspace: {}", reason),
+                },
+            )
+        }
+        "jq" => {
+            // Read-only, but the file can resolve outside the workspace.
+            let p = input
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if p.is_empty() {
+                None
+            } else {
+                let full = ctx.resolve_path(&p);
+                if is_outside(&ctx.working_dir, &full) {
+                    Some(ApprovalGate {
+                        path: Some(full.display().to_string()),
+                        reason: format!("read JSON outside workspace ({})", full.display()),
+                    })
+                } else {
+                    None
                 }
-            })
+            }
+        }
+        "gh" => {
+            let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            if crate::tools::gh_is_mutating(action) {
+                Some(ApprovalGate {
+                    path: None,
+                    reason: format!("gh {}", action),
+                })
+            } else {
+                None
+            }
+        }
+        "test" => {
+            // Known test runners are read-only-ish dev actions (like
+            // `cargo test` through bash); a custom command can do anything.
+            let runner = input.get("runner").and_then(|v| v.as_str()).unwrap_or("");
+            if runner == "custom" {
+                Some(ApprovalGate {
+                    path: None,
+                    reason: "run a custom test command".to_string(),
+                })
+            } else {
+                None
+            }
         }
         _ => None,
-}
     }
+}
 
 /// Normalize a path string for use as a cache key.
 /// Handles variations like "index.html", "./index.html", "dir/../index.html"
 /// by resolving to a canonical form without touching the filesystem.
 fn normalize_path_key(path: &str) -> String {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     let is_absolute = Path::new(path).is_absolute();
     let mut components = Vec::new();
     for comp in Path::new(path).components() {
         match comp {
-            std::path::Component::Normal(name) => components.push(name.to_string_lossy().into_owned()),
-            std::path::Component::ParentDir => { if !components.is_empty() { components.pop(); } }
+            std::path::Component::Normal(name) => {
+                components.push(name.to_string_lossy().into_owned())
+            }
+            std::path::Component::ParentDir => {
+                if !components.is_empty() {
+                    components.pop();
+                }
+            }
             std::path::Component::CurDir => {}
             std::path::Component::RootDir | std::path::Component::Prefix(_) => {
                 // Skip RootDir/Prefix here; we'll prepend "/" if the path was absolute
@@ -590,34 +786,44 @@ async fn handle_message_turn(
         Some(tool_defs.as_slice())
     };
 
-    let ctx = crate::tools::ToolContext {
-        working_dir: std::path::PathBuf::from(&working_dir),
-        database_url: cfg.database.url.clone(),
-        bash_gate: cfg.server.bash_gate.clone(),
-    };
+    let ctx = crate::tools::ToolContext::new(
+        std::path::PathBuf::from(&working_dir),
+        cfg.database.url.clone(),
+        cfg.server.bash_gate.clone(),
+    );
 
     // Per-session approval cache: tracks file paths the user has already approved
     // across all turns in this session, so repeated edits to the same file don't re-prompt.
     let mut approved_paths: HashSet<String> = {
-        let mut map = sessions.write().await;
-        if let Some(entry) = map.get_mut(&session_id_s) {
-            let paths = std::mem::take(&mut entry.approved_paths);
-            info!("loaded approval cache for session {}: {} paths", session_id_s, paths.len());
-            paths
-        } else {
-            info!("no approval cache for session {}", session_id_s);
-            HashSet::new()
-        }
+        // Clone, don't `mem::take`: a cancelled or panicked turn must not wipe
+        // the persisted cache.
+        let map = sessions.read().await;
+        let paths = map
+            .get(&session_id_s)
+            .map(|entry| entry.approved_paths.clone())
+            .unwrap_or_default();
+        info!(
+            "loaded approval cache for session {}: {} paths",
+            session_id_s,
+            paths.len()
+        );
+        paths
     };
 
-    /// Extract file paths from an apply_patch patch string.
-    /// Returns a list of normalized absolute paths for files being modified.
+    // Extract file paths from an apply_patch patch string.
+    // Returns a list of normalized absolute paths for files being modified.
     let extract_patch_paths = |patch: &str| -> Vec<String> {
         let mut paths = Vec::new();
         for line in patch.lines() {
-            if line.starts_with("*** Update File:") || line.starts_with("--- a/") || line.starts_with("+++ b/") {
+            if line.starts_with("*** Update File:")
+                || line.starts_with("--- a/")
+                || line.starts_with("+++ b/")
+            {
                 if let Some(path_part) = line.split(':').nth(1).or_else(|| line.split('/').nth(1)) {
-                    let path = path_part.trim().trim_start_matches("a/").trim_start_matches("b/");
+                    let path = path_part
+                        .trim()
+                        .trim_start_matches("a/")
+                        .trim_start_matches("b/");
                     if !path.is_empty() {
                         let p = Path::new(path);
                         let absolute = if p.is_relative() {
@@ -626,7 +832,10 @@ async fn handle_message_turn(
                             path.to_string()
                         };
                         let norm = normalize_path_key(&absolute);
-                        info!("extract_patch_paths: found path={} absolute={} norm={}", path, absolute, norm);
+                        info!(
+                            "extract_patch_paths: found path={} absolute={} norm={}",
+                            path, absolute, norm
+                        );
                         paths.push(norm);
                     }
                 }
@@ -687,11 +896,20 @@ async fn handle_message_turn(
     loop {
         loop_iteration += 1;
         if loop_iteration > max_tool_loops {
-            error!("tool-calling loop exceeded {} iterations, breaking", max_tool_loops);
-            send(w, &Event::Error {
-                id: Some(id),
-                message: format!("exceeded maximum tool-calling iterations ({})", max_tool_loops),
-            })
+            error!(
+                "tool-calling loop exceeded {} iterations, breaking",
+                max_tool_loops
+            );
+            send(
+                w,
+                &Event::Error {
+                    id: Some(id),
+                    message: format!(
+                        "exceeded maximum tool-calling iterations ({})",
+                        max_tool_loops
+                    ),
+                },
+            )
             .await?;
             break;
         }
@@ -699,7 +917,9 @@ async fn handle_message_turn(
         // Get current conversation for the provider.
         let msgs: Vec<crate::storage::Message> = {
             let s = sessions.read().await;
-            s.get(&session_id_s).map(|e| e.messages.clone()).unwrap_or_default()
+            s.get(&session_id_s)
+                .map(|e| e.messages.clone())
+                .unwrap_or_default()
         };
 
         let session_model = {
@@ -707,14 +927,21 @@ async fn handle_message_turn(
             s.get(&session_id_s)
                 .map(|e| e.model.clone())
                 .unwrap_or_else(|| {
-                    crate::config::resolve_provider(cfg, provider.as_deref()).default_model.clone()
+                    crate::config::resolve_provider(cfg, provider.as_deref())
+                        .default_model
+                        .clone()
                 })
         };
 
         // Memory context: durable facts relevant to the working dir are
         // appended to the system prompt automatically.
-        let query = if msgs.len() >= 1 { content.clone() } else { String::new() };
+        let query = if !msgs.is_empty() {
+            content.clone()
+        } else {
+            String::new()
+        };
         let memory_context = crate::memory::retrieve(&query, &working_dir, 5)
+            .await
             .into_iter()
             .map(|n| format!("- {}", n.text))
             .collect::<Vec<_>>()
@@ -731,7 +958,14 @@ async fn handle_message_turn(
         };
 
         let result = crate::provider::send_message(
-            cfg, provider.as_deref(), &session_model, &msgs, tool_defs_ref, &memory_context, &instructions, remaining_budget,
+            cfg,
+            provider.as_deref(),
+            &session_model,
+            &msgs,
+            tool_defs_ref,
+            &memory_context,
+            &instructions,
+            remaining_budget,
         )
         .await;
 
@@ -748,10 +982,13 @@ async fn handle_message_turn(
                         }
                         Event::ToolCall { id: _, calls } => {
                             for c in calls {
-                                send(w, &Event::ToolCall {
-                                    id: Some(id),
-                                    calls: vec![c.clone()],
-                                })
+                                send(
+                                    w,
+                                    &Event::ToolCall {
+                                        id: Some(id),
+                                        calls: vec![c.clone()],
+                                    },
+                                )
                                 .await?;
                             }
                             tool_calls.extend(calls.clone());
@@ -804,7 +1041,9 @@ async fn handle_message_turn(
                     // short delay so the next model can read the full history
                     // and continue — resetting the loop-guard counters so it
                     // gets a fresh budget. Only give up after several retries.
-                    if assistant_text.is_empty() && empty_response_retries < MAX_EMPTY_RESPONSE_RETRIES {
+                    if assistant_text.is_empty()
+                        && empty_response_retries < MAX_EMPTY_RESPONSE_RETRIES
+                    {
                         empty_response_retries += 1;
                         warn!(
                             "model returned empty response (no text, no tool calls); retrying in {}s (attempt {}/{})",
@@ -832,7 +1071,10 @@ async fn handle_message_turn(
                         denials_this_turn = 0;
                         last_call_sig = None;
                         seen_calls.clear();
-                        tokio::time::sleep(std::time::Duration::from_secs(EMPTY_RESPONSE_RETRY_DELAY_SECS)).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(
+                            EMPTY_RESPONSE_RETRY_DELAY_SECS,
+                        ))
+                        .await;
                         continue;
                     }
                     // If the model produced no text either, surface a clear
@@ -856,7 +1098,7 @@ async fn handle_message_turn(
                 // Stop early with a clear message instead of looping to the cap.
                 let sig = tool_calls
                     .iter()
-                    .map(|tc| format!("{}:{}", tc.name, tc.input.to_string()))
+                    .map(|tc| format!("{}:{}", tc.name, tc.input))
                     .collect::<Vec<_>>()
                     .join("|");
                 total_tool_calls += tool_calls.len() as u32;
@@ -867,12 +1109,12 @@ async fn handle_message_turn(
                 let mut max_same_call = 0u32;
                 for tc in &tool_calls {
                     let c = seen_calls
-                        .entry(format!("{}:{}", tc.name, tc.input.to_string()))
+                        .entry(format!("{}:{}", tc.name, tc.input))
                         .or_insert(0);
                     *c += 1;
                     max_same_call = max_same_call.max(*c);
                 }
-                if last_call_sig.as_deref().map(|s| s == &sig).unwrap_or(false) {
+                if last_call_sig.as_deref().map(|s| s == sig).unwrap_or(false) {
                     repeat_count += 1;
                 } else {
                     repeat_count = 0;
@@ -919,10 +1161,16 @@ async fn handle_message_turn(
                         consecutive_errors,
                         sig.chars().take(80).collect::<String>()
                     );
-                    send(w, &Event::Error {
-                        id: Some(id),
-                        message: format!("{} Try a different model or provider, or disable tools.", reason),
-                    })
+                    send(
+                        w,
+                        &Event::Error {
+                            id: Some(id),
+                            message: format!(
+                                "{} Try a different model or provider, or disable tools.",
+                                reason
+                            ),
+                        },
+                    )
                     .await?;
                     send(w, &Event::Done { id: Some(id) }).await?;
                     done_sent = true;
@@ -990,7 +1238,10 @@ async fn handle_message_turn(
                             // use its parent directory.
                             if !norm.is_empty() {
                                 if tc.name == "read" || tc.name == "agentgrep" {
-                                    Path::new(&norm).parent().map(|p| p.display().to_string()).unwrap_or(norm.clone())
+                                    Path::new(&norm)
+                                        .parent()
+                                        .map(|p| p.display().to_string())
+                                        .unwrap_or(norm.clone())
                                 } else {
                                     norm.clone()
                                 }
@@ -1003,7 +1254,12 @@ async fn handle_message_turn(
                     } else {
                         String::new()
                     };
-                    plan.push(ApprovalPlan { tc, tool, gate, group_key });
+                    plan.push(ApprovalPlan {
+                        tc,
+                        tool,
+                        gate,
+                        group_key,
+                    });
                 }
 
                 // Pass 2: resolve approvals. Read-only calls sharing a group
@@ -1011,10 +1267,13 @@ async fn handle_message_turn(
                 // prompted individually (or auto-approved).
                 let mut group_decisions: HashMap<String, bool> = HashMap::new();
                 for ap in &plan {
-                    send(w, &Event::Status {
-                        id: Some(id),
-                        message: format!("Executing tool: {}...", ap.tc.name),
-                    })
+                    send(
+                        w,
+                        &Event::Status {
+                            id: Some(id),
+                            message: format!("Executing tool: {}...", ap.tc.name),
+                        },
+                    )
                     .await?;
                     let (approved, deny_reason) = match &ap.gate {
                         None => (true, None),
@@ -1030,9 +1289,14 @@ async fn handle_message_turn(
                                     if !norm_key.is_empty() && approved_paths.contains(&norm_key) {
                                         info!("auto-approving {} (already approved in this session): {}", ap.tc.name, g.reason);
                                         (true, None)
-                                    } else if !ap.group_key.is_empty() && group_decisions.contains_key(&ap.group_key) {
+                                    } else if !ap.group_key.is_empty()
+                                        && group_decisions.contains_key(&ap.group_key)
+                                    {
                                         // Another read-only call already prompted for this directory.
-                                        let ok = group_decisions.get(&ap.group_key).map(|b| *b).unwrap_or(false);
+                                        let ok = group_decisions
+                                            .get(&ap.group_key)
+                                            .copied()
+                                            .unwrap_or(false);
                                         if ok && !norm_key.is_empty() {
                                             approved_paths.insert(norm_key);
                                         }
@@ -1054,7 +1318,8 @@ async fn handle_message_turn(
                                                 .iter()
                                                 .filter(|p| p.group_key == ap.group_key)
                                                 .map(|p| {
-                                                    let (_, n) = resolve_gate_key(p.gate.as_ref().unwrap());
+                                                    let (_, n) =
+                                                        resolve_gate_key(p.gate.as_ref().unwrap());
                                                     n
                                                 })
                                                 .filter(|n| !n.is_empty())
@@ -1072,13 +1337,16 @@ async fn handle_message_turn(
                                         } else {
                                             g.reason.clone()
                                         };
-                                        send(w, &Event::ApprovalRequired {
-                                            id,
-                                            tool_call_id: ap.tc.id.clone(),
-                                            tool_name: ap.tc.name.clone(),
-                                            path: prompt_path,
-                                            reason: prompt_reason,
-                                        })
+                                        send(
+                                            w,
+                                            &Event::ApprovalRequired {
+                                                id,
+                                                tool_call_id: ap.tc.id.clone(),
+                                                tool_name: ap.tc.name.clone(),
+                                                path: prompt_path,
+                                                reason: prompt_reason,
+                                            },
+                                        )
                                         .await?;
                                         info!("asking approval for {} ({})", ap.tc.name, g.reason);
                                         let key = format!("{}:{}", id, ap.tc.id);
@@ -1103,14 +1371,24 @@ async fn handle_message_turn(
                                         }
                                         // Also extract paths from apply_patch patches to populate cache
                                         if ok && ap.tc.name == "apply_patch" {
-                                            info!("apply_patch approved, extracting paths from patch");
-                                            if let Some(patch) = ap.tc.input.get("patch").and_then(|v| v.as_str()) {
+                                            info!(
+                                                "apply_patch approved, extracting paths from patch"
+                                            );
+                                            if let Some(patch) =
+                                                ap.tc.input.get("patch").and_then(|v| v.as_str())
+                                            {
                                                 let extracted = extract_patch_paths(patch);
-                                                info!("extract_patch_paths returned: {:?}", extracted);
+                                                info!(
+                                                    "extract_patch_paths returned: {:?}",
+                                                    extracted
+                                                );
                                                 for p in extracted {
                                                     if !p.is_empty() {
                                                         approved_paths.insert(p.clone());
-                                                        info!("inserted patch path into cache: {}", p);
+                                                        info!(
+                                                            "inserted patch path into cache: {}",
+                                                            p
+                                                        );
                                                     }
                                                 }
                                             } else {
@@ -1120,13 +1398,40 @@ async fn handle_message_turn(
                                         (ok, if ok { None } else { Some(g.reason.clone()) })
                                     }
                                 } else {
-                                    info!("auto-approving {} in non-interactive mode: {}", ap.tc.name, g.reason);
+                                    info!(
+                                        "auto-approving {} in non-interactive mode: {}",
+                                        ap.tc.name, g.reason
+                                    );
                                     (true, None)
                                 }
                             }
-                        }
+                        },
                     };
-                    prepared.push(PreparedCall { tc: ap.tc, tool: ap.tool, approved, deny_reason });
+                    // If the user approved an outside-workspace write, record it
+                    // so the tool's confinement check allows exactly that path.
+                    // Headless runs never populate this, so their writes stay
+                    // confined to the workspace.
+                    if approved && interactive {
+                        if let Some(g) = &ap.gate {
+                            let (_, norm_key) = resolve_gate_key(g);
+                            if !norm_key.is_empty() {
+                                crate::tools::allow_outside(&ctx, &norm_key);
+                            }
+                        }
+                        if ap.tc.name == "apply_patch" {
+                            if let Some(patch) = ap.tc.input.get("patch").and_then(|v| v.as_str()) {
+                                for p in crate::tools::patch_paths(patch) {
+                                    crate::tools::allow_outside(&ctx, &p);
+                                }
+                            }
+                        }
+                    }
+                    prepared.push(PreparedCall {
+                        tc: ap.tc,
+                        tool: ap.tool,
+                        approved,
+                        deny_reason,
+                    });
                 }
 
                 // Phase 2a: run all approved, independent (read-only) tools
@@ -1161,11 +1466,18 @@ async fn handle_message_turn(
                 let mut results: Vec<crate::protocol::ToolResultEntry> = Vec::new();
                 for pc in &prepared {
                     let result_entry = if !pc.approved {
-                        warn!("tool denied: {} ({})", pc.tc.name, pc.deny_reason.as_deref().unwrap_or("no approval"));
+                        warn!(
+                            "tool denied: {} ({})",
+                            pc.tc.name,
+                            pc.deny_reason.as_deref().unwrap_or("no approval")
+                        );
                         denials_this_turn += 1;
                         crate::protocol::ToolResultEntry {
                             tool_call_id: pc.tc.id.clone(),
-                            output: format!("APPROVAL_DENIED: {}", pc.deny_reason.as_deref().unwrap_or("no approval")),
+                            output: format!(
+                                "APPROVAL_DENIED: {}",
+                                pc.deny_reason.as_deref().unwrap_or("no approval")
+                            ),
                             is_error: true,
                         }
                     } else if let Some(tool) = pc.tool {
@@ -1183,7 +1495,8 @@ async fn handle_message_turn(
                                 },
                                 None => crate::protocol::ToolResultEntry {
                                     tool_call_id: pc.tc.id.clone(),
-                                    output: "ERROR: independent tool produced no result".to_string(),
+                                    output: "ERROR: independent tool produced no result"
+                                        .to_string(),
                                     is_error: true,
                                 },
                             }
@@ -1208,10 +1521,13 @@ async fn handle_message_turn(
                             is_error: true,
                         }
                     };
-                    send(w, &Event::ToolResult {
-                        id: Some(id),
-                        results: vec![result_entry.clone()],
-                    })
+                    send(
+                        w,
+                        &Event::ToolResult {
+                            id: Some(id),
+                            results: vec![result_entry.clone()],
+                        },
+                    )
                     .await?;
                     results.push(result_entry);
                 }
@@ -1250,10 +1566,13 @@ async fn handle_message_turn(
             Err(e) => {
                 eprintln!("provider error: {}", e);
                 tracing::error!("provider call failed: {}", e);
-                send(w, &Event::Error {
-                    id: Some(id),
-                    message: e.to_string(),
-                })
+                send(
+                    w,
+                    &Event::Error {
+                        id: Some(id),
+                        message: e.to_string(),
+                    },
+                )
                 .await?;
                 break;
             }
@@ -1264,12 +1583,27 @@ async fn handle_message_turn(
         send(w, &Event::Done { id: Some(id) }).await?;
     }
 
-    // Save approval cache back to session for next turn
+    // Save approval cache back to the session (memory + disk) for next turn.
     {
-        let mut map = sessions.write().await;
-        if let Some(entry) = map.get_mut(&session_id_s) {
-            info!("saving approval cache for session {}: {} paths", session_id_s, approved_paths.len());
-            entry.approved_paths = approved_paths;
+        let snapshot = {
+            let mut map = sessions.write().await;
+            match map.get_mut(&session_id_s) {
+                Some(entry) => {
+                    info!(
+                        "saving approval cache for session {}: {} paths",
+                        session_id_s,
+                        approved_paths.len()
+                    );
+                    entry.approved_paths = approved_paths;
+                    Some(entry.clone())
+                }
+                None => None,
+            }
+        };
+        if let Some(snap) = snapshot {
+            if let Err(e) = crate::storage::save_session(&snap).await {
+                error!("saving approval cache for {}: {}", session_id_s, e);
+            }
         }
     }
 
@@ -1297,7 +1631,11 @@ async fn persist_assistant(sessions: &SessionMap, session_id: &str, text: &str) 
         if let Err(e) = crate::storage::save_session(&snapshot).await {
             error!("saving session {}: {}", session_id, e);
         } else {
-            tracing::info!("saved session {} ({} messages)", session_id, snapshot.messages.len());
+            tracing::info!(
+                "saved session {} ({} messages)",
+                session_id,
+                snapshot.messages.len()
+            );
         }
     } else {
         tracing::warn!("session {} not found in map during persist", session_id);
@@ -1311,6 +1649,24 @@ async fn send(w: &Socket, ev: &Event) -> Result<()> {
     w.write_all(b"\n").await?;
     w.flush().await?;
     Ok(())
+}
+
+/// Queue a soft interrupt only when the target has no live client. When a
+/// client is connected, `notify_session` delivers the event live, so queueing
+/// it too would duplicate the message when the queue is later drained.
+async fn queue_interrupt_offline(
+    swarm: &SharedSwarm,
+    session_clients: &SessionClients,
+    target_session: &str,
+    interrupt: Interrupt,
+) {
+    let online = session_clients.read().await.contains_key(target_session);
+    if !online {
+        swarm
+            .write()
+            .await
+            .queue_interrupt(target_session, interrupt);
+    }
 }
 
 /// Push a `Notification` event to a session's connected interactive client, if
@@ -1367,16 +1723,33 @@ async fn notify_session(
 async fn run_headless_agent(
     cfg: &crate::config::Config,
     sessions: &SessionMap,
+    swarm: &SharedSwarm,
     session_id: &str,
     provider: Option<&str>,
 ) -> Result<String> {
+    let provider_cfg = crate::config::resolve_provider(cfg, provider);
     // Built-in tools only: headless agents have no way to opt in to MCP, and
     // connecting to MCP servers per turn would add latency (and stall on a down
     // server). Interactive `/mcp <message>` is the MCP entry point.
     let tool_registry = crate::tools::default_registry();
-    let tool_defs: Vec<crate::tools::ToolDefinition> =
-        tool_registry.all().iter().map(|t| t.to_definition()).collect();
-    let tool_defs_ref = if tool_defs.is_empty() { None } else { Some(tool_defs.as_slice()) };
+    let tool_defs: Vec<crate::tools::ToolDefinition> = if provider_cfg.supports_tools {
+        tool_registry
+            .all()
+            .iter()
+            .map(|t| t.to_definition())
+            .collect()
+    } else {
+        tracing::info!(
+            "provider '{}' has supports_tools=false; headless agent runs without tools",
+            provider_cfg.name
+        );
+        Vec::new()
+    };
+    let tool_defs_ref = if tool_defs.is_empty() {
+        None
+    } else {
+        Some(tool_defs.as_slice())
+    };
 
     let working_dir = {
         let s = sessions.read().await;
@@ -1384,16 +1757,22 @@ async fn run_headless_agent(
             .map(|e| e.working_dir.clone())
             .unwrap_or_default()
     };
-    let ctx = crate::tools::ToolContext {
-        working_dir: std::path::PathBuf::from(&working_dir),
-        database_url: cfg.database.url.clone(),
-        bash_gate: cfg.server.bash_gate.clone(),
-    };
+    let ctx = crate::tools::ToolContext::new(
+        std::path::PathBuf::from(&working_dir),
+        cfg.database.url.clone(),
+        cfg.server.bash_gate.clone(),
+    );
 
     let instructions = crate::agents::load_instructions(&working_dir);
 
     // Configurable so big projects can explore longer (see `[server] max_tool_loops`).
     let max_tool_loops = cfg.server.max_tool_loops.max(1);
+    let max_total_tool_calls = cfg.server.max_total_tool_calls.max(1);
+    const MAX_SAME_CALL_REPEATS: u32 = 5;
+    const MAX_CONSECUTIVE_ERRORS: u32 = 4;
+    let mut total_tool_calls = 0u32;
+    let mut seen_calls: HashMap<String, u32> = HashMap::new();
+    let mut consecutive_errors = 0u32;
     let mut total_text = String::new();
     let mut iteration = 0u32;
     // Empty-response retry (same rationale as the interactive path): a proxy
@@ -1406,7 +1785,10 @@ async fn run_headless_agent(
     loop {
         iteration += 1;
         if iteration > max_tool_loops {
-            info!("headless agent {} exceeded {} tool loops", session_id, max_tool_loops);
+            info!(
+                "headless agent {} exceeded {} tool loops",
+                session_id, max_tool_loops
+            );
             total_text.push_str(&format!(
                 "\n[stopped: exceeded {} tool-calling iterations]",
                 max_tool_loops
@@ -1414,9 +1796,42 @@ async fn run_headless_agent(
             break;
         }
 
+        // Deliver soft-interrupt notifications that queued while this agent was
+        // offline (DMs / broadcasts), then clear the queue.
+        {
+            let pending = swarm.write().await.drain_interrupts(session_id);
+            if !pending.is_empty() {
+                let mut map = sessions.write().await;
+                if let Some(entry) = map.get_mut(session_id) {
+                    for interrupt in pending {
+                        let from = interrupt.from_session.as_deref().unwrap_or("system");
+                        entry.messages.push(Message {
+                            role: "user".to_string(),
+                            content: format!(
+                                "[{}] from {}: {}",
+                                format!("{:?}", interrupt.notification_type).to_lowercase(),
+                                from,
+                                interrupt.message
+                            ),
+                            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        });
+                    }
+                    entry.updated_at_ms = chrono::Utc::now().timestamp_millis();
+                    let snapshot = entry.clone();
+                    if let Err(e) = crate::storage::save_session(&snapshot).await {
+                        error!("saving session {}: {}", session_id, e);
+                    }
+                }
+            }
+        }
+
         let msgs: Vec<crate::storage::Message> = {
             let s = sessions.read().await;
-            s.get(session_id).map(|e| e.messages.clone()).unwrap_or_default()
+            s.get(session_id)
+                .map(|e| e.messages.clone())
+                .unwrap_or_default()
         };
 
         let session_model = {
@@ -1424,11 +1839,24 @@ async fn run_headless_agent(
             s.get(session_id)
                 .map(|e| e.model.clone())
                 .unwrap_or_else(|| {
-                    crate::config::resolve_provider(cfg, provider.as_deref()).default_model.clone()
+                    crate::config::resolve_provider(cfg, provider)
+                        .default_model
+                        .clone()
                 })
         };
 
-        let events = match crate::provider::send_message(cfg, provider, &session_model, &msgs, tool_defs_ref, "", &instructions, None).await {
+        let events = match crate::provider::send_message(
+            cfg,
+            provider,
+            &session_model,
+            &msgs,
+            tool_defs_ref,
+            "",
+            &instructions,
+            None,
+        )
+        .await
+        {
             Ok(events) => events,
             Err(e) => {
                 let msg = format!("ERROR: {}", e);
@@ -1467,7 +1895,11 @@ async fn run_headless_agent(
                         role: "assistant".to_string(),
                         content: turn_text.clone(),
                         timestamp_ms: chrono::Utc::now().timestamp_millis(),
-                        tool_calls: if stored_tcs.is_empty() { None } else { Some(stored_tcs) },
+                        tool_calls: if stored_tcs.is_empty() {
+                            None
+                        } else {
+                            Some(stored_tcs)
+                        },
                         tool_call_id: None,
                     });
                 }
@@ -1492,10 +1924,54 @@ async fn run_headless_agent(
                     empty_response_retries,
                     MAX_EMPTY_RESPONSE_RETRIES
                 );
-                iteration = 0; // reset loop budget for the retried model
-                tokio::time::sleep(std::time::Duration::from_secs(EMPTY_RESPONSE_RETRY_DELAY_SECS)).await;
+                // Reset the loop-guard counters so the retried model gets a
+                // fresh budget.
+                iteration = 0;
+                total_tool_calls = 0;
+                seen_calls.clear();
+                consecutive_errors = 0;
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    EMPTY_RESPONSE_RETRY_DELAY_SECS,
+                ))
+                .await;
                 continue;
             }
+            break;
+        }
+
+        // Loop guards, mirroring the interactive path so a wandering or stuck
+        // model can't burn the whole budget.
+        total_tool_calls += tool_calls.len() as u32;
+        let mut max_same_call = 0u32;
+        for tc in &tool_calls {
+            let c = seen_calls
+                .entry(format!("{}:{}", tc.name, tc.input))
+                .or_insert(0);
+            *c += 1;
+            max_same_call = max_same_call.max(*c);
+        }
+        if total_tool_calls >= max_total_tool_calls
+            || max_same_call >= MAX_SAME_CALL_REPEATS
+            || consecutive_errors >= MAX_CONSECUTIVE_ERRORS
+        {
+            let reason = if max_same_call >= MAX_SAME_CALL_REPEATS {
+                format!(
+                    "the model issued the same tool call {} times without progress",
+                    max_same_call
+                )
+            } else if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                format!(
+                    "the model hit {} consecutive tool errors without progress",
+                    consecutive_errors
+                )
+            } else {
+                format!(
+                    "the model made {} tool calls without producing a final answer",
+                    total_tool_calls
+                )
+            };
+            error!("headless agent {} stopping: {}", session_id, reason);
+            total_text.push_str(&format!("\n[stopped: {}]", reason));
             break;
         }
 
@@ -1524,6 +2000,12 @@ async fn run_headless_agent(
             results.push(result_entry);
         }
 
+        if !results.is_empty() && results.iter().all(|r| r.is_error) {
+            consecutive_errors += 1;
+        } else {
+            consecutive_errors = 0;
+        }
+
         {
             let mut map = sessions.write().await;
             if let Some(entry) = map.get_mut(session_id) {
@@ -1549,6 +2031,7 @@ async fn run_headless_agent(
 }
 
 /// Spawn a new headless agent session and run its initial message.
+#[allow(clippy::too_many_arguments)]
 async fn handle_swarm_spawn(
     w: &Socket,
     req_id: u64,
@@ -1565,25 +2048,53 @@ async fn handle_swarm_spawn(
     let new_id = crate::protocol::new_message_id();
     let session_id = format!("agent-{}", new_id);
 
-    {
-        let mut map = sessions.write().await;
-        let working_dir = std::env::current_dir()
+    // Inherit the parent's workspace: the daemon's own cwd is whatever
+    // directory it was first launched from (or the service's
+    // WorkingDirectory), which is wrong for an agent spawned from another
+    // project.
+    let working_dir = match &parent_session_id {
+        Some(parent_id) => {
+            let parent_dir = {
+                let map = sessions.read().await;
+                map.get(parent_id).map(|s| s.working_dir.clone())
+            };
+            match parent_dir {
+                Some(d) if !d.is_empty() => d,
+                _ => std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+            }
+        }
+        None => std::env::current_dir()
             .unwrap_or_default()
             .to_string_lossy()
-            .to_string();
+            .to_string(),
+    };
+
+    {
+        let mut map = sessions.write().await;
         let model = model_override
             .unwrap_or(&crate::config::resolve_provider(&cfg, provider_override).default_model)
             .to_string();
         let entry = map.entry(session_id.clone()).or_insert_with(|| Session {
             id: session_id.clone(),
             title: format!("agent-{}", new_id),
-            working_dir,
+            working_dir: working_dir.clone(),
             model,
             messages: Vec::new(),
             created_at_ms: chrono::Utc::now().timestamp_millis(),
             updated_at_ms: chrono::Utc::now().timestamp_millis(),
             approved_paths: HashSet::new(),
+            is_swarm_member: true,
+            parent_session_id: parent_session_id.clone(),
+            is_headless: true,
         });
+        // Keep the fields correct even if the session already existed.
+        entry.working_dir = working_dir;
+        entry.is_swarm_member = true;
+        entry.parent_session_id = parent_session_id.clone();
+        entry.is_headless = true;
         entry.messages.push(Message {
             role: "user".to_string(),
             content: initial_message.to_string(),
@@ -1592,6 +2103,10 @@ async fn handle_swarm_spawn(
             tool_call_id: None,
         });
         entry.updated_at_ms = chrono::Utc::now().timestamp_millis();
+        let snapshot = entry.clone();
+        if let Err(e) = crate::storage::save_session(&snapshot).await {
+            error!("saving spawned session {}: {}", session_id, e);
+        }
     }
 
     {
@@ -1606,53 +2121,71 @@ async fn handle_swarm_spawn(
         sw.update_status(&session_id, "running", Some(initial_message.to_string()));
     }
 
-    send(w, &Event::Spawned {
-        id: req_id,
-        new_session_id: session_id.clone(),
-        label: label.map(String::from),
-    })
+    send(
+        w,
+        &Event::Spawned {
+            id: req_id,
+            new_session_id: session_id.clone(),
+            label: label.map(String::from),
+        },
+    )
     .await?;
 
-    // Run the agent headlessly with the full tool set (auto-approved — no
-    // human is attached). Returns the accumulated assistant text.
-    let assistant_text = run_headless_agent(&cfg, sessions, &session_id, provider_override).await?;
-
-    // Forward the completion report to the parent session (jancode's
-    // report_back_to_session_id policy): queue a soft interrupt / send a
-    // Notification to the parent's connected clients if any.
-    let report = if assistant_text.starts_with("ERROR: ") {
-        format!("Agent {} failed: {}", session_id, assistant_text)
-    } else {
-        format!("Agent {} completed: {}", session_id, assistant_text)
-    };
-
-    {
-        let mut sw = swarm.write().await;
-        sw.update_status(&session_id, "completed", None);
-        if let Some(parent_id) = &parent_session_id {
-            sw.queue_interrupt(
+    // Run the agent in its own task (auto-approved — no human is attached) so
+    // the spawning connection isn't blocked for the agent's whole lifetime and
+    // `swarm stop` can abort it.
+    let task_sessions = sessions.clone();
+    let task_swarm = swarm.clone();
+    let task_clients = session_clients.clone();
+    let task_session_id = session_id.clone();
+    let task_parent = parent_session_id.clone();
+    let task_provider = provider_override.map(|s| s.to_string());
+    let handle = tokio::spawn(async move {
+        let result = run_headless_agent(
+            &cfg,
+            &task_sessions,
+            &task_swarm,
+            &task_session_id,
+            task_provider.as_deref(),
+        )
+        .await;
+        let report = match result {
+            Ok(text) if text.starts_with("ERROR: ") => {
+                format!("Agent {} failed: {}", task_session_id, text)
+            }
+            Ok(text) => format!("Agent {} completed: {}", task_session_id, text),
+            Err(e) => format!("Agent {} failed: {}", task_session_id, e),
+        };
+        {
+            let mut sw = task_swarm.write().await;
+            sw.update_status(&task_session_id, "completed", None);
+            sw.tasks.remove(&task_session_id);
+        }
+        if let Some(parent_id) = &task_parent {
+            // Queue only if the parent is offline; a connected client gets the
+            // live notification below.
+            queue_interrupt_offline(
+                &task_swarm,
+                &task_clients,
                 parent_id,
                 Interrupt {
-                    from_session: Some(session_id.clone()),
+                    from_session: Some(task_session_id.clone()),
                     notification_type: crate::protocol::NotificationType::CompletionReport,
                     message: report.clone(),
                 },
-            );
+            )
+            .await;
+            notify_session(
+                &task_clients,
+                parent_id,
+                Some(&task_session_id),
+                crate::protocol::NotificationType::CompletionReport,
+                report,
+            )
+            .await;
         }
-    }
-
-    // Push the completion report live to the parent's interactive client (if
-    // one is attached), independent of the swarm interrupt queue.
-    if let Some(parent_id) = &parent_session_id {
-        notify_session(
-            session_clients,
-            parent_id,
-            Some(&session_id),
-            crate::protocol::NotificationType::CompletionReport,
-            report.clone(),
-        )
-        .await;
-    }
+    });
+    swarm.write().await.tasks.insert(session_id, handle);
 
     Ok(())
 }
@@ -1666,17 +2199,17 @@ async fn handle_swarm_dm(
     to_session_id: &str,
     message: &str,
 ) -> Result<()> {
-    {
-        let mut sw = swarm.write().await;
-        sw.queue_interrupt(
-            to_session_id,
-            Interrupt {
-                from_session: from_session_id.map(String::from),
-                notification_type: crate::protocol::NotificationType::Dm,
-                message: message.to_string(),
-            },
-        );
-    }
+    queue_interrupt_offline(
+        swarm,
+        session_clients,
+        to_session_id,
+        Interrupt {
+            from_session: from_session_id.map(String::from),
+            notification_type: crate::protocol::NotificationType::Dm,
+            message: message.to_string(),
+        },
+    )
+    .await;
     notify_session(
         session_clients,
         to_session_id,
@@ -1709,18 +2242,18 @@ async fn handle_swarm_broadcast(
         let sw = swarm.read().await;
         sw.members.keys().cloned().collect()
     };
-    {
-        let mut sw = swarm.write().await;
-        for to in &keys {
-            sw.queue_interrupt(
-                to,
-                Interrupt {
-                    from_session: from_session_id.map(String::from),
-                    notification_type: crate::protocol::NotificationType::Broadcast,
-                    message: message.to_string(),
-                },
-            );
-        }
+    for to in &keys {
+        queue_interrupt_offline(
+            swarm,
+            session_clients,
+            to,
+            Interrupt {
+                from_session: from_session_id.map(String::from),
+                notification_type: crate::protocol::NotificationType::Broadcast,
+                message: message.to_string(),
+            },
+        )
+        .await;
     }
     for to in &keys {
         notify_session(
@@ -1743,6 +2276,7 @@ async fn handle_swarm_broadcast(
 /// spawn subtree (mirrors jancode's stop permissions).
 async fn handle_swarm_stop(
     w: &Socket,
+    sessions: &SessionMap,
     swarm: &SharedSwarm,
     id: u64,
     session_id: &str,
@@ -1771,12 +2305,39 @@ async fn handle_swarm_stop(
     }
     {
         let mut sw = swarm.write().await;
-        sw.remove_member(session_id);
         sw.update_status(session_id, "stopped", None);
+        // Abort a running headless agent; a cooperative stop can't interrupt a
+        // long-running tool call.
+        if let Some(handle) = sw.tasks.remove(session_id) {
+            handle.abort();
+        }
+        sw.remove_member(session_id);
     }
-    send(w, &Event::Stopped { id, session_id: session_id.to_string() }).await?;
+    // Clear the persisted membership flag so a restart doesn't resurrect it.
+    {
+        let snapshot = {
+            let mut map = sessions.write().await;
+            match map.get_mut(session_id) {
+                Some(entry) => {
+                    entry.is_swarm_member = false;
+                    Some(entry.clone())
+                }
+                None => None,
+            }
+        };
+        if let Some(snap) = snapshot {
+            let _ = crate::storage::save_session(&snap).await;
+        }
+    }
+    send(
+        w,
+        &Event::Stopped {
+            id,
+            session_id: session_id.to_string(),
+        },
+    )
+    .await?;
     Ok(())
-
 }
 
 /// Return the live status of one member, or the requesting session itself.
@@ -1787,9 +2348,13 @@ async fn handle_swarm_status(
     session_id: Option<&str>,
 ) -> Result<()> {
     let sw = swarm.read().await;
+    // Deterministic fallback when no session is named.
+    let mut keys: Vec<&String> = sw.members.keys().collect();
+    keys.sort();
     let target = session_id
-        .or_else(|| sw.members.keys().next().map(|s| s.as_str()));
-    if let Some(sid) = target {
+        .map(|s| s.to_string())
+        .or_else(|| keys.first().map(|s| (*s).clone()));
+    if let Some(sid) = target.as_deref() {
         if let Some(m) = sw.get_member(sid) {
             send(
                 w,
@@ -1817,13 +2382,16 @@ async fn handle_swarm_status(
 }
 
 /// Return the full member roster.
-async fn handle_swarm_list(
-    w: &Socket,
-    swarm: &SharedSwarm,
-    id: u64,
-) -> Result<()> {
+async fn handle_swarm_list(w: &Socket, swarm: &SharedSwarm, id: u64) -> Result<()> {
     let sw = swarm.read().await;
-    send(w, &Event::MemberList { id, members: sw.member_list() }).await?;
+    send(
+        w,
+        &Event::MemberList {
+            id,
+            members: sw.member_list(),
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -1833,7 +2401,11 @@ mod tests {
 
     #[test]
     fn gate_logic() {
-        let ctx = ToolContext { working_dir: std::path::PathBuf::from("/work/proj"), database_url: String::new(), bash_gate: "basic".to_string() };
+        let ctx = ToolContext::new(
+            std::path::PathBuf::from("/work/proj"),
+            String::new(),
+            "basic".to_string(),
+        );
         // write/edit/apply_patch always gate.
         assert!(gate_tool("write", &serde_json::json!({"path": "x.rs"}), &ctx).is_some());
         assert!(gate_tool("edit", &serde_json::json!({"path": "x.rs"}), &ctx).is_some());
@@ -1845,57 +2417,257 @@ mod tests {
         assert!(gate_tool("read", &serde_json::json!({"path": "../secret"}), &ctx).is_some());
         assert!(gate_tool("read", &serde_json::json!({"path": "/etc/passwd"}), &ctx).is_some());
         // Glob with an escaping base is gated.
-        assert!(gate_tool("glob", &serde_json::json!({"pattern": "**", "path": "../"}), &ctx).is_some());
+        assert!(gate_tool(
+            "glob",
+            &serde_json::json!({"pattern": "**", "path": "../"}),
+            &ctx
+        )
+        .is_some());
         // bash: in-workspace commands are ungated, escapes are gated.
         assert!(gate_tool("bash", &serde_json::json!({"command": "ls"}), &ctx).is_none());
         assert!(gate_tool("bash", &serde_json::json!({"command": "cargo test"}), &ctx).is_none());
-        assert!(gate_tool("bash", &serde_json::json!({"command": "grep -r alpha src"}), &ctx).is_none());
-        assert!(gate_tool("bash", &serde_json::json!({"command": "cat /etc/hosts"}), &ctx).is_some());
-        assert!(gate_tool("bash", &serde_json::json!({"command": "ls ~/sysadmin-mcp"}), &ctx).is_some());
+        assert!(gate_tool(
+            "bash",
+            &serde_json::json!({"command": "grep -r alpha src"}),
+            &ctx
+        )
+        .is_none());
+        assert!(gate_tool(
+            "bash",
+            &serde_json::json!({"command": "cat /etc/hosts"}),
+            &ctx
+        )
+        .is_some());
+        assert!(gate_tool(
+            "bash",
+            &serde_json::json!({"command": "ls ~/sysadmin-mcp"}),
+            &ctx
+        )
+        .is_some());
         assert!(gate_tool("bash", &serde_json::json!({"command": "cd .. && ls"}), &ctx).is_some());
-        assert!(gate_tool("bash", &serde_json::json!({"command": "cd /tmp && pwd"}), &ctx).is_some());
-        assert!(gate_tool("bash", &serde_json::json!({"command": "cat $HOME/.claude/settings.json"}), &ctx).is_some());
+        assert!(gate_tool(
+            "bash",
+            &serde_json::json!({"command": "cd /tmp && pwd"}),
+            &ctx
+        )
+        .is_some());
+        assert!(gate_tool(
+            "bash",
+            &serde_json::json!({"command": "cat $HOME/.claude/settings.json"}),
+            &ctx
+        )
+        .is_some());
         assert!(gate_tool("plan", &serde_json::json!({"action": "show"}), &ctx).is_none());
         // Read-only git actions are ungated.
         assert!(gate_tool("git", &serde_json::json!({"action": "status"}), &ctx).is_none());
         assert!(gate_tool("git", &serde_json::json!({"action": "log"}), &ctx).is_none());
         assert!(gate_tool("git", &serde_json::json!({"action": "diff"}), &ctx).is_none());
-        assert!(gate_tool("git", &serde_json::json!({"action": "remote", "branch": "x"}), &ctx).is_none());
+        assert!(gate_tool(
+            "git",
+            &serde_json::json!({"action": "remote", "branch": "x"}),
+            &ctx
+        )
+        .is_none());
         assert!(gate_tool("git", &serde_json::json!({"action": "fetch"}), &ctx).is_none());
-        assert!(gate_tool("git", &serde_json::json!({"action": "stash", "stash_action": "list"}), &ctx).is_none());
+        assert!(gate_tool(
+            "git",
+            &serde_json::json!({"action": "stash", "stash_action": "list"}),
+            &ctx
+        )
+        .is_none());
         // Creating a branch pointer at HEAD is ungated.
-        assert!(gate_tool("git", &serde_json::json!({"action": "branch", "branch": "topic"}), &ctx).is_none());
+        assert!(gate_tool(
+            "git",
+            &serde_json::json!({"action": "branch", "branch": "topic"}),
+            &ctx
+        )
+        .is_none());
         // Mutating git actions are gated.
-        assert!(gate_tool("git", &serde_json::json!({"action": "add", "path": "all"}), &ctx).is_some());
-        assert!(gate_tool("git", &serde_json::json!({"action": "commit", "message": "x"}), &ctx).is_some());
+        assert!(gate_tool(
+            "git",
+            &serde_json::json!({"action": "add", "path": "all"}),
+            &ctx
+        )
+        .is_some());
+        assert!(gate_tool(
+            "git",
+            &serde_json::json!({"action": "commit", "message": "x"}),
+            &ctx
+        )
+        .is_some());
         assert!(gate_tool("git", &serde_json::json!({"action": "push"}), &ctx).is_some());
         assert!(gate_tool("git", &serde_json::json!({"action": "pull"}), &ctx).is_some());
-        assert!(gate_tool("git", &serde_json::json!({"action": "checkout", "branch": "x"}), &ctx).is_some());
-        assert!(gate_tool("git", &serde_json::json!({"action": "branch", "branch": "old", "delete_branch": true}), &ctx).is_some());
-        assert!(gate_tool("git", &serde_json::json!({"action": "stash", "stash_action": "pop"}), &ctx).is_some());
-        assert!(gate_tool("git", &serde_json::json!({"action": "merge", "branch": "main"}), &ctx).is_some());
-        assert!(gate_tool("git", &serde_json::json!({"action": "rebase", "branch": "origin/main"}), &ctx).is_some());
-        assert!(gate_tool("git", &serde_json::json!({"action": "reset", "mode": "hard", "ref": "HEAD~1"}), &ctx).is_some());
+        assert!(gate_tool(
+            "git",
+            &serde_json::json!({"action": "checkout", "branch": "x"}),
+            &ctx
+        )
+        .is_some());
+        assert!(gate_tool(
+            "git",
+            &serde_json::json!({"action": "branch", "branch": "old", "delete_branch": true}),
+            &ctx
+        )
+        .is_some());
+        assert!(gate_tool(
+            "git",
+            &serde_json::json!({"action": "stash", "stash_action": "pop"}),
+            &ctx
+        )
+        .is_some());
+        assert!(gate_tool(
+            "git",
+            &serde_json::json!({"action": "merge", "branch": "main"}),
+            &ctx
+        )
+        .is_some());
+        assert!(gate_tool(
+            "git",
+            &serde_json::json!({"action": "rebase", "branch": "origin/main"}),
+            &ctx
+        )
+        .is_some());
+        assert!(gate_tool(
+            "git",
+            &serde_json::json!({"action": "reset", "mode": "hard", "ref": "HEAD~1"}),
+            &ctx
+        )
+        .is_some());
         // Web + notes.
-        assert!(gate_tool("fetch_url", &serde_json::json!({"url": "https://example.com"}), &ctx).is_none());
+        assert!(gate_tool(
+            "fetch_url",
+            &serde_json::json!({"url": "https://example.com"}),
+            &ctx
+        )
+        .is_none());
         assert!(gate_tool("note", &serde_json::json!({"action": "clear"}), &ctx).is_none());
         // http_request: read methods ungated, mutating gated.
-        assert!(gate_tool("http_request", &serde_json::json!({"method": "GET", "url": "https://a.com"}), &ctx).is_none());
-        assert!(gate_tool("http_request", &serde_json::json!({"method": "HEAD", "url": "https://a.com"}), &ctx).is_none());
-        assert!(gate_tool("http_request", &serde_json::json!({"method": "post", "url": "https://a.com", "json": {}}), &ctx).is_some());
-        assert!(gate_tool("http_request", &serde_json::json!({"method": "DELETE", "url": "https://a.com/x"}), &ctx).is_some());
+        assert!(gate_tool(
+            "http_request",
+            &serde_json::json!({"method": "GET", "url": "https://a.com"}),
+            &ctx
+        )
+        .is_none());
+        assert!(gate_tool(
+            "http_request",
+            &serde_json::json!({"method": "HEAD", "url": "https://a.com"}),
+            &ctx
+        )
+        .is_none());
+        assert!(gate_tool(
+            "http_request",
+            &serde_json::json!({"method": "post", "url": "https://a.com", "json": {}}),
+            &ctx
+        )
+        .is_some());
+        assert!(gate_tool(
+            "http_request",
+            &serde_json::json!({"method": "DELETE", "url": "https://a.com/x"}),
+            &ctx
+        )
+        .is_some());
         // docker: reads ungated, state changes gated.
         assert!(gate_tool("docker", &serde_json::json!({"action": "ps"}), &ctx).is_none());
-        assert!(gate_tool("docker", &serde_json::json!({"action": "logs", "container": "web"}), &ctx).is_none());
-        assert!(gate_tool("docker", &serde_json::json!({"action": "inspect", "container": "web"}), &ctx).is_none());
-        assert!(gate_tool("docker", &serde_json::json!({"action": "exec", "container": "web", "command": "ls"}), &ctx).is_some());
-        assert!(gate_tool("docker", &serde_json::json!({"action": "run", "image": "nginx"}), &ctx).is_some());
-        assert!(gate_tool("docker", &serde_json::json!({"action": "rm", "container": "web", "force": true}), &ctx).is_some());
-        assert!(gate_tool("docker", &serde_json::json!({"action": "build", "tag": "x"}), &ctx).is_some());
+        assert!(gate_tool(
+            "docker",
+            &serde_json::json!({"action": "logs", "container": "web"}),
+            &ctx
+        )
+        .is_none());
+        assert!(gate_tool(
+            "docker",
+            &serde_json::json!({"action": "inspect", "container": "web"}),
+            &ctx
+        )
+        .is_none());
+        assert!(gate_tool(
+            "docker",
+            &serde_json::json!({"action": "exec", "container": "web", "command": "ls"}),
+            &ctx
+        )
+        .is_some());
+        assert!(gate_tool(
+            "docker",
+            &serde_json::json!({"action": "run", "image": "nginx"}),
+            &ctx
+        )
+        .is_some());
+        assert!(gate_tool(
+            "docker",
+            &serde_json::json!({"action": "rm", "container": "web", "force": true}),
+            &ctx
+        )
+        .is_some());
+        assert!(gate_tool(
+            "docker",
+            &serde_json::json!({"action": "build", "tag": "x"}),
+            &ctx
+        )
+        .is_some());
         // sql: reads ungated, writes gated.
         assert!(gate_tool("sql", &serde_json::json!({"query": "SELECT 1"}), &ctx).is_none());
         assert!(gate_tool("sql", &serde_json::json!({"query": "show tables"}), &ctx).is_none());
-        assert!(gate_tool("sql", &serde_json::json!({"query": "INSERT INTO t VALUES (1)"}), &ctx).is_some());
+        assert!(gate_tool(
+            "sql",
+            &serde_json::json!({"query": "INSERT INTO t VALUES (1)"}),
+            &ctx
+        )
+        .is_some());
         assert!(gate_tool("sql", &serde_json::json!({"query": "DELETE FROM t"}), &ctx).is_some());
+        // Read-only SQL still gates on an outside-workspace sqlite file.
+        assert!(gate_tool(
+            "sql",
+            &serde_json::json!({"query": "SELECT 1", "db": "app.db"}),
+            &ctx
+        )
+        .is_none());
+        assert!(gate_tool(
+            "sql",
+            &serde_json::json!({"query": "SELECT 1", "db": "/etc/app.db"}),
+            &ctx
+        )
+        .is_some());
+        assert!(gate_tool(
+            "sql",
+            &serde_json::json!({"query": "SELECT 1", "db": "postgres://u:p@host/db"}),
+            &ctx
+        )
+        .is_none());
+
+        // jq: inline text and in-workspace files are ungated; outside paths gate.
+        assert!(gate_tool(
+            "jq",
+            &serde_json::json!({"filter": ".", "json": "{\"a\":1}"}),
+            &ctx
+        )
+        .is_none());
+        assert!(gate_tool(
+            "jq",
+            &serde_json::json!({"filter": ".", "path": "data.json"}),
+            &ctx
+        )
+        .is_none());
+        assert!(gate_tool(
+            "jq",
+            &serde_json::json!({"filter": ".", "path": "/etc/passwd"}),
+            &ctx
+        )
+        .is_some());
+
+        // gh: reads ungated, remote mutations gated.
+        assert!(gate_tool("gh", &serde_json::json!({"action": "pr_list"}), &ctx).is_none());
+        assert!(gate_tool("gh", &serde_json::json!({"action": "run_view"}), &ctx).is_none());
+        assert!(gate_tool("gh", &serde_json::json!({"action": "pr_merge"}), &ctx).is_some());
+        assert!(gate_tool("gh", &serde_json::json!({"action": "api"}), &ctx).is_some());
+
+        // test: known runners ungated, custom commands gated.
+        assert!(gate_tool("test", &serde_json::json!({"runner": "cargo"}), &ctx).is_none());
+        assert!(gate_tool("test", &serde_json::json!({"runner": "pytest"}), &ctx).is_none());
+        assert!(gate_tool(
+            "test",
+            &serde_json::json!({"runner": "custom", "args": ["make", "test"]}),
+            &ctx
+        )
+        .is_some());
     }
 }

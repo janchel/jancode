@@ -25,7 +25,28 @@ pub struct Session {
     /// Persists across turns so repeated edits to the same file don't re-prompt.
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     pub approved_paths: HashSet<String>,
+    /// Whether this session is a live swarm member (interactive chat or a
+    /// spawned headless agent). Persisted so the roster survives a restart.
+    #[serde(default)]
+    pub is_swarm_member: bool,
+    /// For a headless agent: the session it reports back to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// Whether this session runs headlessly (auto-approved, no human attached).
+    #[serde(default)]
+    pub is_headless: bool,
 }
+
+/// Best-effort: make a daemon-created file owner-only. Session transcripts and
+/// the socket can contain prompts, paths, and provider output.
+#[cfg(unix)]
+fn restrict_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn restrict_permissions(_path: &std::path::Path) {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredToolCall {
@@ -58,20 +79,34 @@ pub async fn create_session(working_dir: &str, model: &str) -> Result<Session> {
         created_at_ms: now,
         updated_at_ms: now,
         approved_paths: HashSet::new(),
+        is_swarm_member: false,
+        parent_session_id: None,
+        is_headless: false,
     };
     save_session(&session).await?;
     Ok(session)
 }
 
-#[allow(dead_code)]
 pub async fn save_session(session: &Session) -> Result<()> {
     let dir = sessions_dir();
-    fs::create_dir_all(&dir).await.context("creating sessions dir")?;
+    fs::create_dir_all(&dir)
+        .await
+        .context("creating sessions dir")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     let path = dir.join(format!("{}.json", session.id));
-    let tmp = dir.join(format!("{}.tmp", session.id));
+    // Unique temp name: concurrent saves of the same session must not clobber
+    // one another's `.tmp`.
+    let tmp = dir.join(format!("{}.{}.tmp", session.id, Uuid::new_v4()));
     let data = serde_json::to_vec_pretty(session)?;
     fs::write(&tmp, data).await.context("writing session tmp")?;
-    fs::rename(&tmp, &path).await.context("renaming session file")?;
+    fs::rename(&tmp, &path)
+        .await
+        .context("renaming session file")?;
+    restrict_permissions(&path);
     Ok(())
 }
 
@@ -88,7 +123,9 @@ pub async fn load_session(id: &str) -> Result<Option<Session>> {
 
 #[allow(dead_code)]
 pub async fn append_message(session_id: &str, role: &str, content: &str) -> Result<()> {
-    let mut session = load_session(session_id).await?.ok_or_else(|| anyhow::anyhow!("session not found"))?;
+    let mut session = load_session(session_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("session not found"))?;
     let msg = Message {
         role: role.to_string(),
         content: content.to_string(),
@@ -118,6 +155,6 @@ pub async fn list_sessions() -> Result<Vec<Session>> {
             }
         }
     }
-    sessions.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at_ms));
     Ok(sessions)
 }

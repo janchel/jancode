@@ -89,8 +89,6 @@ struct StreamChoice {
 #[derive(Debug, Clone, Deserialize)]
 struct StreamDelta {
     #[serde(default)]
-    role: Option<String>,
-    #[serde(default)]
     content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ApiToolCall>>,
@@ -132,6 +130,19 @@ fn stream_stall() -> std::time::Duration {
         .unwrap_or(STREAM_STALL_DEFAULT)
 }
 
+/// Provider HTTP client, built once and reused so connections are pooled
+/// across turns instead of being re-established for every request.
+fn provider_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .timeout(std::time::Duration::from_secs(12 * 60 * 60))
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default()
+    })
+}
+
 /// Perform the POST and consume the streamed SSE body, reassembling it as a
 /// string. Unlike `.text()`, which runs a single total deadline over the whole
 /// exchange and trips on long-context generations that stream slowly, this
@@ -154,12 +165,21 @@ async fn do_chat_request(
         .context("sending chat request")?;
     if !resp.status().is_success() {
         let status = resp.status();
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
         let text = tokio::time::timeout(std::time::Duration::from_secs(30), resp.text())
             .await
             .unwrap_or_else(|_| Ok("(reading error body timed out)".to_string()))
             .unwrap_or_default();
         tracing::error!("provider error {}: {}", status, text);
-        anyhow::bail!("provider error {}: {}", status, text);
+        let mut msg = format!("provider error {}: {}", status, text);
+        if let Some(ra) = retry_after {
+            msg.push_str(&format!(" (retry-after: {}s)", ra));
+        }
+        anyhow::bail!(msg);
     }
 
     // Incremental read: append bytes to a raw buffer, splitting on newlines so
@@ -191,15 +211,59 @@ async fn do_chat_request(
             })?;
         let chunk = chunk.context("reading response body")?;
         let Some(bytes) = chunk else { break };
-        // Detect keepalive-only chunks: a line that is `data: {...}` with an
-        // empty delta and no content/tool_calls. We count them and bail if the
-        // provider keeps sending them without progress. Only count a chunk as
-        // keepalive if it has NO real content and NO [DONE] marker.
-        let line_str = String::from_utf8_lossy(&bytes);
-        let is_keepalive = !line_str.contains("[DONE]")
-            && line_str.contains("\"delta\":{}")
-            && !line_str.contains("\"content\":\"")
-            && !line_str.contains("\"tool_calls\"");
+        // Detect keepalive-only chunks: an SSE payload whose delta carries no
+        // content, tool calls, or reasoning and has no finish reason. Count
+        // them and bail if the provider sends nothing else for the whole stall
+        // window. Parsing the JSON (rather than matching `"delta":{}`) also
+        // catches `"delta": {}` and routers that use different whitespace.
+        let chunk_text = String::from_utf8_lossy(&bytes);
+        let mut is_keepalive = !chunk_text.contains("[DONE]");
+        for line in chunk_text.lines() {
+            let Some(data) = line.trim().strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() {
+                continue;
+            }
+            if data == "[DONE]" {
+                is_keepalive = false;
+                break;
+            }
+            let Some(v) = serde_json::from_str::<Value>(data).ok() else {
+                // Partial JSON line split across chunks: don't classify it as
+                // a keepalive; the next chunk completes it.
+                is_keepalive = false;
+                break;
+            };
+            let choice = v
+                .get("choices")
+                .and_then(|c| c.as_array())
+                .and_then(|a| a.first());
+            let delta = choice.and_then(|c| c.get("delta"));
+            let has_content = delta
+                .and_then(|d| d.get("content"))
+                .and_then(|c| c.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            let has_tools = delta
+                .and_then(|d| d.get("tool_calls"))
+                .map(|t| !t.is_null())
+                .unwrap_or(false);
+            let has_reasoning = delta
+                .and_then(|d| d.get("reasoning").or_else(|| d.get("reasoning_content")))
+                .and_then(|r| r.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            let finished = choice
+                .and_then(|c| c.get("finish_reason"))
+                .map(|f| !f.is_null())
+                .unwrap_or(false);
+            if has_content || has_tools || has_reasoning || finished {
+                is_keepalive = false;
+                break;
+            }
+        }
         if is_keepalive {
             let now = std::time::Instant::now();
             let start = *first_empty.get_or_insert(now);
@@ -235,7 +299,10 @@ async fn do_chat_request(
 /// retried.
 fn is_retryable_transport_error(e: &anyhow::Error) -> bool {
     e.chain().any(|cause| {
-        if cause.downcast_ref::<tokio::time::error::Elapsed>().is_some() {
+        if cause
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some()
+        {
             return true;
         }
         // Keepalive-only stall: transient provider condition (router routed to a
@@ -252,21 +319,23 @@ fn is_retryable_transport_error(e: &anyhow::Error) -> bool {
 
 /// True when the error is an HTTP 429 (rate limit) response.
 fn is_rate_limit_error(e: &anyhow::Error) -> bool {
-    e.to_string().contains("429")
+    let msg = e.to_string();
+    msg.contains("provider error 429") || msg.contains("HTTP 429")
 }
 
-/// Extract the suggested wait time from a 429 rate-limit error message, if the
-/// provider includes one (e.g. "Please try again in 13.155s"). Falls back to a
-/// default backoff.
+/// Extract the suggested wait time from a 429 rate-limit error message. Prefers
+/// the server's `Retry-After` header (added to the error by `do_chat_request`),
+/// then the common "in 13.155s" prose hint. Falls back to a default backoff.
 fn rate_limit_wait(e: &anyhow::Error) -> std::time::Duration {
     let msg = e.to_string();
-    // Look for "in <N>s" or "in <N> seconds" in the message.
-    if let Some(idx) = msg.find("in ") {
-        let rest = &msg[idx + 3..];
-        let num: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
-        if let Ok(secs) = num.parse::<f64>() {
-            if secs > 0.0 {
-                return std::time::Duration::from_secs_f64(secs + 1.0);
+    for pattern in [r"retry-after:\s*([0-9.]+)", r"\bin\s+([0-9.]+)\s*s"] {
+        if let Ok(re) = regex::Regex::new(pattern) {
+            if let Some(c) = re.captures(&msg) {
+                if let Ok(secs) = c[1].parse::<f64>() {
+                    if secs >= 0.0 {
+                        return std::time::Duration::from_secs_f64(secs + 1.0);
+                    }
+                }
             }
         }
     }
@@ -278,18 +347,18 @@ fn rate_limit_wait(e: &anyhow::Error) -> std::time::Duration {
 /// that don't match the tool's declared JSON schema (e.g. `file_path` instead
 /// of `path`, or a `raw` wrapper around a JSON string). We repair the common
 /// cases so the tool can actually run instead of failing and looping.
-fn normalize_tool_args(name: &str, input: &Value) -> Value {
+fn normalize_tool_args(_name: &str, input: &Value) -> Value {
     // If the args failed to parse as JSON, they were wrapped in `{"raw": ...}`.
     // Try to recover the inner JSON string and re-parse it.
     if let Some(raw) = input.get("raw").and_then(|v| v.as_str()) {
         if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
-            return normalize_tool_args(name, &parsed);
+            return normalize_tool_args(_name, &parsed);
         }
         // If the raw string is truncated JSON (unbalanced braces), try to
         // repair it by balancing braces.
         if let Some(repaired) = repair_truncated_json(raw) {
             if let Ok(parsed) = serde_json::from_str::<Value>(&repaired) {
-                return normalize_tool_args(name, &parsed);
+                return normalize_tool_args(_name, &parsed);
             }
         }
     }
@@ -299,9 +368,9 @@ fn normalize_tool_args(name: &str, input: &Value) -> Value {
     // instead of `path`, etc. We rebuild the object with canonical keys.
     if let Some(obj) = input.as_object() {
         let mut out = serde_json::json!({});
-        if let Some(mut out_map) = out.as_object_mut() {
+        if let Some(out_map) = out.as_object_mut() {
             for (k, v) in obj {
-                let canonical = canonical_key(&k);
+                let canonical = canonical_key(k);
                 // Only set if not already present (don't overwrite a canonical key).
                 if !out_map.contains_key(&canonical) {
                     out_map.insert(canonical, v.clone());
@@ -316,7 +385,9 @@ fn normalize_tool_args(name: &str, input: &Value) -> Value {
 /// Map a non-standard tool-argument key to the canonical one the tools expect.
 fn canonical_key(k: &str) -> String {
     match k {
-        "file_path" | "file" | "filename" | "filepath" | "target_path" | "destination" => "path".to_string(),
+        "file_path" | "file" | "filename" | "filepath" | "target_path" | "destination" => {
+            "path".to_string()
+        }
         "command_line" | "cmd" | "shell_command" => "command".to_string(),
         "query_string" | "search" => "query".to_string(),
         "pattern_str" | "glob_pattern" => "pattern".to_string(),
@@ -350,10 +421,8 @@ fn repair_truncated_json(s: &str) -> Option<String> {
             '"' => in_string = true,
             '{' => stack.push('}'),
             '[' => stack.push(']'),
-            '}' | ']' => {
-                if !stack.is_empty() && stack.last().map(|x| *x).unwrap_or('\0') == c {
-                    stack.pop();
-                }
+            '}' | ']' if !stack.is_empty() && stack.last().copied().unwrap_or('\0') == c => {
+                stack.pop();
             }
             _ => {}
         }
@@ -369,6 +438,7 @@ fn repair_truncated_json(s: &str) -> Option<String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn send_message(
     cfg: &Config,
     provider_name: Option<&str>,
@@ -380,15 +450,12 @@ pub async fn send_message(
     tool_budget: Option<u32>,
 ) -> Result<Vec<Event>> {
     let provider = crate::config::resolve_provider(cfg, provider_name);
-    let api_key = resolve_api_key(cfg, &provider)?;
+    let api_key = resolve_api_key(&provider)?;
     let base_url = provider.base_url.trim_end_matches('/');
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(12 * 60 * 60))
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .build()?;
+    let client = provider_client();
 
     let mut system = if provider.supports_tools {
-        "You are a helpful AI coding agent with local filesystem access. You have tools: list_dir, glob, read, agentgrep, bash, write, edit, apply_patch, plan, git, fetch_url, http_request, note, docker, sql.
+        "You are a helpful AI coding agent with local filesystem access. You have tools: list_dir, glob, read, agentgrep, bash, write, edit, apply_patch, plan, git, fetch_url, http_request, note, docker, sql, jq, gh, test.
 
 WORKFLOW (be surgical, not exhaustive):
 1. Start with list_dir on '.' to see the project structure.
@@ -500,7 +567,6 @@ The user's time and tokens are limited. Be concise and direct.".to_string()
     // an overloaded upstream. Native format round-trips reliably. Only
     // `tool_call_style = "flattened"` (for providers like LM Studio that reject
     // tool roles) triggers the flattened text encoding.
-    let has_tool_history = session_messages.iter().any(|m| m.role == "tool" || m.tool_calls.is_some());
     let flattened = provider.tool_call_style == "flattened";
     let auto_style = provider.tool_call_style == "auto";
 
@@ -543,38 +609,34 @@ The user's time and tokens are limited. Be concise and direct.".to_string()
             }
         }
     } else {
-        messages.extend(
-            session_messages
-                .iter()
-                .map(|m| ChatMessage {
-                    role: m.role.clone(),
-                    // Provider compatibility: an assistant message that carries
-                    // `tool_calls` must have `content` as null/omitted (not an
-                    // empty string) — LM Studio's Gemma rejects `content:""` on a
-                    // tool-call message. Tool-result and regular messages keep a
-                    // string content.
-                    content: if m.tool_calls.is_some() {
-                        None
-                    } else {
-                        Some(m.content.clone())
-                    },
-                    tool_calls: m.tool_calls.as_ref().map(|tcs| {
-                        tcs.iter()
-                            .enumerate()
-                            .map(|(i, tc)| ApiToolCall {
-                                id: Some(tc.id.clone()),
-                                index: i,
-                                tool_type: "function".to_string(),
-                                function: ApiFunctionCall {
-                                    name: Some(tc.name.clone()),
-                                    arguments: Some(tc.arguments.clone()),
-                                },
-                            })
-                            .collect()
-                    }),
-                    tool_call_id: m.tool_call_id.clone(),
-                }),
-        );
+        messages.extend(session_messages.iter().map(|m| ChatMessage {
+            role: m.role.clone(),
+            // Provider compatibility: an assistant message that carries
+            // `tool_calls` must have `content` as null/omitted (not an
+            // empty string) — LM Studio's Gemma rejects `content:""` on a
+            // tool-call message. Tool-result and regular messages keep a
+            // string content.
+            content: if m.tool_calls.is_some() {
+                None
+            } else {
+                Some(m.content.clone())
+            },
+            tool_calls: m.tool_calls.as_ref().map(|tcs| {
+                tcs.iter()
+                    .enumerate()
+                    .map(|(i, tc)| ApiToolCall {
+                        id: Some(tc.id.clone()),
+                        index: i,
+                        tool_type: "function".to_string(),
+                        function: ApiFunctionCall {
+                            name: Some(tc.name.clone()),
+                            arguments: Some(tc.arguments.clone()),
+                        },
+                    })
+                    .collect()
+            }),
+            tool_call_id: m.tool_call_id.clone(),
+        }));
     }
 
     let tool_defs = tools.map(|tds| {
@@ -590,10 +652,12 @@ The user's time and tokens are limited. Be concise and direct.".to_string()
             .collect::<Vec<_>>()
     });
 
+    // Only send `tool_choice` when tools are actually present; several providers
+    // reject a `tool_choice` value with no `tools` array.
     let tool_choice = if tool_defs.is_some() {
         Some(serde_json::json!("auto"))
     } else {
-        Some(serde_json::json!("none"))
+        None
     };
 
     // Optional context-window trimming: if `context_window` is set, drop the
@@ -609,7 +673,13 @@ The user's time and tokens are limited. Be concise and direct.".to_string()
         // the budget. Always keep at least the system prompt + last 2 turns.
         let min_keep = 3; // system + user + assistant
         for i in (min_keep..messages.len()).rev() {
-            let est = (messages[i].content.as_deref().map_or(0, |c| c.len()) / 4) as u64;
+            let content_len = messages[i].content.as_deref().map_or(0, |c| c.len());
+            let tool_len = messages[i].tool_calls.as_ref().map_or(0, |tcs| {
+                tcs.iter()
+                    .map(|tc| tc.function.arguments.as_deref().map_or(0, |s| s.len()))
+                    .sum()
+            });
+            let est = ((content_len + tool_len) / 4) as u64;
             if total + est > budget {
                 break;
             }
@@ -617,19 +687,32 @@ The user's time and tokens are limited. Be concise and direct.".to_string()
             keep_from = i;
         }
         if keep_from > min_keep {
-            tracing::info!(
-                "context window {}: trimming {} oldest messages (keeping {}..{})",
-                budget,
-                keep_from - min_keep,
-                keep_from,
-                messages.len(),
-            );
-            let mut trimmed = Vec::new();
-            trimmed.push(messages[0].clone()); // system prompt
-            for i in keep_from..messages.len() {
-                trimmed.push(messages[i].clone());
+            // Never split a tool exchange. Dropping an assistant `tool_calls`
+            // message while keeping its `tool` results (or vice versa) makes
+            // most providers reject the request, so skip trimming in that case.
+            let would_split_tool_group = (min_keep..keep_from)
+                .any(|i| messages[i].role == "tool" || messages[i].tool_calls.is_some())
+                || messages[keep_from - 1].tool_calls.is_some();
+            if would_split_tool_group {
+                tracing::info!(
+                    "context window {}: skipping trim to keep tool-call groups intact",
+                    budget
+                );
+            } else {
+                tracing::info!(
+                    "context window {}: trimming {} oldest messages (keeping {}..{})",
+                    budget,
+                    keep_from - min_keep,
+                    keep_from,
+                    messages.len(),
+                );
+                let mut trimmed = Vec::new();
+                trimmed.push(messages[0].clone()); // system prompt
+                for msg in &messages[keep_from..] {
+                    trimmed.push(msg.clone());
+                }
+                messages = trimmed;
             }
-            messages = trimmed;
         }
     }
 
@@ -655,10 +738,19 @@ The user's time and tokens are limited. Be concise and direct.".to_string()
     };
 
     let url = format!("{}/chat/completions", base_url);
-    tracing::info!("provider request: model={}, messages={}, tools={}", req.model, req.messages.len(), req.tools.as_ref().map_or(0, |t| t.len()));
+    tracing::info!(
+        "provider request: model={}, messages={}, tools={}",
+        req.model,
+        req.messages.len(),
+        req.tools.as_ref().map_or(0, |t| t.len())
+    );
     if let Some(ref tool_list) = req.tools {
         for td in tool_list {
-            tracing::info!("  tool: {} - {}", td.function.name, td.function.description.chars().take(60).collect::<String>());
+            tracing::info!(
+                "  tool: {} - {}",
+                td.function.name,
+                td.function.description.chars().take(60).collect::<String>()
+            );
         }
     }
     // Debug: dump the exact JSON payload so we can see what the provider rejects.
@@ -691,11 +783,16 @@ The user's time and tokens are limited. Be concise and direct.".to_string()
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match do_chat_request(&client, &url, &api_key, &req).await {
+            match do_chat_request(client, &url, &api_key, &req).await {
                 Ok(body) => break body,
                 Err(e) if attempt <= 3 && is_retryable_transport_error(&e) => {
-                    tracing::warn!("provider transport failure: {:?}; retrying (attempt {})", e, attempt);
-                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+                    tracing::warn!(
+                        "provider transport failure: {:?}; retrying (attempt {})",
+                        e,
+                        attempt
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
+                        .await;
                     continue;
                 }
                 Err(e) if attempt <= 3 && is_rate_limit_error(&e) => {
@@ -709,7 +806,11 @@ The user's time and tokens are limited. Be concise and direct.".to_string()
                         );
                         return Err(e);
                     }
-                    tracing::warn!("provider rate limited; retrying in {}s (attempt {})", wait.as_secs(), attempt);
+                    tracing::warn!(
+                        "provider rate limited; retrying in {}s (attempt {})",
+                        wait.as_secs(),
+                        attempt
+                    );
                     tokio::time::sleep(wait).await;
                     continue;
                 }
@@ -717,10 +818,20 @@ The user's time and tokens are limited. Be concise and direct.".to_string()
             }
         }
     };
-    tracing::info!("provider response: {} lines, {} bytes", body.lines().count(), body.len());
+    tracing::info!(
+        "provider response: {} lines, {} bytes",
+        body.lines().count(),
+        body.len()
+    );
     tracing::debug!("provider response body: {}", body);
     for line in body.lines() {
-        process_line(line, &mut events, &mut full, &mut pending, &mut reasoning_buf);
+        process_line(
+            line,
+            &mut events,
+            &mut full,
+            &mut pending,
+            &mut reasoning_buf,
+        );
     }
 
     // Emit the accumulated reasoning as a single Status event (if any).
@@ -738,9 +849,8 @@ The user's time and tokens are limited. Be concise and direct.".to_string()
             .into_iter()
             .map(|a| {
                 let name = a.name.clone();
-                let input: Value = serde_json::from_str(&a.args).unwrap_or_else(|_| {
-                    serde_json::json!({ "raw": a.args.clone() })
-                });
+                let input: Value = serde_json::from_str(&a.args)
+                    .unwrap_or_else(|_| serde_json::json!({ "raw": a.args.clone() }));
                 let norm = normalize_tool_args(&name, &input);
                 ToolCall {
                     id: a.id,
@@ -769,17 +879,19 @@ The user's time and tokens are limited. Be concise and direct.".to_string()
         events.push(Event::Done { id: Some(0) });
     }
     if events.is_empty() {
-        events.push(Event::TextDelta { id: None, text: full });
+        events.push(Event::TextDelta {
+            id: None,
+            text: full,
+        });
         events.push(Event::Done { id: Some(0) });
     }
     Ok(events)
 }
 
-/// Parse tool calls written as text in flattened mode. Handles two formats the
-/// model may emit:
-///   1. `[calling tools: read {"path":"styles.css"}]` (compact, `;`-separated)
-///   2. `[tool_request] {json} [END_TOOL_REQUEST]` (JSON block)
-/// Returns `None` if no tool-call marker is present.
+/// Parse tool calls written as text in flattened mode. Handles both the
+/// compact `[calling tools: read {"path":"styles.css"}]` marker (`;`-separated)
+/// and the `[tool_request] {json} [END_TOOL_REQUEST]` JSON block. Returns
+/// `None` if no tool-call marker is present.
 fn parse_flattened_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
     let mut calls = Vec::new();
 
@@ -796,7 +908,10 @@ fn parse_flattened_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
                 .and_then(|n| n.as_str())
                 .unwrap_or("")
                 .to_string();
-            let args = v.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({}));
+            let args = v
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
             if !name.is_empty() {
                 calls.push(ToolCall {
                     id: format!("text-{}", calls.len()),
@@ -866,9 +981,8 @@ fn parse_flattened_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
                                 if n.is_empty() {
                                     continue;
                                 }
-                                let input: Value = serde_json::from_str(args_str).unwrap_or_else(|_| {
-                                    serde_json::json!({ "raw": args_str })
-                                });
+                                let input: Value = serde_json::from_str(args_str)
+                                    .unwrap_or_else(|_| serde_json::json!({ "raw": args_str }));
                                 calls.push(ToolCall {
                                     id: format!("text-{}", calls.len()),
                                     name: n,
@@ -921,7 +1035,10 @@ fn process_line(
         if let Some(text) = &choice.delta.content {
             if !text.is_empty() {
                 full.push_str(text);
-                events.push(Event::TextDelta { id: None, text: text.clone() });
+                events.push(Event::TextDelta {
+                    id: None,
+                    text: text.clone(),
+                });
             }
         }
 
@@ -929,9 +1046,11 @@ fn process_line(
         // buffer; they're emitted as a single Status event after the stream.
         // Handles both `reasoning` (OpenAI-style) and `reasoning_content`
         // (DeepSeek-style) field names.
-        let reasoning = choice.delta.reasoning
+        let reasoning = choice
+            .delta
+            .reasoning
             .as_ref()
-            .or_else(|| choice.delta.reasoning_content.as_ref());
+            .or(choice.delta.reasoning_content.as_ref());
         if let Some(r) = reasoning {
             if !r.is_empty() {
                 reasoning_buf.push_str(r);
@@ -991,7 +1110,7 @@ pub async fn list_models(cfg: &Config, provider_name: Option<&str>) -> Result<Ve
     if !provider.models.is_empty() {
         return Ok(provider.models.clone());
     }
-    let api_key = resolve_api_key(cfg, &provider)?;
+    let api_key = resolve_api_key(&provider)?;
     let base_url = provider.base_url.trim_end_matches('/');
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -1020,7 +1139,7 @@ pub async fn list_models(cfg: &Config, provider_name: Option<&str>) -> Result<Ve
     Ok(parsed.data.into_iter().map(|m| m.id).collect())
 }
 
-fn resolve_api_key(cfg: &Config, provider: &ProviderConfig) -> Result<String> {
+fn resolve_api_key(provider: &ProviderConfig) -> Result<String> {
     // 1. Inline key in config (easiest for single-user setups)
     if let Some(ref key) = provider.api_key {
         if !key.trim().is_empty() {
@@ -1101,9 +1220,17 @@ mod tests {
             "[calling tools: edit {\"path\":\"styles.css\",\"new_string\":\"body { color: #fff; background: rgba(26,60,52,0.98); }\",\"old_string\":\"body { color: #000; }\"}]",
         )
         .unwrap();
-        assert_eq!(calls.len(), 1, "should be exactly ONE edit call, got {}", calls.len());
+        assert_eq!(
+            calls.len(),
+            1,
+            "should be exactly ONE edit call, got {}",
+            calls.len()
+        );
         assert_eq!(calls[0].name, "edit");
-        assert_eq!(calls[0].input["new_string"], "body { color: #fff; background: rgba(26,60,52,0.98); }");
+        assert_eq!(
+            calls[0].input["new_string"],
+            "body { color: #fff; background: rgba(26,60,52,0.98); }"
+        );
     }
 
     #[test]
@@ -1119,10 +1246,24 @@ mod tests {
         // Parses the "in 13.155s" hint from the error message.
         let e = anyhow::anyhow!("Please try again in 13.155s. Need more tokens?");
         let wait = rate_limit_wait(&e);
-        assert!(wait.as_secs() >= 14, "expected ~14s, got {}", wait.as_secs());
+        assert!(
+            wait.as_secs() >= 14,
+            "expected ~14s, got {}",
+            wait.as_secs()
+        );
         // Falls back to 15s when no hint is present.
         let e2 = anyhow::anyhow!("provider error 429 Too Many Requests");
         assert_eq!(rate_limit_wait(&e2).as_secs(), 15);
+    }
+
+    #[test]
+    fn rate_limit_wait_prefers_retry_after_header() {
+        let e = anyhow::anyhow!("provider error 429: slow down (retry-after: 7s)");
+        assert_eq!(rate_limit_wait(&e).as_secs(), 8);
+        let _e = anyhow::anyhow!("provider error 429 Too Many Requests");
+        assert!(!is_rate_limit_error(&anyhow::anyhow!(
+            "provider error 500 Internal Server Error"
+        )));
     }
 
     #[test]
@@ -1131,7 +1272,10 @@ mod tests {
         let v = normalize_tool_args("read", &serde_json::json!({"file_path": "styles.css"}));
         assert_eq!(v["path"], "styles.css");
         // `raw` wrapper around a JSON string is unwrapped.
-        let v = normalize_tool_args("write", &serde_json::json!({"raw": "{\"path\": \"a.css\", \"content\": \"x\"}"}));
+        let v = normalize_tool_args(
+            "write",
+            &serde_json::json!({"raw": "{\"path\": \"a.css\", \"content\": \"x\"}"}),
+        );
         assert_eq!(v["path"], "a.css");
         assert_eq!(v["content"], "x");
         // Truncated JSON in `raw` is repaired (unbalanced brace).
@@ -1144,8 +1288,14 @@ mod tests {
 
     #[test]
     fn repairs_truncated_json() {
-        assert_eq!(repair_truncated_json("{\"path\": \"a.css\"").unwrap(), "{\"path\": \"a.css\"}");
-        assert_eq!(repair_truncated_json("{\"a\": [1, 2").unwrap(), "{\"a\": [1, 2]}");
+        assert_eq!(
+            repair_truncated_json("{\"path\": \"a.css\"").unwrap(),
+            "{\"path\": \"a.css\"}"
+        );
+        assert_eq!(
+            repair_truncated_json("{\"a\": [1, 2").unwrap(),
+            "{\"a\": [1, 2]}"
+        );
         // Balanced JSON -> None (nothing to repair).
         assert!(repair_truncated_json("{\"a\": 1}").is_none());
     }

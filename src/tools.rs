@@ -2,39 +2,9 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-
-/// Lighter-clone of jancode-tool-types::ToolOutput + jancode-tool-core traits, kept
-/// minimal: a plain string output plus an optional markdown rendering hint.
-#[derive(Debug, Clone)]
-pub struct ToolOutput {
-    pub output: String,
-    pub title: Option<String>,
-    pub is_error: bool,
-}
-
-impl ToolOutput {
-    pub fn new(output: impl Into<String>) -> Self {
-        Self {
-            output: output.into(),
-            title: None,
-            is_error: false,
-        }
-    }
-
-    pub fn error(output: impl Into<String>) -> Self {
-        Self {
-            output: output.into(),
-            title: None,
-            is_error: true,
-        }
-    }
-
-    pub fn with_title(mut self, title: impl Into<String>) -> Self {
-        self.title = Some(title.into());
-        self
-    }
-}
+use std::sync::{Arc, Mutex};
 
 /// JSON Schema tool definition, matching the OpenAI function-calling shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,22 +12,6 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub parameters: Value,
-}
-
-/// A tool call returned by the model.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolCall {
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub input: Value,
-}
-
-/// A completed tool execution for appending to the conversation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolResult {
-    pub tool_call_id: String,
-    pub output: String,
 }
 
 /// Trait mirroring jancode-tool-core::Tool, simplified for a single binary crate.
@@ -95,9 +49,22 @@ pub struct ToolContext {
     /// aggressively the `bash` tool is gated for commands that reference paths
     /// outside the working directory.
     pub bash_gate: String,
+    /// Paths the user explicitly approved for outside-workspace writes during
+    /// this turn (populated by the approval gate). Shared through clones so the
+    /// concurrent read-only tool fan-out sees the same set.
+    pub allowed_outside: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 impl ToolContext {
+    pub fn new(working_dir: PathBuf, database_url: String, bash_gate: String) -> Self {
+        Self {
+            working_dir,
+            database_url,
+            bash_gate,
+            allowed_outside: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
     pub fn resolve_path(&self, path: &str) -> PathBuf {
         let p = Path::new(path);
         if p.is_absolute() {
@@ -105,6 +72,69 @@ impl ToolContext {
         } else {
             self.working_dir.join(p)
         }
+    }
+}
+
+/// The canonical built-in tool names, in registry order. Shared by the client
+/// (tool allow-list) and the daemon (registry filtering) so the two can't drift.
+pub const BUILTIN_TOOLS: &[&str] = &[
+    "bash",
+    "read",
+    "write",
+    "edit",
+    "list_dir",
+    "glob",
+    "agentgrep",
+    "apply_patch",
+    "plan",
+    "git",
+    "fetch_url",
+    "http_request",
+    "note",
+    "docker",
+    "sql",
+    "jq",
+    "gh",
+    "test",
+];
+
+/// Resolve a path for a *writing* tool and enforce workspace confinement.
+///
+/// `write`/`edit`/`apply_patch` accept arbitrary strings, so without this a
+/// model (or a malicious prompt) could overwrite files outside the workspace
+/// with `../../etc/...` or an absolute path. Paths are normalized lexically
+/// (`.`/`..` resolved, symlinks not followed) and rejected when they escape
+/// `ctx.working_dir` — unless the user explicitly approved that path for this
+/// turn (see [`allow_outside`]). Headless agents never populate the allow-list,
+/// so their writes are always confined.
+pub fn resolve_within(ctx: &ToolContext, path: &str) -> Result<PathBuf> {
+    let full = ctx.resolve_path(path);
+    let normalized = normalize_path(&full);
+    let base = normalize_path(&ctx.working_dir);
+    if normalized.starts_with(&base) {
+        return Ok(full);
+    }
+    let allowed = ctx
+        .allowed_outside
+        .lock()
+        .map(|set| set.contains(&normalized))
+        .unwrap_or(false);
+    if allowed {
+        return Ok(full);
+    }
+    anyhow::bail!(
+        "path {} is outside the workspace {} (not approved)",
+        full.display(),
+        ctx.working_dir.display()
+    );
+}
+
+/// Record an interactive approval for an outside-workspace write. Called by the
+/// daemon's approval gate when the user answers `y`.
+pub fn allow_outside(ctx: &ToolContext, path: &str) {
+    let normalized = normalize_path(&ctx.resolve_path(path));
+    if let Ok(mut set) = ctx.allowed_outside.lock() {
+        set.insert(normalized);
     }
 }
 
@@ -276,7 +306,11 @@ fn is_likely_target(t: &str) -> bool {
     if t.is_empty() {
         return false;
     }
-    if t.starts_with("s/") || t.starts_with("y/") || t.starts_with("p;") || t.starts_with('/') && t.len() > 1 {
+    if t.starts_with("s/")
+        || t.starts_with("y/")
+        || t.starts_with("p;")
+        || t.starts_with('/') && t.len() > 1
+    {
         return false; // sed/awk expression or an operator-ish `/something`
     }
     if t.contains('/') {
@@ -475,7 +509,7 @@ pub fn bash_escapes_workspace(command: &str, working_dir: &Path, mode: &str) -> 
         // `/*`/`*/` are comment markers, not paths.
         if tok.starts_with("/") && tok != "/" && !tok.starts_with("/*") && !tok.starts_with("*/") {
             let trimmed = tok.trim_end_matches('/');
-            if is_outside(working_dir, &std::path::Path::new(trimmed)) {
+            if is_outside(working_dir, std::path::Path::new(trimmed)) {
                 return Some(format!("references absolute path {}", tok));
             }
             // otherwise: absolute path inside the workspace — safe.
@@ -524,13 +558,22 @@ impl ToolRegistry {
         self.tools.push(tool);
     }
 
+    /// Keep only tools whose names appear in `names`. Used to honor the
+    /// client's `tools` allow-list instead of always sending the full registry.
+    pub fn retain_names(&mut self, names: &[String]) {
+        self.tools.retain(|t| names.iter().any(|n| n == t.name()));
+    }
+
     pub fn all(&self) -> &[Box<dyn Tool>] {
         &self.tools
     }
 
     /// Look up a tool by name (after alias resolution).
     pub fn find(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools.iter().find(|t| t.name() == name).map(|b| b.as_ref())
+        self.tools
+            .iter()
+            .find(|t| t.name() == name)
+            .map(|b| b.as_ref())
     }
 }
 
@@ -558,6 +601,9 @@ pub fn default_registry() -> ToolRegistry {
     r.register(NoteTool);
     r.register(DockerTool);
     r.register(SqlTool);
+    r.register(JqTool);
+    r.register(GhTool);
+    r.register(TestTool);
     r
 }
 
@@ -608,24 +654,25 @@ impl Tool for BashTool {
         // OUTSIDE the workspace are left untouched so the approval gate still
         // sees the escape; by the time this runs, such commands have already
         // been approved, but the rewrite must not mask an external cd.
-        let command = normalize_bash_cd(command, &ctx.working_dir).unwrap_or_else(|| command.to_string());
+        let command =
+            normalize_bash_cd(command, &ctx.working_dir).unwrap_or_else(|| command.to_string());
 
-        let mut child = tokio::process::Command::new("bash")
+        let child = tokio::process::Command::new("bash")
             .arg("-c")
             .arg(&command)
             .current_dir(&ctx.working_dir)
+            // Kill the child if the timeout (or a `Cancel`) drops the future;
+            // otherwise an orphaned command keeps running after the tool call.
+            .kill_on_drop(true)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .context("failed to spawn shell")?;
 
-        let output = tokio::time::timeout(
-            std::time::Duration::from_millis(timeout_ms),
-            async {
-                let out = child.wait_with_output().await?;
-                Ok::<_, std::io::Error>(out)
-            },
-        )
+        let output = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), async {
+            let out = child.wait_with_output().await?;
+            Ok::<_, std::io::Error>(out)
+        })
         .await
         .context("command timed out")?;
 
@@ -697,11 +744,16 @@ impl Tool for ReadTool {
 
         let lines: Vec<&str> = content.lines().collect();
         let start = start_line.map(|n| n.saturating_sub(1)).unwrap_or(0);
-        let end = end_line
-            .map(|n| n.min(lines.len()))
-            .unwrap_or(lines.len());
+        let end = end_line.map(|n| n.min(lines.len())).unwrap_or(lines.len());
+        // Clamp: an inverted range (`start_line > end_line`) used to panic on
+        // `lines[start..end]`, killing the turn task without a `Done`.
+        let start = start.min(end);
 
-        let selected: Vec<&str> = lines[start..end].to_vec();
+        let selected: Vec<&str> = if start >= end {
+            Vec::new()
+        } else {
+            lines[start..end].to_vec()
+        };
         Ok(selected.join("\n"))
     }
 }
@@ -743,7 +795,7 @@ impl Tool for WriteTool {
             .get("content")
             .and_then(|v| v.as_str())
             .context("missing 'content' parameter")?;
-        let full_path = ctx.resolve_path(path);
+        let full_path = resolve_within(ctx, path)?;
 
         if let Some(parent) = full_path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -754,7 +806,11 @@ impl Tool for WriteTool {
             .await
             .with_context(|| format!("writing {}", full_path.display()))?;
 
-        Ok(format!("wrote {} bytes to {}", content.len(), full_path.display()))
+        Ok(format!(
+            "wrote {} bytes to {}",
+            content.len(),
+            full_path.display()
+        ))
     }
 }
 
@@ -800,7 +856,7 @@ impl Tool for EditTool {
             .get("new_string")
             .and_then(|v| v.as_str())
             .context("missing 'new_string' parameter")?;
-        let full_path = ctx.resolve_path(path);
+        let full_path = resolve_within(ctx, path)?;
 
         let content = tokio::fs::read_to_string(&full_path)
             .await
@@ -859,10 +915,7 @@ impl Tool for ListDirTool {
     }
 
     async fn execute(&self, input: &Value, ctx: &ToolContext) -> Result<String> {
-        let path = input
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or(".");
+        let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
         let full_path = ctx.resolve_path(path);
 
         let mut entries = Vec::new();
@@ -931,21 +984,16 @@ impl Tool for GlobTool {
             .get("pattern")
             .and_then(|v| v.as_str())
             .context("missing 'pattern' parameter")?;
-        let base = input
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or(".");
+        let base = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
         let base_path = ctx.resolve_path(base);
 
         let matches = glob::glob(&base_path.join(pattern).to_string_lossy())
             .map_err(|e| anyhow::anyhow!("invalid glob pattern: {}", e))?;
 
         let mut results = Vec::new();
-        for entry in matches {
-            if let Ok(p) = entry {
-                if let Ok(rel) = p.strip_prefix(&base_path) {
-                    results.push(rel.to_string_lossy().to_string());
-                }
+        for p in matches.flatten() {
+            if let Ok(rel) = p.strip_prefix(&base_path) {
+                results.push(rel.to_string_lossy().to_string());
             }
         }
         results.sort();
@@ -956,6 +1004,25 @@ impl Tool for GlobTool {
 // ---------------------------------------------------------------------------
 // grep (agentgrep-style)
 // ---------------------------------------------------------------------------
+
+/// Directories skipped during a recursive grep (VCS metadata, dependencies,
+/// build output) so a broad search doesn't churn through them.
+const GREP_IGNORED_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+];
+
+/// Files larger than this are skipped by `agentgrep` (binary/generated files).
+const GREP_MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Cap on reported matches so one broad regex can't flood the model context.
+const GREP_MAX_MATCHES: usize = 5000;
 
 pub struct GrepTool;
 
@@ -991,47 +1058,73 @@ impl Tool for GrepTool {
             .get("query")
             .and_then(|v| v.as_str())
             .context("missing 'query' parameter")?;
-        let base = input
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or(".");
+        let base = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
         let base_path = ctx.resolve_path(base);
 
-        let re = regex::Regex::new(query)
-            .with_context(|| format!("invalid regex: {}", query))?;
+        let re = regex::Regex::new(query).with_context(|| format!("invalid regex: {}", query))?;
 
         let mut matches = Vec::new();
 
-        // Walk all files recursively
+        // Walk all files recursively. Symlinks are skipped (they can cycle or
+        // escape the base), as are VCS/dependency/build directories and files
+        // too large to be sensible search targets.
         let mut stack = vec![base_path.clone()];
-        while let Some(dir) = stack.pop() {
-            if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        stack.push(path);
-                    } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        // Apply include filter
-                    if let Some(inc) = input.get("include").and_then(|v| v.as_str()) {
-                        let pat = glob::Pattern::new(inc).unwrap_or_else(|_| glob::Pattern::new("*").unwrap());
-                        if !pat.matches_with(name, glob::MatchOptions::new()) {
-                            continue;
-                        }
+        'walk: while let Some(dir) = stack.pop() {
+            let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+                continue;
+            };
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let Ok(file_type) = entry.file_type().await else {
+                    continue;
+                };
+                let path = entry.path();
+                if file_type.is_symlink() {
+                    continue;
+                }
+                if file_type.is_dir() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if GREP_IGNORED_DIRS.contains(&name.as_ref()) {
+                        continue;
                     }
-                        // Read and search
-                        if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                            for (lineno, line) in content.lines().enumerate() {
-                                if re.is_match(line) {
-                                    matches.push(format!(
-                                        "{}:{}: {}",
-                                        path.strip_prefix(&base_path)
-                                            .unwrap_or(&path)
-                                            .display(),
-                                        lineno + 1,
-                                        line.trim_end()
-                                    ));
-                                }
-                            }
+                    stack.push(path);
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                // Apply include filter
+                if let Some(inc) = input.get("include").and_then(|v| v.as_str()) {
+                    let pat = glob::Pattern::new(inc)
+                        .unwrap_or_else(|_| glob::Pattern::new("*").unwrap());
+                    if !pat.matches_with(name, glob::MatchOptions::new()) {
+                        continue;
+                    }
+                }
+                if let Ok(md) = entry.metadata().await {
+                    if md.len() > GREP_MAX_FILE_BYTES {
+                        continue;
+                    }
+                }
+                // Read and search
+                let Ok(content) = tokio::fs::read_to_string(&path).await else {
+                    continue;
+                };
+                for (lineno, line) in content.lines().enumerate() {
+                    if re.is_match(line) {
+                        matches.push(format!(
+                            "{}:{}: {}",
+                            path.strip_prefix(&base_path).unwrap_or(&path).display(),
+                            lineno + 1,
+                            line.trim_end()
+                        ));
+                        if matches.len() >= GREP_MAX_MATCHES {
+                            matches
+                                .push(format!("... (truncated at {} matches)", GREP_MAX_MATCHES));
+                            break 'walk;
                         }
                     }
                 }
@@ -1080,9 +1173,33 @@ fn patch_path(s: &str, prefix: &str) -> Option<String> {
     }
 }
 
+/// Paths a unified diff touches, used for approval prompts and diff snapshots.
+/// `+++` targets are used; deletions (`/dev/null`) are skipped. Best-effort and
+/// shared by the daemon (gate reason) and the client (status line/snapshots).
+pub fn patch_paths(patch: &str) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    for line in patch.lines() {
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            let p = rest.trim();
+            if p == "/dev/null" {
+                continue;
+            }
+            let p = p.strip_prefix("b/").unwrap_or(p);
+            if !paths.iter().any(|existing| existing == p) {
+                paths.push(p.to_string());
+            }
+        }
+    }
+    paths
+}
+
 fn parse_patch(text: &str) -> Result<Vec<PatchFile>> {
     let mut files: Vec<PatchFile> = Vec::new();
-    let empty = || PatchFile { old_path: None, new_path: None, hunks: Vec::new() };
+    let empty = || PatchFile {
+        old_path: None,
+        new_path: None,
+        hunks: Vec::new(),
+    };
     let mut cur = empty();
     let mut cur_hunk: Option<Hunk> = None;
     let mut in_body = false;
@@ -1092,11 +1209,12 @@ fn parse_patch(text: &str) -> Result<Vec<PatchFile>> {
             cur.hunks.push(h);
         }
     };
-    let flush_file = |files: &mut Vec<PatchFile>, cur: &mut PatchFile, empty: &dyn Fn() -> PatchFile| {
-        if cur.new_path.is_some() || !cur.hunks.is_empty() {
-            files.push(std::mem::replace(cur, empty()));
-        }
-    };
+    let flush_file =
+        |files: &mut Vec<PatchFile>, cur: &mut PatchFile, empty: &dyn Fn() -> PatchFile| {
+            if cur.new_path.is_some() || !cur.hunks.is_empty() {
+                files.push(std::mem::replace(cur, empty()));
+            }
+        };
 
     for raw in text.lines() {
         let line = raw.trim_end_matches('\r');
@@ -1109,19 +1227,33 @@ fn parse_patch(text: &str) -> Result<Vec<PatchFile>> {
         if in_body {
             match line.as_bytes().first() {
                 Some(b' ') => {
-                    cur_hunk.as_mut().unwrap().lines.push(DiffLine::Context(line[1..].to_string()));
+                    cur_hunk
+                        .as_mut()
+                        .unwrap()
+                        .lines
+                        .push(DiffLine::Context(line[1..].to_string()));
                     continue;
                 }
                 Some(b'-') if !line.starts_with("--- ") => {
-                    cur_hunk.as_mut().unwrap().lines.push(DiffLine::Remove(line[1..].to_string()));
+                    cur_hunk
+                        .as_mut()
+                        .unwrap()
+                        .lines
+                        .push(DiffLine::Remove(line[1..].to_string()));
                     continue;
                 }
                 Some(b'+') if !line.starts_with("+++ ") => {
-                    cur_hunk.as_mut().unwrap().lines.push(DiffLine::Add(line[1..].to_string()));
+                    cur_hunk
+                        .as_mut()
+                        .unwrap()
+                        .lines
+                        .push(DiffLine::Add(line[1..].to_string()));
                     continue;
                 }
                 Some(b'\\') => continue, // "\ No newline at end of file"
-                _ => { in_body = false; }
+                _ => {
+                    in_body = false;
+                }
             }
         }
         if line.starts_with("@@ ") {
@@ -1138,7 +1270,10 @@ fn parse_patch(text: &str) -> Result<Vec<PatchFile>> {
                 .unwrap_or("1")
                 .parse()
                 .unwrap_or(1);
-            cur_hunk = Some(Hunk { old_start, lines: Vec::new() });
+            cur_hunk = Some(Hunk {
+                old_start,
+                lines: Vec::new(),
+            });
             in_body = true;
             continue;
         }
@@ -1171,7 +1306,7 @@ fn parse_patch(text: &str) -> Result<Vec<PatchFile>> {
     Ok(files)
 }
 
-async fn apply_patch_file(file: &PatchFile, base_dir: &Path) -> Result<String> {
+async fn apply_patch_file(file: &PatchFile, ctx: &ToolContext) -> Result<String> {
     let new_path = match &file.new_path {
         Some(p) => p,
         None => anyhow::bail!("patch has no target file (new_path missing)"),
@@ -1179,7 +1314,7 @@ async fn apply_patch_file(file: &PatchFile, base_dir: &Path) -> Result<String> {
 
     if new_path == "/dev/null" {
         let old = file.old_path.as_deref().unwrap_or("");
-        let full = base_dir.join(old);
+        let full = resolve_within(ctx, old)?;
         if tokio::fs::remove_file(&full).await.is_ok() {
             return Ok(format!("deleted {}", full.display()));
         }
@@ -1187,7 +1322,7 @@ async fn apply_patch_file(file: &PatchFile, base_dir: &Path) -> Result<String> {
     }
 
     let is_new = file.old_path.is_none();
-    let full = base_dir.join(new_path);
+    let full = resolve_within(ctx, new_path)?;
     let content = if is_new {
         String::new()
     } else {
@@ -1312,7 +1447,7 @@ impl Tool for ApplyPatchTool {
         }
         let mut summary = format!("applied patch to {} file(s):", files.len());
         for f in &files {
-            match apply_patch_file(f, &ctx.working_dir).await {
+            match apply_patch_file(f, ctx).await {
                 Ok(s) => summary.push_str(&format!("\n  {}", s)),
                 Err(e) => summary.push_str(&format!("\n  ERROR: {}", e)),
             }
@@ -1386,8 +1521,12 @@ impl Tool for PlanTool {
 
         match action {
             "create" => {
-                let steps = steps_from(input.get("steps")).context("missing 'steps' array for create")?;
-                let title = input.get("title").and_then(|v| v.as_str()).unwrap_or("Plan");
+                let steps =
+                    steps_from(input.get("steps")).context("missing 'steps' array for create")?;
+                let title = input
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Plan");
                 let mut out = format!("# {}\n\n", title);
                 for s in &steps {
                     out.push_str(&format!("- [ ] {}\n", s));
@@ -1398,8 +1537,11 @@ impl Tool for PlanTool {
                 Ok(format!("plan updated: {} steps", steps.len()))
             }
             "append" => {
-                let steps = steps_from(input.get("steps")).context("missing 'steps' array for append")?;
-                let mut out = tokio::fs::read_to_string(&plan_file).await.unwrap_or_default();
+                let steps =
+                    steps_from(input.get("steps")).context("missing 'steps' array for append")?;
+                let mut out = tokio::fs::read_to_string(&plan_file)
+                    .await
+                    .unwrap_or_default();
                 for s in &steps {
                     out.push_str(&format!("- [ ] {}\n", s));
                 }
@@ -1446,7 +1588,7 @@ impl Tool for PlanTool {
             "show" => {
                 let data = tokio::fs::read_to_string(&plan_file)
                     .await
-                    .with_context(|| format!("no plan yet — create one with action=create"))?;
+                    .with_context(|| "no plan yet — create one with action=create".to_string())?;
                 Ok(data)
             }
             _ => Ok(format!("unknown plan action: {}", action)),
@@ -1545,7 +1687,11 @@ impl Tool for GitTool {
                 let branch = input.get("branch").and_then(|v| v.as_str()).unwrap_or("");
                 if branch.is_empty() {
                     git(vec!["branch", "-avv"]).await
-                } else if input.get("delete_branch").and_then(|v| v.as_bool()).unwrap_or(false) {
+                } else if input
+                    .get("delete_branch")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     git(vec!["branch", "-D", branch]).await
                 } else {
                     git(vec!["branch", branch]).await
@@ -1556,7 +1702,11 @@ impl Tool for GitTool {
                     .get("branch")
                     .and_then(|v| v.as_str())
                     .context("missing 'branch' for checkout")?;
-                if input.get("create_branch").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if input
+                    .get("create_branch")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     git(vec!["checkout", "-b", branch]).await
                 } else {
                     git(vec!["checkout", branch]).await
@@ -1564,7 +1714,11 @@ impl Tool for GitTool {
             }
             "diff" => {
                 let mut args = vec!["diff"];
-                if input.get("staged").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if input
+                    .get("staged")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     args.push("--cached");
                 }
                 if let Some(p) = input.get("path").and_then(|v| v.as_str()) {
@@ -1577,7 +1731,14 @@ impl Tool for GitTool {
             }
             "log" => {
                 let max = input.get("max").and_then(|v| v.as_u64()).unwrap_or(10);
-                git(vec!["log", "--oneline", "--decorate", "-n", &max.to_string()]).await
+                git(vec![
+                    "log",
+                    "--oneline",
+                    "--decorate",
+                    "-n",
+                    &max.to_string(),
+                ])
+                .await
             }
             "add" => {
                 let p = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
@@ -1592,9 +1753,16 @@ impl Tool for GitTool {
                 git(vec!["commit", "-m", message]).await
             }
             "push" => {
-                let remote = input.get("remote").and_then(|v| v.as_str()).unwrap_or("origin");
+                let remote = input
+                    .get("remote")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("origin");
                 let mut args = vec!["push"];
-                if input.get("force").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if input
+                    .get("force")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     args.push("--force");
                 }
                 args.push(remote);
@@ -1606,7 +1774,10 @@ impl Tool for GitTool {
                 git(args).await
             }
             "pull" => {
-                let remote = input.get("remote").and_then(|v| v.as_str()).unwrap_or("origin");
+                let remote = input
+                    .get("remote")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("origin");
                 let mut args = vec!["pull", remote];
                 if let Some(rs) = input.get("refspec").and_then(|v| v.as_str()) {
                     if !rs.is_empty() {
@@ -1616,7 +1787,10 @@ impl Tool for GitTool {
                 git(args).await
             }
             "fetch" => {
-                let remote = input.get("remote").and_then(|v| v.as_str()).unwrap_or("origin");
+                let remote = input
+                    .get("remote")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("origin");
                 let mut args = vec!["fetch", remote];
                 if let Some(rs) = input.get("refspec").and_then(|v| v.as_str()) {
                     if !rs.is_empty() {
@@ -1626,7 +1800,11 @@ impl Tool for GitTool {
                 git(args).await
             }
             "merge" => {
-                if input.get("abort").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if input
+                    .get("abort")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     return git(vec!["merge", "--abort"]).await;
                 }
                 let branch = input
@@ -1634,17 +1812,29 @@ impl Tool for GitTool {
                     .and_then(|v| v.as_str())
                     .context("missing 'branch' to merge")?;
                 let mut args = vec!["merge"];
-                if input.get("allow_unrelated").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if input
+                    .get("allow_unrelated")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     args.push("--allow-unrelated-histories");
                 }
                 args.push(branch);
                 git(args).await
             }
             "rebase" => {
-                if input.get("abort").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if input
+                    .get("abort")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     return git(vec!["rebase", "--abort"]).await;
                 }
-                if input.get("rebase_continue").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if input
+                    .get("rebase_continue")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     return git(vec!["rebase", "--continue"]).await;
                 }
                 let branch = input
@@ -1654,7 +1844,10 @@ impl Tool for GitTool {
                 git(vec!["rebase", branch]).await
             }
             "reset" => {
-                let mode = input.get("mode").and_then(|v| v.as_str()).unwrap_or("mixed");
+                let mode = input
+                    .get("mode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("mixed");
                 if !matches!(mode, "soft" | "mixed" | "hard") {
                     return Ok(format!(
                         "reset mode must be soft, mixed, or hard (got: {})",
@@ -1677,7 +1870,10 @@ impl Tool for GitTool {
                     .unwrap_or("list");
                 match sa {
                     "save" => {
-                        let msg = input.get("message").and_then(|v| v.as_str()).unwrap_or("wip");
+                        let msg = input
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("wip");
                         git(vec!["stash", "save", msg]).await
                     }
                     "pop" => git(vec!["stash", "pop"]).await,
@@ -1713,24 +1909,60 @@ async fn run_cli(
     timeout_secs: u64,
     env: &[(&str, &str)],
 ) -> Result<String> {
+    run_cli_inner(exe, ctx, args, None, timeout_secs, env).await
+}
+
+/// Like [`run_cli`], but feeds `stdin_data` to the child's stdin (closed after
+/// writing so the child sees EOF).
+async fn run_cli_with_stdin(
+    exe: &str,
+    ctx: &ToolContext,
+    args: Vec<String>,
+    stdin_data: &str,
+    timeout_secs: u64,
+    env: &[(&str, &str)],
+) -> Result<String> {
+    run_cli_inner(exe, ctx, args, Some(stdin_data), timeout_secs, env).await
+}
+
+async fn run_cli_inner(
+    exe: &str,
+    ctx: &ToolContext,
+    args: Vec<String>,
+    stdin_data: Option<&str>,
+    timeout_secs: u64,
+    env: &[(&str, &str)],
+) -> Result<String> {
     let mut cmd = tokio::process::Command::new(exe);
-    cmd.args(&args).current_dir(&ctx.working_dir);
+    cmd.args(&args)
+        .current_dir(&ctx.working_dir)
+        // Don't leave an orphaned git/docker/psql process behind on timeout.
+        .kill_on_drop(true)
+        .stdin(if stdin_data.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     for (k, v) in env {
         cmd.env(k, v);
     }
     let mut child = cmd
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
         .spawn()
         .with_context(|| format!("failed to spawn {} (is it installed?)", exe))?;
 
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        async {
-            let out = child.wait_with_output().await?;
-            Ok::<_, std::io::Error>(out)
-        },
-    )
+    if let Some(data) = stdin_data {
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(data.as_bytes()).await;
+        }
+    }
+
+    let output = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
+        let out = child.wait_with_output().await?;
+        Ok::<_, std::io::Error>(out)
+    })
     .await
     .map_err(|_| anyhow::anyhow!("{} timed out after {}s", exe, timeout_secs))??;
 
@@ -1742,7 +1974,12 @@ async fn run_cli(
         } else {
             stderr.trim().to_string()
         };
-        return Ok(format!("{} failed (exit {}): {}", exe, output.status.code().unwrap_or(-1), msg));
+        return Ok(format!(
+            "{} failed (exit {}): {}",
+            exe,
+            output.status.code().unwrap_or(-1),
+            msg
+        ));
     }
     let mut out = stdout.trim().to_string();
     if !stderr.trim().is_empty() {
@@ -1762,6 +1999,58 @@ async fn run_cli(
 // fetch_url
 // ---------------------------------------------------------------------------
 
+/// True for loopback / private / link-local / CGNAT / documentation addresses.
+/// Used to stop the HTTP tools from being an ungated path to cloud metadata
+/// (`169.254.169.254`) or internal services.
+fn is_non_global_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.octets()[0] == 0
+                // 100.64.0.0/10 (CGNAT)
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40)
+        }
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (s[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+                || (s[0] & 0xfe00) == 0xfc00 // fc00::/7 unique local
+        }
+    }
+}
+
+/// Reject URLs whose host is (or resolves to) a non-global address.
+async fn assert_public_url(url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url).context("invalid URL")?;
+    let host = parsed.host_str().context("URL has no host")?.to_string();
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if is_non_global_ip(&ip) {
+            anyhow::bail!("refusing to fetch non-global address {}", ip);
+        }
+        return Ok(());
+    }
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .context("resolving URL host")?
+        .collect();
+    if addrs.is_empty() {
+        anyhow::bail!("URL host did not resolve: {}", host);
+    }
+    for addr in addrs {
+        if is_non_global_ip(&addr.ip()) {
+            anyhow::bail!("refusing to fetch non-global address {}", addr.ip());
+        }
+    }
+    Ok(())
+}
+
 pub struct WebFetchTool;
 
 #[async_trait]
@@ -1773,7 +2062,8 @@ impl Tool for WebFetchTool {
     fn description(&self) -> &str {
         "Fetch a URL (http/https) and return its text content. Use to read\n\
          documentation, inspect a web page, or pull data from an API endpoint.\n\
-         Read-only and ungated."
+         Read-only and ungated. URLs that resolve to loopback, private, or\n\
+         link-local addresses (e.g. cloud metadata) are refused."
     }
 
     fn is_independent(&self) -> bool {
@@ -1792,8 +2082,15 @@ impl Tool for WebFetchTool {
     }
 
     async fn execute(&self, input: &Value, _ctx: &ToolContext) -> Result<String> {
-        let url = input.get("url").and_then(|v| v.as_str()).context("missing 'url'")?;
-        let max_chars = input.get("max_chars").and_then(|v| v.as_u64()).unwrap_or(12000) as usize;
+        let url = input
+            .get("url")
+            .and_then(|v| v.as_str())
+            .context("missing 'url'")?;
+        assert_public_url(url).await?;
+        let max_chars = input
+            .get("max_chars")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(12000) as usize;
         let client = reqwest::Client::builder()
             .user_agent("jancode-agent/0.1")
             .timeout(std::time::Duration::from_secs(30))
@@ -1838,7 +2135,8 @@ impl Tool for HttpRequestTool {
         "Send a raw HTTP request (GET/POST/PUT/PATCH/DELETE/HEAD). Pass headers\n\
          as an object, and a payload via 'json' (object) or 'body' (string).\n\
          Returns status code and response body. Non-GET/HEAD methods require\n\
-         approval in interactive sessions."
+         approval in interactive sessions. URLs that resolve to loopback,\n\
+         private, or link-local addresses are refused."
     }
 
     fn parameters(&self) -> Value {
@@ -1857,11 +2155,22 @@ impl Tool for HttpRequestTool {
     }
 
     async fn execute(&self, input: &Value, _ctx: &ToolContext) -> Result<String> {
-        let url = input.get("url").and_then(|v| v.as_str()).context("missing 'url'")?;
-        let method = input.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_uppercase();
+        let url = input
+            .get("url")
+            .and_then(|v| v.as_str())
+            .context("missing 'url'")?;
+        assert_public_url(url).await?;
+        let method = input
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("GET")
+            .to_uppercase();
         let method = reqwest::Method::from_bytes(method.as_bytes())
             .map_err(|_| anyhow::anyhow!("invalid method: {}", method))?;
-        let timeout_ms = input.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(30000);
+        let timeout_ms = input
+            .get("timeout_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(30000);
 
         let client = reqwest::Client::builder()
             .user_agent("jancode-agent/0.1")
@@ -1882,7 +2191,10 @@ impl Tool for HttpRequestTool {
             req = req.body(b.to_string());
         }
 
-        let resp = req.send().await.with_context(|| format!("{} {}", method, url))?;
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("{} {}", method, url))?;
         let status = resp.status();
         let ct = resp
             .headers()
@@ -1892,7 +2204,11 @@ impl Tool for HttpRequestTool {
             .to_string();
         let body = resp.text().await.unwrap_or_default();
         let truncated: String = body.chars().take(40000).collect();
-        let header_line = if ct.is_empty() { String::new() } else { format!("content-type: {}\n", ct) };
+        let header_line = if ct.is_empty() {
+            String::new()
+        } else {
+            format!("content-type: {}\n", ct)
+        };
         if truncated.len() < body.len() {
             Ok(format!(
                 "HTTP {} {}\n{}{}\n\n[truncated: {} bytes total]",
@@ -1903,7 +2219,13 @@ impl Tool for HttpRequestTool {
                 body.len()
             ))
         } else {
-            Ok(format!("HTTP {} {}\n{}{}", status.as_u16(), status.canonical_reason().unwrap_or(""), header_line, truncated))
+            Ok(format!(
+                "HTTP {} {}\n{}{}",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or(""),
+                header_line,
+                truncated
+            ))
         }
     }
 }
@@ -1941,7 +2263,10 @@ impl Tool for NoteTool {
     }
 
     async fn execute(&self, input: &Value, ctx: &ToolContext) -> Result<String> {
-        let action = input.get("action").and_then(|v| v.as_str()).context("missing 'action'")?;
+        let action = input
+            .get("action")
+            .and_then(|v| v.as_str())
+            .context("missing 'action'")?;
         let file = ctx.working_dir.join(".jancode-notes.md");
         match action {
             "create" => {
@@ -1953,7 +2278,9 @@ impl Tool for NoteTool {
                     }
                 }
                 text.push_str(content);
-                tokio::fs::write(&file, text).await.with_context(|| format!("writing {}", file.display()))?;
+                tokio::fs::write(&file, text)
+                    .await
+                    .with_context(|| format!("writing {}", file.display()))?;
                 Ok("notes updated (create)".to_string())
             }
             "append" => {
@@ -1968,15 +2295,21 @@ impl Tool for NoteTool {
                     }
                 }
                 text.push_str(content);
-                tokio::fs::write(&file, text).await.with_context(|| format!("writing {}", file.display()))?;
+                tokio::fs::write(&file, text)
+                    .await
+                    .with_context(|| format!("writing {}", file.display()))?;
                 Ok("notes updated (append)".to_string())
             }
             "show" => {
-                let text = tokio::fs::read_to_string(&file).await.with_context(|| format!("notes are empty: {}", file.display()))?;
+                let text = tokio::fs::read_to_string(&file)
+                    .await
+                    .with_context(|| format!("notes are empty: {}", file.display()))?;
                 Ok(text)
             }
             "clear" => {
-                tokio::fs::write(&file, "").await.with_context(|| format!("writing {}", file.display()))?;
+                tokio::fs::write(&file, "")
+                    .await
+                    .with_context(|| format!("writing {}", file.display()))?;
                 Ok("notes cleared".to_string())
             }
             _ => Ok(format!("unknown note action: {}", action)),
@@ -2020,6 +2353,7 @@ impl Tool for DockerTool {
                 "container": { "type": "string", "description": "Container name or id (logs/inspect/exec/stop/rm)." },
                 "image": { "type": "string", "description": "Image name (run/pull)." },
                 "command": { "type": "string", "description": "Command to run inside the container (exec) or the container command (run)." },
+                "command_args": { "type": "array", "items": { "type": "string" }, "description": "Explicit argv for the container command (run); preferred over 'command' because it preserves quoting." },
                 "name": { "type": "string", "description": "Container name to assign (run, --name)." },
                 "ports": { "type": "string", "description": "Port mapping for run, e.g. '8080:80'." },
                 "detach": { "type": "boolean", "description": "Run container in the background (run, -d)." },
@@ -2035,9 +2369,15 @@ impl Tool for DockerTool {
     }
 
     async fn execute(&self, input: &Value, ctx: &ToolContext) -> Result<String> {
-        let action = input.get("action").and_then(|v| v.as_str()).context("missing 'action'")?;
+        let action = input
+            .get("action")
+            .and_then(|v| v.as_str())
+            .context("missing 'action'")?;
         let arg = |name: &str| -> Result<Vec<String>, anyhow::Error> {
-            let v = input.get(name).and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+            let v = input
+                .get(name)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
             Ok(v.map(|s| s.to_string()).into_iter().collect())
         };
 
@@ -2047,7 +2387,11 @@ impl Tool for DockerTool {
             "stats" => vec!["stats".into(), "--no-stream".into()],
             "logs" => {
                 let mut a = vec!["logs".into(), "--tail".into()];
-                let tail = input.get("tail").and_then(|v| v.as_u64()).unwrap_or(50).to_string();
+                let tail = input
+                    .get("tail")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(50)
+                    .to_string();
                 a.push(tail);
                 let container = arg("container")?;
                 if container.is_empty() {
@@ -2069,7 +2413,13 @@ impl Tool for DockerTool {
                 if container.is_empty() || command.is_empty() {
                     return Ok("docker exec: need 'container' and 'command'".to_string());
                 }
-                vec!["exec".into(), container[0].clone(), "sh".into(), "-lc".into(), command[0].clone()]
+                vec![
+                    "exec".into(),
+                    container[0].clone(),
+                    "sh".into(),
+                    "-lc".into(),
+                    command[0].clone(),
+                ]
             }
             "run" => {
                 let image = arg("image")?;
@@ -2077,22 +2427,42 @@ impl Tool for DockerTool {
                     return Ok("docker run: missing 'image'".to_string());
                 }
                 let mut a: Vec<String> = vec!["run".into()];
-                if input.get("detach").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if input
+                    .get("detach")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     a.push("-d".into());
                 }
-                if input.get("remove").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if input
+                    .get("remove")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     a.push("--rm".into());
                 }
-                if let Some(name) = input.get("name").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                if let Some(name) = input
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
                     a.push("--name".into());
                     a.push(name.to_string());
                 }
-                if let Some(ports) = input.get("ports").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                if let Some(ports) = input
+                    .get("ports")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
                     a.push("-p".into());
                     a.push(ports.to_string());
                 }
                 a.push(image[0].clone());
-                if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+                // Prefer an explicit argv array (quotes preserved); fall back to
+                // the legacy whitespace-split string form.
+                if let Some(arr) = input.get("command_args").and_then(|v| v.as_array()) {
+                    a.extend(arr.iter().filter_map(|s| s.as_str().map(|s| s.to_string())));
+                } else if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
                     if !cmd.trim().is_empty() {
                         a.extend(cmd.split_whitespace().map(|s| s.to_string()));
                     }
@@ -2100,8 +2470,15 @@ impl Tool for DockerTool {
                 a
             }
             "build" => {
-                let tag = input.get("tag").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
-                let path = input.get("build_path").and_then(|v| v.as_str()).unwrap_or(".").to_string();
+                let tag = input
+                    .get("tag")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty());
+                let path = input
+                    .get("build_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(".")
+                    .to_string();
                 let mut a = vec!["build".into()];
                 if let Some(t) = tag {
                     a.push("-t".into());
@@ -2123,7 +2500,11 @@ impl Tool for DockerTool {
                     return Ok("docker rm: missing 'container'".to_string());
                 }
                 let mut a = vec!["rm".into()];
-                if input.get("force").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if input
+                    .get("force")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     a.push("-f".into());
                 }
                 a.push(container[0].clone());
@@ -2137,10 +2518,23 @@ impl Tool for DockerTool {
                 vec!["pull".into(), image[0].clone()]
             }
             "compose" => {
-                let sub = input.get("compose_command").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("ps");
-                vec!["compose".into(), sub.to_string()]
+                // `compose_command` is a string ("up -d"); split it so docker
+                // receives `up` and `-d` as separate argv entries.
+                let sub = input
+                    .get("compose_command")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("ps");
+                let mut a = vec!["compose".into()];
+                a.extend(sub.split_whitespace().map(|s| s.to_string()));
+                a
             }
-            _ => return Ok(format!("unknown docker action: {} (available: {})", action, DOCKER_ACTIONS)),
+            _ => {
+                return Ok(format!(
+                    "unknown docker action: {} (available: {})",
+                    action, DOCKER_ACTIONS
+                ))
+            }
         };
 
         DockerTool::run_docker(ctx, args).await
@@ -2187,7 +2581,10 @@ impl Tool for SqlTool {
     }
 
     async fn execute(&self, input: &Value, ctx: &ToolContext) -> Result<String> {
-        let query = input.get("query").and_then(|v| v.as_str()).context("missing 'query'")?;
+        let query = input
+            .get("query")
+            .and_then(|v| v.as_str())
+            .context("missing 'query'")?;
         let db = match input.get("db").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
             Some(d) => d.to_string(),
             None if !ctx.database_url.is_empty() => ctx.database_url.clone(),
@@ -2233,7 +2630,11 @@ impl Tool for SqlTool {
 
         let truncated: String = output.chars().take(20000).collect();
         if truncated.len() < output.len() {
-            Ok(format!("{}\n\n[truncated: {} bytes total]", truncated, output.len()))
+            Ok(format!(
+                "{}\n\n[truncated: {} bytes total]",
+                truncated,
+                output.len()
+            ))
         } else {
             Ok(truncated)
         }
@@ -2242,12 +2643,15 @@ impl Tool for SqlTool {
 
 impl SqlTool {
     async fn run_mysql(ctx: &ToolContext, url: &str, stmt: &str) -> Result<String> {
-        let (host, user, pass, db) = parse_mysql_url(url)
-            .ok_or_else(|| anyhow::anyhow!("invalid mysql URL — expected mysql://user:pass@host[:port]/dbname"))?;
+        let (host, user, pass, db) = parse_mysql_url(url).ok_or_else(|| {
+            anyhow::anyhow!("invalid mysql URL — expected mysql://user:pass@host[:port]/dbname")
+        })?;
         if db.is_empty() {
-            return Ok("sql: mysql URL needs a database name (mysql://user:pass@host/db)".to_string());
+            return Ok(
+                "sql: mysql URL needs a database name (mysql://user:pass@host/db)".to_string(),
+            );
         }
-        let mut args = vec![
+        let args = vec![
             "--batch".to_string(),
             "-h".to_string(),
             host,
@@ -2264,6 +2668,426 @@ impl SqlTool {
             vec![("MYSQL_PWD", pass.as_str())]
         };
         run_cli("mysql", ctx, args, 30, &env).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// jq
+// ---------------------------------------------------------------------------
+
+pub struct JqTool;
+
+#[async_trait]
+impl Tool for JqTool {
+    fn name(&self) -> &str {
+        "jq"
+    }
+
+    fn description(&self) -> &str {
+        "Query JSON or JSONL with a jq filter. Provide 'path' (a file in the\n\
+         working directory) or 'json' (inline text). Read-only."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "filter": {
+                    "type": "string",
+                    "description": "jq filter, e.g. '.items[] | {name, size}'. Default '.'."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Path to a JSON or JSONL file (relative to the working directory)."
+                },
+                "json": {
+                    "type": "string",
+                    "description": "Inline JSON or JSONL text to query instead of reading a file."
+                },
+                "compact": {
+                    "type": "boolean",
+                    "description": "Compact one-line output (jq -c). Default true."
+                },
+                "raw": {
+                    "type": "boolean",
+                    "description": "Emit strings without JSON quotes (jq -r). Default false."
+                }
+            },
+            "required": ["filter"]
+        })
+    }
+
+    fn is_independent(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, input: &Value, ctx: &ToolContext) -> Result<String> {
+        let filter = input.get("filter").and_then(|v| v.as_str()).unwrap_or(".");
+        let compact = input
+            .get("compact")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let raw = input.get("raw").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let mut args: Vec<String> = Vec::new();
+        if raw {
+            args.push("-r".to_string());
+        }
+        if compact {
+            args.push("-c".to_string());
+        }
+        args.push(filter.to_string());
+
+        let path = input
+            .get("path")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let inline = input
+            .get("json")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+
+        let output = match (path, inline) {
+            (Some(p), _) => {
+                let full = ctx.resolve_path(p);
+                args.push(full.display().to_string());
+                run_cli("jq", ctx, args, 30, &[]).await?
+            }
+            (None, Some(text)) => run_cli_with_stdin("jq", ctx, args, text, 30, &[]).await?,
+            (None, None) => return Ok("jq: provide 'path' or 'json'".to_string()),
+        };
+
+        let truncated: String = output.chars().take(20000).collect();
+        if truncated.len() < output.len() {
+            Ok(format!(
+                "{}\n\n[truncated: {} bytes total]",
+                truncated,
+                output.len()
+            ))
+        } else {
+            Ok(truncated)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// gh
+// ---------------------------------------------------------------------------
+
+const GH_ACTIONS: &[&str] = &[
+    "pr_list",
+    "pr_view",
+    "pr_diff",
+    "pr_create",
+    "pr_merge",
+    "pr_comment",
+    "pr_close",
+    "pr_reopen",
+    "issue_list",
+    "issue_view",
+    "issue_create",
+    "issue_comment",
+    "run_list",
+    "run_view",
+    "run_rerun",
+    "run_cancel",
+    "repo_view",
+    "search_issues",
+    "search_prs",
+    "api",
+];
+
+/// True when a `gh` action creates/modifies remote state (requires approval).
+pub fn gh_is_mutating(action: &str) -> bool {
+    GH_MUTATING_ACTIONS.contains(&action)
+}
+
+/// Actions that create/modify remote state and therefore require approval.
+const GH_MUTATING_ACTIONS: &[&str] = &[
+    "pr_create",
+    "pr_merge",
+    "pr_comment",
+    "pr_close",
+    "pr_reopen",
+    "issue_create",
+    "issue_comment",
+    "run_rerun",
+    "run_cancel",
+    "api",
+];
+
+fn gh_argv(action: &str, extra: &[String]) -> Option<Vec<String>> {
+    let head: &[&str] = match action {
+        "pr_list" => &["pr", "list"],
+        "pr_view" => &["pr", "view"],
+        "pr_diff" => &["pr", "diff"],
+        "pr_create" => &["pr", "create"],
+        "pr_merge" => &["pr", "merge"],
+        "pr_comment" => &["pr", "comment"],
+        "pr_close" => &["pr", "close"],
+        "pr_reopen" => &["pr", "reopen"],
+        "issue_list" => &["issue", "list"],
+        "issue_view" => &["issue", "view"],
+        "issue_create" => &["issue", "create"],
+        "issue_comment" => &["issue", "comment"],
+        "run_list" => &["run", "list"],
+        "run_view" => &["run", "view"],
+        "run_rerun" => &["run", "rerun"],
+        "run_cancel" => &["run", "cancel"],
+        "repo_view" => &["repo", "view"],
+        "search_issues" => &["search", "issues"],
+        "search_prs" => &["search", "prs"],
+        "api" => &["api"],
+        _ => return None,
+    };
+    let mut argv: Vec<String> = head.iter().map(|s| s.to_string()).collect();
+    argv.extend(extra.iter().cloned());
+    Some(argv)
+}
+
+pub struct GhTool;
+
+#[async_trait]
+impl Tool for GhTool {
+    fn name(&self) -> &str {
+        "gh"
+    }
+
+    fn description(&self) -> &str {
+        "Run the GitHub CLI (gh): pull requests, issues, actions runs, and repo\n\
+         queries. Read actions run freely; create/merge/comment/rerun require\n\
+         approval. Requires gh installed and authenticated."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": GH_ACTIONS,
+                    "description": "GitHub CLI operation to run."
+                },
+                "args": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Extra gh flags/arguments (e.g. [\"123\", \"--json\", \"title,number\"])."
+                },
+                "repo": {
+                    "type": "string",
+                    "description": "Optional 'OWNER/REPO' target (adds --repo)."
+                }
+            },
+            "required": ["action"]
+        })
+    }
+
+    async fn execute(&self, input: &Value, ctx: &ToolContext) -> Result<String> {
+        let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        let mut extra: Vec<String> = input
+            .get("args")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(repo) = input
+            .get("repo")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            if action != "api" {
+                extra.push("--repo".to_string());
+                extra.push(repo.to_string());
+            }
+        }
+
+        let argv = match gh_argv(action, &extra) {
+            Some(a) => a,
+            None => {
+                return Ok(format!(
+                    "gh: unknown action '{}' (available: {})",
+                    action,
+                    GH_ACTIONS.join(", ")
+                ))
+            }
+        };
+        let output = run_cli("gh", ctx, argv, 60, &[]).await?;
+        let truncated: String = output.chars().take(20000).collect();
+        if truncated.len() < output.len() {
+            Ok(format!(
+                "{}\n\n[truncated: {} bytes total]",
+                truncated,
+                output.len()
+            ))
+        } else {
+            Ok(truncated)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// test
+// ---------------------------------------------------------------------------
+
+pub struct TestTool;
+
+/// Condense test output: list failing test lines, then the tail. Keeps the
+/// model's context small on large suites while preserving the summary.
+fn summarize_test_output(output: &str) -> String {
+    const MAX_TAIL: usize = 4000;
+    let failed: Vec<String> = output
+        .lines()
+        .filter(|l| l.contains("FAILED") || l.contains("... FAILED"))
+        .map(|l| l.trim().to_string())
+        .take(25)
+        .collect();
+
+    let mut out = String::new();
+    if !failed.is_empty() {
+        out.push_str("FAILING:\n");
+        for f in &failed {
+            out.push_str("  ");
+            out.push_str(f);
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+
+    let total_chars = output.chars().count();
+    let tail: String = output
+        .chars()
+        .rev()
+        .take(MAX_TAIL)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    out.push_str(&tail);
+    if total_chars > MAX_TAIL {
+        out.push_str(&format!("\n[truncated: {} bytes total]", output.len()));
+    }
+    out
+}
+
+#[async_trait]
+impl Tool for TestTool {
+    fn name(&self) -> &str {
+        "test"
+    }
+
+    fn description(&self) -> &str {
+        "Run the project's test suite and return a condensed summary (failing\n\
+         tests + tail) instead of raw output. Runners: cargo, npm, pnpm, yarn,\n\
+         pytest, go, custom. Known runners are ungated; 'custom' requires\n\
+         approval."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "runner": {
+                    "type": "string",
+                    "enum": ["cargo", "npm", "pnpm", "yarn", "pytest", "go", "custom"],
+                    "description": "Test runner to invoke."
+                },
+                "args": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Extra arguments passed to the runner."
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": "Timeout in seconds (default 300)."
+                },
+                "parse": {
+                    "type": "boolean",
+                    "description": "Condense the output (default true)."
+                }
+            },
+            "required": ["runner"]
+        })
+    }
+
+    async fn execute(&self, input: &Value, ctx: &ToolContext) -> Result<String> {
+        let runner = input
+            .get("runner")
+            .and_then(|v| v.as_str())
+            .unwrap_or("cargo");
+        let extra: Vec<String> = input
+            .get("args")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let timeout = input
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(300);
+        let parse = input.get("parse").and_then(|v| v.as_bool()).unwrap_or(true);
+
+        let (exe, argv): (String, Vec<String>) = match runner {
+            "cargo" => {
+                let mut a = vec!["test".to_string()];
+                a.extend(extra);
+                ("cargo".to_string(), a)
+            }
+            "npm" => {
+                let mut a = vec!["test".to_string(), "--".to_string()];
+                a.extend(extra);
+                ("npm".to_string(), a)
+            }
+            "pnpm" | "yarn" => {
+                let mut a = vec!["test".to_string()];
+                a.extend(extra);
+                (runner.to_string(), a)
+            }
+            "pytest" => {
+                if extra.is_empty() {
+                    ("pytest".to_string(), vec!["-q".to_string()])
+                } else {
+                    ("pytest".to_string(), extra)
+                }
+            }
+            "go" => {
+                let mut a = vec!["test".to_string()];
+                if extra.is_empty() {
+                    a.push("./...".to_string());
+                } else {
+                    a.extend(extra);
+                }
+                ("go".to_string(), a)
+            }
+            "custom" => {
+                if extra.is_empty() {
+                    return Ok(
+                        "test: 'custom' needs an args array, e.g. [\"make\",\"test\"]".to_string(),
+                    );
+                }
+                let mut it = extra.into_iter();
+                let exe = it.next().unwrap_or_default();
+                (exe, it.collect())
+            }
+            other => {
+                return Ok(format!(
+                    "test: unknown runner '{}' (cargo|npm|pnpm|yarn|pytest|go|custom)",
+                    other
+                ))
+            }
+        };
+
+        let output = run_cli(&exe, ctx, argv, timeout, &[]).await?;
+        if parse {
+            Ok(summarize_test_output(&output))
+        } else {
+            Ok(output)
+        }
     }
 }
 
@@ -2285,13 +3109,42 @@ fn parse_mysql_url(url: &str) -> Option<(String, String, String, String)> {
     Some((host, user, pass, db))
 }
 
-/// Heuristic: is this statement read-only (approval-free)? Leading keywords
-/// that only read data / metadata.
+/// Heuristic: is this statement read-only (approval-free)?
+///
+/// `WITH` is only treated as read-only when the statement contains no
+/// data-modifying keyword (`INSERT`/`UPDATE`/`DELETE`/`MERGE`); Postgres and
+/// MySQL allow `WITH x AS (INSERT ...) SELECT ...`, which mutates.
 pub fn sql_is_read_only(query: &str) -> bool {
     let q = query.trim_start().to_uppercase();
-    ["SELECT", "WITH", "SHOW", "EXPLAIN", "DESCRIBE", "DESC", "PRAGMA"]
+    if ["SELECT", "SHOW", "EXPLAIN", "DESCRIBE", "DESC", "PRAGMA"]
         .iter()
         .any(|kw| q.starts_with(kw))
+    {
+        return true;
+    }
+    if q.starts_with("WITH") {
+        return !contains_write_keyword(query);
+    }
+    false
+}
+
+/// True when the query contains a data-modifying keyword outside of quoted
+/// string literals. Heuristic, but errs toward gating (safe direction).
+fn contains_write_keyword(query: &str) -> bool {
+    let re = regex::Regex::new(r"(?i)\b(insert|update|delete|merge)\b").unwrap();
+    let mut stripped = String::with_capacity(query.len());
+    let mut in_single = false;
+    let mut in_double = false;
+    let chars = query.chars();
+    for c in chars {
+        match c {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            _ if in_single || in_double => stripped.push(' '),
+            _ => stripped.push(c),
+        }
+    }
+    re.is_match(&stripped)
 }
 
 #[cfg(test)]
@@ -2304,51 +3157,58 @@ mod tests {
         assert!(!is_outside(base, &base.join("src/main.rs")));
         assert!(!is_outside(base, &base.join("src/../lib.rs")));
         assert!(is_outside(base, &base.join("../secrets.txt")));
-        assert!(is_outside(base, &Path::new("/etc/passwd")));
-        assert!(!is_outside(base, &Path::new("/work/proj")));
+        assert!(is_outside(base, Path::new("/etc/passwd")));
+        assert!(!is_outside(base, Path::new("/work/proj")));
     }
 
     #[test]
     fn bash_escape_detection() {
         let base = Path::new("/work/proj");
         // Safe: in-workspace commands.
-        assert!(bash_escapes_workspace("ls", &base, "basic").is_none());
-        assert!(bash_escapes_workspace("cargo test", &base, "basic").is_none());
-        assert!(bash_escapes_workspace("grep -r alpha src", &base, "basic").is_none());
-        assert!(bash_escapes_workspace("cat .env", &base, "basic").is_none());
-        assert!(bash_escapes_workspace("docker ps -a", &base, "basic").is_none());
-        assert!(bash_escapes_workspace("curl -s http://localhost:5000", &base, "basic").is_none());
+        assert!(bash_escapes_workspace("ls", base, "basic").is_none());
+        assert!(bash_escapes_workspace("cargo test", base, "basic").is_none());
+        assert!(bash_escapes_workspace("grep -r alpha src", base, "basic").is_none());
+        assert!(bash_escapes_workspace("cat .env", base, "basic").is_none());
+        assert!(bash_escapes_workspace("docker ps -a", base, "basic").is_none());
+        assert!(bash_escapes_workspace("curl -s http://localhost:5000", base, "basic").is_none());
         // Escapes: absolute paths, home, `..`, `cd` out.
-        assert!(bash_escapes_workspace("cat /etc/hosts", &base, "basic").is_some());
-        assert!(bash_escapes_workspace("ls ~/sysadmin-mcp", &base, "basic").is_some());
-        assert!(bash_escapes_workspace("cat $HOME/.claude/settings.json", &base, "basic").is_some());
-        assert!(bash_escapes_workspace("cd .. && ls", &base, "basic").is_some());
-        assert!(bash_escapes_workspace("cd /tmp && pwd", &base, "basic").is_some());
-        assert!(bash_escapes_workspace("cd ~/sysadmin-mcp && grep -r alpha .", &base, "basic").is_some());
-        assert!(bash_escapes_workspace("grep -r alpha ../secrets", &base, "basic").is_some());
-        assert!(bash_escapes_workspace("ls $PWD/../..", &base, "basic").is_some());
+        assert!(bash_escapes_workspace("cat /etc/hosts", base, "basic").is_some());
+        assert!(bash_escapes_workspace("ls ~/sysadmin-mcp", base, "basic").is_some());
+        assert!(bash_escapes_workspace("cat $HOME/.claude/settings.json", base, "basic").is_some());
+        assert!(bash_escapes_workspace("cd .. && ls", base, "basic").is_some());
+        assert!(bash_escapes_workspace("cd /tmp && pwd", base, "basic").is_some());
+        assert!(
+            bash_escapes_workspace("cd ~/sysadmin-mcp && grep -r alpha .", base, "basic").is_some()
+        );
+        assert!(bash_escapes_workspace("grep -r alpha ../secrets", base, "basic").is_some());
+        assert!(bash_escapes_workspace("ls $PWD/../..", base, "basic").is_some());
         // "off" never gates.
-        assert!(bash_escapes_workspace("cat /etc/hosts", &base, "off").is_none());
-        assert!(bash_escapes_workspace("ls ~/sysadmin-mcp", &base, "off").is_none());
+        assert!(bash_escapes_workspace("cat /etc/hosts", base, "off").is_none());
+        assert!(bash_escapes_workspace("ls ~/sysadmin-mcp", base, "off").is_none());
         // "strict" gates on any cd / $PWD / $OLDPWD.
-        assert!(bash_escapes_workspace("cd src && ls", &base, "strict").is_some());
-        assert!(bash_escapes_workspace("echo $PWD", &base, "strict").is_some());
-        assert!(bash_escapes_workspace("echo $OLDPWD", &base, "strict").is_some());
+        assert!(bash_escapes_workspace("cd src && ls", base, "strict").is_some());
+        assert!(bash_escapes_workspace("echo $PWD", base, "strict").is_some());
+        assert!(bash_escapes_workspace("echo $OLDPWD", base, "strict").is_some());
         // "strict" still allows plain in-workspace commands.
-        assert!(bash_escapes_workspace("ls", &base, "strict").is_none());
-        assert!(bash_escapes_workspace("cargo test", &base, "strict").is_none());
+        assert!(bash_escapes_workspace("ls", base, "strict").is_none());
+        assert!(bash_escapes_workspace("cargo test", base, "strict").is_none());
         // Heredoc bodies are data, not paths — must NOT be flagged for PATH escapes
         // even if they contain `/*` comments or absolute-looking text. But a
         // heredoc that WRITES a file (`cat > file` / `cat >> file`) is still a
         // file mutation and IS gated.
-        assert!(bash_escapes_workspace("cat >> styles.css << 'EOF'\n/* ==== Cart ==== */\n.cart-overlay { display: none }\nEOF", &base, "basic").is_some());
-        assert!(bash_escapes_workspace("cat > file.txt <<EOF\n/usr/share/notes\nEOF", &base, "basic").is_some());
+        assert!(bash_escapes_workspace("cat >> styles.css << 'EOF'\n/* ==== Cart ==== */\n.cart-overlay { display: none }\nEOF", base, "basic").is_some());
+        assert!(bash_escapes_workspace(
+            "cat > file.txt <<EOF\n/usr/share/notes\nEOF",
+            base,
+            "basic"
+        )
+        .is_some());
         // A bare `/` or comment markers are not escapes.
-        assert!(bash_escapes_workspace("ls /", &base, "basic").is_none());
-        assert!(bash_escapes_workspace("echo /* comment */", &base, "basic").is_none());
+        assert!(bash_escapes_workspace("ls /", base, "basic").is_none());
+        assert!(bash_escapes_workspace("echo /* comment */", base, "basic").is_none());
         // `which`/`ls` on system paths is a read, but still an absolute path —
         // keep gating it (it's a genuine outside-workspace read).
-        assert!(bash_escapes_workspace("ls /usr/bin/node*", &base, "basic").is_some());
+        assert!(bash_escapes_workspace("ls /usr/bin/node*", base, "basic").is_some());
     }
 
     #[test]
@@ -2356,31 +3216,56 @@ mod tests {
         let base = Path::new("/home/user/proj");
         // cd to the workspace itself (absolute) is NOT a path escape, BUT the
         // `sed -i` mutation still requires approval.
-        assert!(bash_escapes_workspace("cd /home/user/proj && sed -i s/a/b/ x.css", &base, "basic").is_some());
+        assert!(
+            bash_escapes_workspace("cd /home/user/proj && sed -i s/a/b/ x.css", base, "basic")
+                .is_some()
+        );
         // cd to a subdir inside the workspace is NOT an escape (basic mode).
-        assert!(bash_escapes_workspace("cd src && cargo build", &base, "basic").is_none());
+        assert!(bash_escapes_workspace("cd src && cargo build", base, "basic").is_none());
         // `sed -i` on a file inside the workspace is a MUTATION -> gated.
-        assert!(bash_escapes_workspace("sed -i s/a/b/ /home/user/proj/x.css", &base, "basic").is_some());
+        assert!(
+            bash_escapes_workspace("sed -i s/a/b/ /home/user/proj/x.css", base, "basic").is_some()
+        );
         // Read-only sed (no -i) inside workspace is not a mutation.
-        assert!(bash_escapes_workspace("sed -n '1,5p' /home/user/proj/x.css", &base, "basic").is_none());
+        assert!(
+            bash_escapes_workspace("sed -n '1,5p' /home/user/proj/x.css", base, "basic").is_none()
+        );
         // cd to another project outside the workspace IS an escape.
-        assert!(bash_escapes_workspace("cd /home/user/other && ls", &base, "basic").is_some());
+        assert!(bash_escapes_workspace("cd /home/user/other && ls", base, "basic").is_some());
         // cd .. is still an escape.
-        assert!(bash_escapes_workspace("cd .. && ls", &base, "basic").is_some());
+        assert!(bash_escapes_workspace("cd .. && ls", base, "basic").is_some());
         // cd to absolute path OUTSIDE workspace is still an escape.
-        assert!(bash_escapes_workspace("cd /tmp && pwd", &base, "basic").is_some());
+        assert!(bash_escapes_workspace("cd /tmp && pwd", base, "basic").is_some());
         // strict still gates even an in-workspace cd.
-        assert!(bash_escapes_workspace("cd src && cargo build", &base, "strict").is_some());
+        assert!(bash_escapes_workspace("cd src && cargo build", base, "strict").is_some());
     }
 
     #[test]
     fn mutation_targets_extraction() {
-        assert_eq!(mutation_targets("sed -i 's/a/b/g' styles.css", "sed"), vec!["styles.css".to_string()]);
-        assert_eq!(mutation_targets("sed -i s/a/b/ src/main.rs", "sed"), vec!["src/main.rs".to_string()]);
-        assert_eq!(mutation_targets("rm -rf target", "rm"), Vec::<String>::new()); // "target" looks like a name, no ext/slash -> empty
-        assert_eq!(mutation_targets("touch a.css b.js", "touch"), vec!["a.css".to_string(), "b.js".to_string()]);
-        assert_eq!(mutation_targets("cat > out.txt << EOF", "shell-redirect"), vec!["out.txt".to_string()]);
-        assert_eq!(mutation_targets("cd /x/y && sed -i s/a/b/ f.css", "sed"), vec!["f.css".to_string()]);
+        assert_eq!(
+            mutation_targets("sed -i 's/a/b/g' styles.css", "sed"),
+            vec!["styles.css".to_string()]
+        );
+        assert_eq!(
+            mutation_targets("sed -i s/a/b/ src/main.rs", "sed"),
+            vec!["src/main.rs".to_string()]
+        );
+        assert_eq!(
+            mutation_targets("rm -rf target", "rm"),
+            Vec::<String>::new()
+        ); // "target" looks like a name, no ext/slash -> empty
+        assert_eq!(
+            mutation_targets("touch a.css b.js", "touch"),
+            vec!["a.css".to_string(), "b.js".to_string()]
+        );
+        assert_eq!(
+            mutation_targets("cat > out.txt << EOF", "shell-redirect"),
+            vec!["out.txt".to_string()]
+        );
+        assert_eq!(
+            mutation_targets("cd /x/y && sed -i s/a/b/ f.css", "sed"),
+            vec!["f.css".to_string()]
+        );
     }
 
     #[test]
@@ -2390,7 +3275,10 @@ mod tests {
         assert_eq!(bash_mutation("perl -pi -e s/a/b/ f.rs"), Some("perl"));
         assert_eq!(bash_mutation("perl -i -pe s/a/b/ f.rs"), Some("perl"));
         assert_eq!(bash_mutation("sed -ni '1,5p' f.rs"), Some("sed"));
-        assert_eq!(bash_mutation("sed --in-place=.bak s/a/b/ f.rs"), Some("sed"));
+        assert_eq!(
+            bash_mutation("sed --in-place=.bak s/a/b/ f.rs"),
+            Some("sed")
+        );
         assert_eq!(bash_mutation("rm -rf target"), Some("rm"));
         assert_eq!(bash_mutation("tee out.log"), Some("tee"));
         assert_eq!(bash_mutation("cat > out.txt"), Some("shell-redirect"));
@@ -2451,29 +3339,32 @@ mod tests {
         // Absolute cd to the workspace root is rewritten to a relative `cd .`,
         // preserving the directory change but removing the absolute path.
         assert_eq!(
-            normalize_bash_cd("cd /home/user/proj && sed -i s/a/b/ styles.css", &base),
+            normalize_bash_cd("cd /home/user/proj && sed -i s/a/b/ styles.css", base),
             Some("cd . && sed -i s/a/b/ styles.css".to_string())
         );
         // Absolute cd to a workspace subdir is rewritten to a relative path.
         assert_eq!(
-            normalize_bash_cd("cd /home/user/proj/src && make", &base),
+            normalize_bash_cd("cd /home/user/proj/src && make", base),
             Some("cd src && make".to_string())
         );
         // Already-relative cd is unchanged (None = no rewrite needed).
-        assert_eq!(normalize_bash_cd("cd src && cargo build", &base), None);
+        assert_eq!(normalize_bash_cd("cd src && cargo build", base), None);
         // Absolute cd to the workspace root alone -> `cd .`.
-        assert_eq!(normalize_bash_cd("cd /home/user/proj", &base), Some("cd .".to_string()));
+        assert_eq!(
+            normalize_bash_cd("cd /home/user/proj", base),
+            Some("cd .".to_string())
+        );
         // cd OUTSIDE the workspace is NOT rewritten (gate must still see it).
-        assert_eq!(normalize_bash_cd("cd /home/user/other && ls", &base), None);
+        assert_eq!(normalize_bash_cd("cd /home/user/other && ls", base), None);
         // absolute path outside -> not rewritten.
-        assert_eq!(normalize_bash_cd("cd /tmp && pwd", &base), None);
+        assert_eq!(normalize_bash_cd("cd /tmp && pwd", base), None);
         // no leading cd -> not rewritten.
-        assert_eq!(normalize_bash_cd("sed -i s/a/b/ styles.css", &base), None);
+        assert_eq!(normalize_bash_cd("sed -i s/a/b/ styles.css", base), None);
         // ~ / $HOME -> not rewritten (gate handles).
-        assert_eq!(normalize_bash_cd("cd ~/notes && ls", &base), None);
+        assert_eq!(normalize_bash_cd("cd ~/notes && ls", base), None);
         // empty / `cd` alone -> not rewritten.
-        assert_eq!(normalize_bash_cd("", &base), None);
-        assert_eq!(normalize_bash_cd("cd", &base), None);
+        assert_eq!(normalize_bash_cd("", base), None);
+        assert_eq!(normalize_bash_cd("cd", base), None);
     }
 
     #[test]
@@ -2501,7 +3392,9 @@ mod tests {
     fn sql_read_only_detection() {
         assert!(sql_is_read_only("SELECT * FROM users"));
         assert!(sql_is_read_only("  select id from users limit 5"));
-        assert!(sql_is_read_only("WITH recent AS (SELECT 1) SELECT * FROM recent"));
+        assert!(sql_is_read_only(
+            "WITH recent AS (SELECT 1) SELECT * FROM recent"
+        ));
         assert!(sql_is_read_only("SHOW TABLES"));
         assert!(sql_is_read_only("EXPLAIN SELECT 1"));
         assert!(sql_is_read_only("PRAGMA table_info(users)"));
@@ -2521,15 +3414,172 @@ mod tests {
             assert!(t.is_independent(), "{} should be independent", name);
         }
         // Mutating / stateful tools must NOT be parallelized.
-        for name in ["write", "edit", "apply_patch", "bash", "git", "docker", "sql", "plan", "note", "http_request"] {
+        for name in [
+            "write",
+            "edit",
+            "apply_patch",
+            "bash",
+            "git",
+            "docker",
+            "sql",
+            "plan",
+            "note",
+            "http_request",
+        ] {
             let t = reg.find(name).expect(name);
             assert!(!t.is_independent(), "{} should NOT be independent", name);
         }
     }
 
     #[test]
+    fn write_tools_enforce_workspace_confinement() {
+        let ctx = ToolContext::new(
+            Path::new("/work/proj").to_path_buf(),
+            String::new(),
+            "basic".to_string(),
+        );
+        assert!(resolve_within(&ctx, "src/main.rs").is_ok());
+        assert!(resolve_within(&ctx, "./src/../src/main.rs").is_ok());
+        assert!(resolve_within(&ctx, "/work/proj/src/main.rs").is_ok());
+        assert!(resolve_within(&ctx, "../outside.txt").is_err());
+        assert!(resolve_within(&ctx, "/etc/passwd").is_err());
+        assert!(resolve_within(&ctx, "src/../../outside.txt").is_err());
+        // An explicit interactive approval unlocks exactly that path.
+        allow_outside(&ctx, "../outside.txt");
+        assert!(resolve_within(&ctx, "../outside.txt").is_ok());
+        assert!(resolve_within(&ctx, "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn builtin_tools_match_registry() {
+        let reg = default_registry();
+        let names: Vec<&str> = reg.all().iter().map(|t| t.name()).collect();
+        assert_eq!(names, BUILTIN_TOOLS);
+        for t in reg.all() {
+            let def = t.to_definition();
+            assert!(def.parameters.is_object(), "{} schema", def.name);
+        }
+    }
+
+    #[test]
+    fn patch_paths_lists_new_targets_only() {
+        let patch =
+            "--- a/one.rs\n+++ b/one.rs\n@@ -1 +1 @@\n-a\n+b\n--- a/gone.rs\n+++ /dev/null\n";
+        assert_eq!(patch_paths(patch), vec!["one.rs".to_string()]);
+    }
+
+    #[test]
+    fn with_is_not_read_only_when_it_writes() {
+        assert!(sql_is_read_only("WITH x AS (SELECT 1) SELECT * FROM x"));
+        assert!(!sql_is_read_only(
+            "WITH x AS (INSERT INTO t VALUES (1)) SELECT * FROM x"
+        ));
+        assert!(!sql_is_read_only(
+            "WITH x AS (UPDATE t SET a=1) SELECT * FROM x"
+        ));
+        // A quoted string mentioning the keyword doesn't count.
+        assert!(sql_is_read_only("SELECT 'update' AS note FROM t"));
+    }
+
+    #[test]
+    fn non_global_address_detection() {
+        use std::net::IpAddr;
+        for s in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "::1",
+            "fe80::1",
+            "fc00::1",
+        ] {
+            assert!(is_non_global_ip(&s.parse::<IpAddr>().unwrap()), "{}", s);
+        }
+        for s in ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700::1111"] {
+            assert!(!is_non_global_ip(&s.parse::<IpAddr>().unwrap()), "{}", s);
+        }
+    }
+
+    #[tokio::test]
+    async fn jq_tool_queries_inline_json() {
+        // Skip on hosts without jq (the tool itself requires it).
+        if std::process::Command::new("jq")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let ctx = ToolContext::new(std::env::temp_dir(), String::new(), "basic".to_string());
+        let out = JqTool
+            .execute(
+                &serde_json::json!({
+                    "filter": ".items[] | .name",
+                    "json": "{\"items\":[{\"name\":\"a\"},{\"name\":\"b\"}]}",
+                    "raw": true
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, "a\nb");
+    }
+
+    #[tokio::test]
+    async fn test_tool_runs_custom_command_and_summarizes() {
+        let ctx = ToolContext::new(std::env::temp_dir(), String::new(), "basic".to_string());
+        let out = TestTool
+            .execute(
+                &serde_json::json!({
+                    "runner": "custom",
+                    "args": ["sh", "-c", "printf 'test result: ok. 1 passed; 0 failed\\n'"]
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("test result: ok"));
+        assert!(!out.contains("FAILING:"));
+    }
+
+    #[test]
+    fn gh_action_mapping_and_gating() {
+        assert_eq!(gh_argv("pr_list", &[]).unwrap(), vec!["pr", "list"]);
+        assert_eq!(
+            gh_argv("issue_view", &["42".to_string(), "--json".to_string()]).unwrap(),
+            vec!["issue", "view", "42", "--json"]
+        );
+        assert!(gh_argv("nope", &[]).is_none());
+        assert!(gh_is_mutating("pr_merge"));
+        assert!(gh_is_mutating("api"));
+        assert!(!gh_is_mutating("pr_list"));
+        assert!(!gh_is_mutating("run_view"));
+    }
+
+    #[test]
+    fn test_summary_lists_failures_and_tail() {
+        let out = "running 3 tests\ntest alpha ... ok\ntest beta ... FAILED\ntest result: FAILED. 1 passed; 1 failed\n";
+        let s = summarize_test_output(out);
+        assert!(s.contains("FAILING:"));
+        assert!(s.contains("test beta ... FAILED"));
+        assert!(s.contains("test result: FAILED"));
+    }
+
+    #[test]
+    fn test_summary_ok_output_has_no_failure_section() {
+        let s = summarize_test_output("test result: ok. 3 passed; 0 failed\n");
+        assert!(!s.contains("FAILING:"));
+        assert!(s.contains("test result: ok"));
+    }
+
+    #[test]
     fn parses_mysql_url() {
-        let (host, user, pass, db) = parse_mysql_url("mysql://alice:s3cret@db.internal:3306/appdb").unwrap();
+        let (host, user, pass, db) =
+            parse_mysql_url("mysql://alice:s3cret@db.internal:3306/appdb").unwrap();
         assert_eq!(host, "db.internal");
         assert_eq!(user, "alice");
         assert_eq!(pass, "s3cret");

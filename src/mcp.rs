@@ -35,10 +35,6 @@ pub struct McpClient {
 }
 
 impl McpClient {
-    pub fn new(url: &str) -> Self {
-        Self::with_bearer(url, None)
-    }
-
     /// Create a client that sends `Authorization: Bearer <token>` on every
     /// request (e.g. from a `bearer_env` config value).
     pub fn with_bearer(url: &str, bearer_token: Option<String>) -> Self {
@@ -103,16 +99,22 @@ impl McpClient {
             .unwrap_or_default()
         {
             tools.push(McpToolInfo {
-                name: t.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                name: t
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
                 description: t
                     .get("description")
                     .and_then(|d| d.as_str())
                     .unwrap_or_default()
                     .to_string(),
-                input_schema: t.get("inputSchema").cloned().unwrap_or_else(|| json!({
-                    "type": "object",
-                    "properties": {}
-                })),
+                input_schema: t.get("inputSchema").cloned().unwrap_or_else(|| {
+                    json!({
+                        "type": "object",
+                        "properties": {}
+                    })
+                }),
             });
         }
         Ok(tools)
@@ -130,9 +132,17 @@ impl McpClient {
             )
             .await
             .with_context(|| format!("MCP tools/call failed for {}", self.url))?;
-        let is_error = res.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
+        let is_error = res
+            .get("isError")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let mut text = String::new();
-        for c in res.get("content").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+        for c in res
+            .get("content")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+        {
             if let Some(t) = c.get("text").and_then(|v| v.as_str()) {
                 text.push_str(t);
                 text.push('\n');
@@ -201,7 +211,7 @@ impl McpClient {
 /// a plain `application/json` response and an SSE (`text/event-stream`) body.
 fn parse_envelope(data: &str, id: u64) -> Result<Value> {
     if data.trim_start().starts_with('{') {
-        return Ok(serde_json::from_str(data).context("parsing JSON-RPC envelope")?);
+        return serde_json::from_str(data).context("parsing JSON-RPC envelope");
     }
     // SSE: `event: message\n data: {...}\n\nevent: message\ndata: {...}`.
     let mut last: Option<Value> = None;
@@ -307,8 +317,7 @@ pub async fn load_tools(cfg: &crate::config::Config) -> Vec<Box<dyn crate::tools
     let tasks = cfg.mcp.servers.iter().map(|svc| async move {
         let token = resolve_bearer(svc);
         let client = std::sync::Arc::new(tokio::sync::Mutex::new(McpClient::with_bearer(
-            &svc.url,
-            token,
+            &svc.url, token,
         )));
         let info = match (async {
             let mut c = client.lock().await;
@@ -325,10 +334,19 @@ pub async fn load_tools(cfg: &crate::config::Config) -> Vec<Box<dyn crate::tools
         };
         tracing::info!("MCP server {} exposed {} tools", svc.name, info.len());
         info.into_iter()
-            .map(|t| Box::new(McpTool { client: client.clone(), info: t }) as Box<dyn crate::tools::Tool>)
+            .map(|t| {
+                Box::new(McpTool {
+                    client: client.clone(),
+                    info: t,
+                }) as Box<dyn crate::tools::Tool>
+            })
             .collect::<Vec<_>>()
     });
-    futures::future::join_all(tasks).await.into_iter().flatten().collect()
+    futures::future::join_all(tasks)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 /// Read-only probe of every configured MCP server: connect, initialize, and
@@ -377,15 +395,30 @@ mod tests {
     fn resolve_bearer_prefers_inline_over_env() {
         // Inline wins even when bearer_env names a set variable.
         std::env::set_var("JANCODE_TEST_MCP_KEY", "from-env");
-        assert_eq!(resolve_bearer(&svc(Some("inline-token"), Some("JANCODE_TEST_MCP_KEY"))), Some("inline-token".to_string()));
+        assert_eq!(
+            resolve_bearer(&svc(Some("inline-token"), Some("JANCODE_TEST_MCP_KEY"))),
+            Some("inline-token".to_string())
+        );
         // Inline is trimmed.
-        assert_eq!(resolve_bearer(&svc(Some("  spaced  "), None)), Some("spaced".to_string()));
+        assert_eq!(
+            resolve_bearer(&svc(Some("  spaced  "), None)),
+            Some("spaced".to_string())
+        );
         // Empty inline falls through to the env var.
-        assert_eq!(resolve_bearer(&svc(Some("   "), Some("JANCODE_TEST_MCP_KEY"))), Some("from-env".to_string()));
+        assert_eq!(
+            resolve_bearer(&svc(Some("   "), Some("JANCODE_TEST_MCP_KEY"))),
+            Some("from-env".to_string())
+        );
         // No inline + env var set -> env value.
-        assert_eq!(resolve_bearer(&svc(None, Some("JANCODE_TEST_MCP_KEY"))), Some("from-env".to_string()));
+        assert_eq!(
+            resolve_bearer(&svc(None, Some("JANCODE_TEST_MCP_KEY"))),
+            Some("from-env".to_string())
+        );
         // No inline + env var unset -> None (server gets no auth).
-        assert_eq!(resolve_bearer(&svc(None, Some("JANCODE_TEST_MCP_MISSING"))), None);
+        assert_eq!(
+            resolve_bearer(&svc(None, Some("JANCODE_TEST_MCP_MISSING"))),
+            None
+        );
         // Neither configured -> None.
         assert_eq!(resolve_bearer(&svc(None, None)), None);
         std::env::remove_var("JANCODE_TEST_MCP_KEY");

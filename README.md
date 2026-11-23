@@ -212,6 +212,15 @@ auto/best-free>
   Pure client-side string handling — no extra tokens, provider calls, or
   measurable CPU.
 
+#### Waiting indicator
+
+While a turn is in flight, a dim `⠋ thinking…` spinner is shown on stderr as
+soon as you send a message, and it animates through any silent stretch (a slow
+provider, or a reasoning model that hasn't emitted a token yet). It disappears
+the moment real output, a tool call, or an approval prompt appears, so you can
+always tell the agent is still working. Terminal-only: piped/redirected output
+stays clean, and `jancode run` gets the same indicator.
+
 #### Modified lines
 
 Whenever the model changes a file, jancode prints **just the lines it changed**
@@ -278,10 +287,12 @@ jancode ships with these tools (plus any discovered via [MCP servers](#mcp-model
   markers can be fixed with `read`/`edit`/`apply_patch`, then
   `git add` + `rebase --continue` (or `merge` commit) to finish.
 - `fetch_url` — fetch a URL and return its text content (read docs, check
-  pages, pull API data). Read-only, ungated.
+  pages, pull API data). Read-only, ungated. SSRF-guarded: hosts that are (or
+  resolve to) loopback, private, link-local, or CGNAT addresses — e.g.
+  `169.254.169.254` — are refused.
 - `http_request` — raw HTTP calls (GET/POST/PUT/PATCH/DELETE/HEAD) with
   headers, JSON or string body. GET/HEAD/OPTIONS run freely; other methods
-  require approval.
+  require approval. Same SSRF guard as `fetch_url`.
 - `docker` — manage local containers/images: `ps`, `images`, `logs`,
   `inspect`, `stats` (read-only), and `exec`, `run`, `build`, `stop`, `rm`,
   `pull`, `compose` (require approval).
@@ -290,6 +301,18 @@ jancode ships with these tools (plus any discovered via [MCP servers](#mcp-model
   statements (SELECT/WITH/SHOW/EXPLAIN/PRAGMA) are ungated; anything else
   requires approval. Default target comes from `[database]` url in
   `config.toml`.
+- `jq` — query JSON/JSONL with a jq filter, from a file (`path`) or inline
+  text (`json`). Read-only; in-workspace files and inline text are ungated,
+  outside paths require approval.
+- `gh` — run the GitHub CLI: pull requests, issues, actions runs, and repo
+  queries. Read actions (`pr_list`, `issue_view`, `run_list`, …) run freely;
+  `pr_create`/`pr_merge`/`pr_comment`/`issue_create`/`run_rerun`/`api` and
+  other remote mutations require approval. Requires `gh` installed and
+  authenticated.
+- `test` — run the project’s test suite (`cargo`, `npm`, `pnpm`, `yarn`,
+  `pytest`, `go`, or a `custom` command) and return a condensed summary
+  (failing tests + tail) instead of raw output. Known runners are ungated;
+  `custom` requires approval.
 - `note` — persistent freeform notes in `.jancode-notes.md`
   (`create` / `append` / `show` / `clear`). Ungated; it only touches its own
   file.
@@ -309,9 +332,11 @@ directory.
 
 ### Approval (safe file changes)
 
-File **modifications** (`write`, `edit`, `apply_patch`) and **reads that
-resolve outside the working directory** (`read`, `list_dir`, `glob`,
-`agentgrep`) require consent before the daemon executes them:
+File **modifications** (`write`, `edit`, `apply_patch`) require consent and
+are confined to the workspace (an outside path needs explicit approval; see
+[Workspace confinement](#workspace-confinement)). **Reads that resolve outside
+the working directory** (`read`, `list_dir`, `glob`, `agentgrep`) require
+consent before the daemon executes them:
 
 - In `jancode connect` you get an interactive prompt: `[approval] <tool> —
   <reason>` then `allow? [y/N]`. Answering `n` sends `APPROVAL_DENIED` to the
@@ -323,8 +348,8 @@ resolve outside the working directory** (`read`, `list_dir`, `glob`,
 - `plan`, `note`, and `fetch_url` are intentionally ungated: `plan`/`note` only
   touch their own bookkeeping files, and `fetch_url` only reads. Other tools
   gate selectively: `git` mutating actions, `http_request` non-GET/HEAD
-  methods, `docker` state-changing actions, and non-read-only `sql` statements
-  all require approval.
+  methods, `docker` state-changing actions, non-read-only `sql` statements,
+  `gh` mutating actions, and `test` with a custom command all require approval.
 
   **`bash` is gated when it escapes the workspace OR modifies files.** Because
   `bash` can read, search, or write anywhere on the host, jancode scans the
@@ -405,9 +430,15 @@ following the same convention as other CLI agents (opencode, antigravity):
   workspace itself is normalized to a relative form (e.g. `cd /home/u/proj/src`
   → `cd src`) so commands read cleanly — but a `cd` that leaves the workspace
   is left untouched so the approval gate still sees it.
-- Reads, edits, and bash commands that stay inside the workspace run freely
-  (subject to the mutation gate above); anything that touches a location
-  **outside** the workspace requires approval.
+- Reads and bash commands that stay inside the workspace run freely (subject to
+  the mutation gate above); anything that touches a location **outside** the
+  workspace requires approval.
+- **Writes are confined.** `write`, `edit`, and `apply_patch` resolve and
+  lexically normalize their target (`..`/absolute paths included) and refuse
+  anything outside the workspace unless you explicitly approve that exact path
+  in an interactive session. Headless `run` and swarm agents never get an
+  outside-write exception, so a spawned agent cannot escape its parent's
+  workspace.
 - Running `jancode connect` in different folders gives each its own isolated
   workspace, session history, and approval cache — you can work on multiple
   projects independently.
@@ -730,7 +761,10 @@ agents. In interactive mode you'll see a line like
 ## Core mechanics
 
 - **Unix socket IPC** (`jancode.sock`) under `JANCODE_RUNTIME_DIR` — clients and the
-  daemon communicate over a local socket, no HTTP port to manage.
+  daemon communicate over a local socket, no HTTP port to manage. The socket is
+  created owner-only (`0600`), and a second `serve` refuses to start while
+  another live daemon owns the path. Session transcripts and `config.toml` are
+  likewise written owner-only.
 - **`JANCODE_HOME` sandboxing** — config and state are isolated to a single
   directory you control.
 - **Lazy daemon spawn** — `run` and `connect` wake the daemon on demand, so

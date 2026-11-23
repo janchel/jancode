@@ -6,7 +6,7 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, stdin};
+use tokio::io::{stdin, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::info;
 
 /// Left-gutter border for model responses (interactive readability). Rendered
@@ -23,6 +23,15 @@ const ANSI_CYAN: &str = "\x1b[36m";
 /// Cap on changed lines shown per file, so a huge patch can't flood the
 /// terminal. The remainder is summarised as a single `...` line.
 const MAX_DIFF_LINES: usize = 60;
+
+/// The built-in tool allow-list sent to the daemon. Shared with the daemon's
+/// registry (`crate::tools::BUILTIN_TOOLS`) so the two can't drift.
+fn builtin_tool_list() -> Vec<String> {
+    crate::tools::BUILTIN_TOOLS
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
 
 /// True when the style draws any response chrome (blank lines / gutter / box).
 fn border_enabled(style: &str) -> bool {
@@ -53,6 +62,76 @@ fn dim(s: &str, enabled: bool) -> String {
         format!("{}{}{}", ANSI_DIM, s, ANSI_RESET)
     } else {
         s.to_string()
+    }
+}
+
+/// Terminal "still working" indicator. A slow provider or a reasoning model can
+/// go seconds without emitting a token; this shows a dim, single-line spinner
+/// on stderr after a short silence so the user knows the turn is alive.
+/// Terminal-only: disabled when stderr is piped/redirected, so logs stay clean.
+struct WaitingIndicator {
+    enabled: bool,
+    dim_tools: bool,
+    last_activity: std::time::Instant,
+    idle_after: std::time::Duration,
+    frame: usize,
+    shown: bool,
+}
+
+impl WaitingIndicator {
+    fn new(enabled: bool, dim_tools: bool) -> Self {
+        Self {
+            enabled,
+            dim_tools,
+            last_activity: std::time::Instant::now(),
+            idle_after: std::time::Duration::from_millis(1200),
+            frame: 0,
+            shown: false,
+        }
+    }
+
+    /// Show the first frame immediately, right after the request is sent.
+    fn show_now(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        self.last_activity = std::time::Instant::now();
+        self.frame = 1;
+        eprint!("\r{}", dim("⠋ thinking…", self.dim_tools));
+        let _ = std::io::stderr().flush();
+        self.shown = true;
+    }
+
+    /// Reset the idle timer; call on every event.
+    fn activity(&mut self) {
+        self.last_activity = std::time::Instant::now();
+    }
+
+    /// Called from a `tokio::select!` timer branch. Animates only after the
+    /// turn has been silent for `idle_after`.
+    fn tick(&mut self) {
+        if !self.enabled || !self.shown || self.last_activity.elapsed() < self.idle_after {
+            return;
+        }
+        const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+        let frame = FRAMES[self.frame % FRAMES.len()];
+        self.frame = self.frame.wrapping_add(1);
+        eprint!(
+            "\r{} {}",
+            dim(frame, self.dim_tools),
+            dim("thinking…", self.dim_tools)
+        );
+        let _ = std::io::stderr().flush();
+    }
+
+    /// Erase the spinner line before real output is written.
+    fn clear(&mut self) {
+        self.activity();
+        if self.shown {
+            eprint!("\r{}\r", " ".repeat(24));
+            let _ = std::io::stderr().flush();
+            self.shown = false;
+        }
     }
 }
 
@@ -135,7 +214,11 @@ fn workspace_path(path: &str) -> PathBuf {
 fn display_path(path: &Path) -> String {
     std::env::current_dir()
         .ok()
-        .and_then(|cwd| path.strip_prefix(&cwd).ok().map(|p| p.display().to_string()))
+        .and_then(|cwd| {
+            path.strip_prefix(&cwd)
+                .ok()
+                .map(|p| p.display().to_string())
+        })
         .unwrap_or_else(|| path.display().to_string())
 }
 
@@ -146,9 +229,13 @@ fn mutation_paths_for_call(name: &str, input: &serde_json::Value) -> Vec<String>
     match name {
         "write" | "edit" => {
             let p = arg("path");
-            if p.is_empty() { Vec::new() } else { vec![p.to_string()] }
+            if p.is_empty() {
+                Vec::new()
+            } else {
+                vec![p.to_string()]
+            }
         }
-        "apply_patch" => patch_path_list(arg("patch")),
+        "apply_patch" => crate::tools::patch_paths(arg("patch")),
         // `bash` hides its writes in the shell string, so reuse the same
         // detection the approval gate uses to decide what to watch.
         "bash" => crate::tools::bash_mutation_targets(arg("command")).unwrap_or_default(),
@@ -289,7 +376,10 @@ fn diff_contents(old: Option<&str>, new: Option<&str>) -> Vec<String> {
             }
             idx += 1;
         }
-        out.push(format!("@@ -{},{} +{},{} @@", hunk_old, removed, hunk_new, added));
+        out.push(format!(
+            "@@ -{},{} +{},{} @@",
+            hunk_old, removed, hunk_new, added
+        ));
         out.extend(body);
         old_line += removed;
         new_line += added;
@@ -345,26 +435,7 @@ fn print_diff(lines: &[String]) {
 /// Comma-separated list of the files a unified diff touches, used for the
 /// one-line `[tool] apply_patch <paths>` summary.
 fn patch_paths(patch: &str) -> String {
-    patch_path_list(patch).join(", ")
-}
-
-/// The files a unified diff touches (paths with a `/dev/null` target, i.e.
-/// deleted files, are skipped).
-fn patch_path_list(patch: &str) -> Vec<String> {
-    let mut paths: Vec<String> = Vec::new();
-    for line in patch.lines() {
-        if let Some(rest) = line.strip_prefix("+++ ") {
-            let p = rest.trim();
-            if p == "/dev/null" {
-                continue;
-            }
-            let p = p.strip_prefix("b/").unwrap_or(p);
-            if !paths.iter().any(|existing| existing == p) {
-                paths.push(p.to_string());
-            }
-        }
-    }
-    paths
+    crate::tools::patch_paths(patch).join(", ")
 }
 
 /// One-line summary of a tool call's target for the `[tool] <name> <summary>`
@@ -385,9 +456,16 @@ fn tool_arg_summary(name: &str, input: &serde_json::Value) -> String {
         "note" => join_nonempty(&[arg("action"), arg("title")]),
         "docker" => join_nonempty(&[
             arg("action"),
-            if arg("container").is_empty() { arg("image") } else { arg("container") },
+            if arg("container").is_empty() {
+                arg("image")
+            } else {
+                arg("container")
+            },
         ]),
         "sql" => truncate(arg("query"), 60),
+        "jq" => join_nonempty(&[arg("filter"), arg("path")]),
+        "gh" => join_nonempty(&[arg("action"), arg("repo")]),
+        "test" => arg("runner").to_string(),
         "git" => git_arg_summary(input),
         // Unknown (e.g. MCP) tools: show a truncated JSON dump of the arguments
         // so the call is still identifiable.
@@ -411,13 +489,20 @@ fn git_arg_summary(input: &serde_json::Value) -> String {
     let action = arg("action");
     let target: String = if matches!(action, "checkout" | "branch" | "push") {
         let branch = arg("branch");
-        if branch.is_empty() { arg("refspec").to_string() } else { branch.to_string() }
+        if branch.is_empty() {
+            arg("refspec").to_string()
+        } else {
+            branch.to_string()
+        }
     } else if matches!(action, "merge" | "rebase") {
         match input.get("branch").and_then(|v| v.as_str()) {
             Some(b) => b.to_string(),
             None => {
                 if action == "rebase"
-                    && input.get("rebase_continue").and_then(|v| v.as_bool()).unwrap_or(false)
+                    && input
+                        .get("rebase_continue")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
                 {
                     "--continue".to_string()
                 } else {
@@ -426,7 +511,10 @@ fn git_arg_summary(input: &serde_json::Value) -> String {
             }
         }
     } else if action == "reset" {
-        let mode = input.get("mode").and_then(|v| v.as_str()).unwrap_or("mixed");
+        let mode = input
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("mixed");
         format!("{} {}", mode, arg("ref"))
     } else if action == "add" || action == "diff" {
         arg("path").to_string()
@@ -513,7 +601,11 @@ fn print_mcp_status(servers: &[crate::mcp::McpServerProbe]) -> (usize, usize) {
         }
         println!(
             "  - {} ({}, {}) [{}] - {} tools",
-            s.name, s.url, s.transport, status, s.tools.len()
+            s.name,
+            s.url,
+            s.transport,
+            status,
+            s.tools.len()
         );
         if let Some(e) = &s.error {
             println!("      error: {}", e.lines().next().unwrap_or(""));
@@ -563,10 +655,7 @@ pub async fn handle_swarm(sub: crate::SwarmCommands) -> Result<()> {
             to_session_id: to,
             message,
         },
-        crate::SwarmCommands::Stop {
-            force,
-            session,
-        } => Request::SwarmStop {
+        crate::SwarmCommands::Stop { force, session } => Request::SwarmStop {
             id: crate::protocol::new_message_id(),
             session_id: session,
             force,
@@ -622,7 +711,12 @@ pub async fn handle_swarm(sub: crate::SwarmCommands) -> Result<()> {
                 message,
             } => {
                 let from = from_session.as_deref().unwrap_or("system");
-                println!("[{}] from {}: {}", notification_type_str(notification_type), from, message);
+                println!(
+                    "[{}] from {}: {}",
+                    notification_type_str(notification_type),
+                    from,
+                    message
+                );
             }
             Event::Stopped { id: _, session_id } => {
                 println!("stopped session: {}", session_id);
@@ -668,7 +762,6 @@ fn notification_type_str(t: &crate::protocol::NotificationType) -> &'static str 
     }
 }
 
-
 /// Connect to the daemon, auto-spawning it if it is not already running.
 /// Mirrors jancode's lazy shared-server model: `run` and `connect` start a
 /// detached background daemon on first use instead of failing with
@@ -676,21 +769,34 @@ fn notification_type_str(t: &crate::protocol::NotificationType) -> &'static str 
 async fn connect_or_spawn() -> Result<tokio::net::UnixStream> {
     let socket = runtime_dir().join("jancode.sock");
     if socket.exists() {
-        match tokio::net::UnixStream::connect(&socket).await {
-            Ok(s) => return Ok(s),
-            Err(_) => {}
+        if let Ok(s) = tokio::net::UnixStream::connect(&socket).await {
+            return Ok(s);
         }
     }
 
     // Spawn a detached daemon that inherits stdout/stderr for logging but
     // detaches from this process so it survives after `run`/`connect` exits.
     let exe = std::env::current_exe().context("resolving jancode executable path")?;
-    let log_path = std::env::temp_dir().join("jancode-daemon.log");
-    let log_file = std::fs::File::create(&log_path)
+    // Keep the daemon log inside JANCODE_HOME (installer-created 0700) rather
+    // than a predictable shared /tmp path that other users can read or clobber.
+    let log_path = crate::config::jancode_dir().join("daemon.log");
+    let log_file = match std::fs::File::create(&log_path) {
+        Ok(f) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o600));
+            }
+            f
+        }
+        Err(_) => std::fs::File::create(
+            std::env::temp_dir().join(format!("jancode-daemon-{}.log", std::process::id())),
+        )
+        .unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap()),
+    };
+    let log_file_err = log_file
+        .try_clone()
         .unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap());
-    let log_file_err = log_file.try_clone().unwrap_or_else(|_| {
-        std::fs::File::create("/dev/null").unwrap()
-    });
     let mut cmd = Command::new(&exe);
     cmd.arg("serve")
         .stdin(std::process::Stdio::null())
@@ -725,8 +831,7 @@ pub async fn connect() -> Result<()> {
     // Ctrl+C never kills the chat: while a request is streaming it cancels the
     // request (sends `Request::Cancel` to the daemon); at the idle prompt it is
     // drained into a no-op. Quit with /q, /quit, /exit, or Ctrl+D.
-    let mut interrupt =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
     let mut tools_enabled = true;
     // MCP tools are opt-in per turn (only `/mcp <message>` sets this). Ordinary
@@ -739,7 +844,11 @@ pub async fn connect() -> Result<()> {
         session_id.as_deref().unwrap_or("")
     );
     let default_model = crate::config::load()
-        .map(|c| crate::config::resolve_provider(&c, None).default_model.clone())
+        .map(|c| {
+            crate::config::resolve_provider(&c, None)
+                .default_model
+                .clone()
+        })
         .unwrap_or_else(|_| "default".to_string());
     // Whether to print the model's reasoning as `[thinking]` lines. Defaults
     // to hidden for a clean CLI; enable with `[server] show_thinking = true`.
@@ -809,7 +918,11 @@ pub async fn connect() -> Result<()> {
             break;
         }
         if input == "/tools" || input.starts_with("/tools ") {
-            let remainder = input.strip_prefix("/tools ").unwrap_or("").trim().to_string();
+            let remainder = input
+                .strip_prefix("/tools ")
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if remainder.is_empty() {
                 // Bare /tools: toggle
                 tools_enabled = !tools_enabled;
@@ -824,8 +937,12 @@ pub async fn connect() -> Result<()> {
         if input == "/mcp" || input.starts_with("/mcp ") {
             let cfg = crate::config::load().unwrap_or_default();
             if cfg.mcp.servers.is_empty() {
-                println!("no MCP servers configured; add [[mcp.servers]] to ~/.jancode/config.toml");
-                println!("  [[mcp.servers]]\n  name = \"server-name\"\n  url = \"https://host/mcp\"");
+                println!(
+                    "no MCP servers configured; add [[mcp.servers]] to ~/.jancode/config.toml"
+                );
+                println!(
+                    "  [[mcp.servers]]\n  name = \"server-name\"\n  url = \"https://host/mcp\""
+                );
                 continue;
             }
             let remainder = input.strip_prefix("/mcp ").unwrap_or("").trim().to_string();
@@ -857,8 +974,10 @@ pub async fn connect() -> Result<()> {
             println!("tools enabled: true (MCP + built-in)");
             input = remainder;
         }
-        if input == "/model" || input.starts_with("/model ")
-            || input == "/models" || input.starts_with("/models ")
+        if input == "/model"
+            || input.starts_with("/model ")
+            || input == "/models"
+            || input.starts_with("/models ")
         {
             let cfg = crate::config::load().unwrap_or_default();
             // `/models` is an accepted alias for `/model`.
@@ -916,7 +1035,10 @@ pub async fn connect() -> Result<()> {
                 _ => catalog.clone(),
             };
             if show.is_empty() && filter.is_some() {
-                println!("no models match '{}' (run /model grep <term>)", filter.as_deref().unwrap_or(""));
+                println!(
+                    "no models match '{}' (run /model grep <term>)",
+                    filter.as_deref().unwrap_or("")
+                );
                 continue;
             }
 
@@ -938,7 +1060,10 @@ pub async fn connect() -> Result<()> {
                     Some(term) if !term.is_empty() => {
                         println!("models matching '{}' ({}):", term, show.len());
                     }
-                    _ => println!("available models ({}) (narrow with /model grep <term>):", show.len()),
+                    _ => println!(
+                        "available models ({}) (narrow with /model grep <term>):",
+                        show.len()
+                    ),
                 }
                 for (i, m) in show.iter().enumerate() {
                     println!("  [{}] {}", i + 1, m);
@@ -966,9 +1091,10 @@ pub async fn connect() -> Result<()> {
                 continue;
             }
 
-            // /model <number>: select from the catalog.
+            // /model <number>: select from the displayed list (which may be
+            // narrowed by a `/model grep <term>` filter).
             if let Ok(n) = remainder.parse::<usize>() {
-                match resolve(n, &catalog) {
+                match resolve(n, &show) {
                     Some(Some(m)) => {
                         current_model = Some(m.clone());
                         println!("model switched to: {}", m);
@@ -996,7 +1122,10 @@ pub async fn connect() -> Result<()> {
 
             // /model <name>: set an explicit model id regardless of the catalog.
             if !catalog.is_empty() && !catalog.iter().any(|m| m == &remainder) {
-                println!("note: '{}' is not in the fetched model list; the provider may reject it", remainder);
+                println!(
+                    "note: '{}' is not in the fetched model list; the provider may reject it",
+                    remainder
+                );
             }
             current_model = Some(remainder.clone());
             println!("model switched to: {}", remainder);
@@ -1017,12 +1146,18 @@ pub async fn connect() -> Result<()> {
         if input == "/provider" || input.starts_with("/provider ") {
             let cfg = crate::config::load().unwrap_or_default();
             let names = crate::config::provider_names(&cfg);
-            let remainder = input.strip_prefix("/provider").unwrap_or("").trim().to_string();
+            let remainder = input
+                .strip_prefix("/provider")
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if remainder.is_empty() {
                 // List providers.
                 println!("available providers ({}):", names.len());
                 for (i, n) in names.iter().enumerate() {
-                    let marker = if current_provider.as_deref().unwrap_or("") == n || (current_provider.is_none() && i == 0) {
+                    let marker = if current_provider.as_deref().unwrap_or("") == n
+                        || (current_provider.is_none() && i == 0)
+                    {
                         " *"
                     } else {
                         ""
@@ -1046,10 +1181,17 @@ pub async fn connect() -> Result<()> {
                     }
                 }
                 if let Some(p) = switched {
-                    current_provider = if p == "default" { None } else { Some(p.clone()) };
+                    current_provider = if p == "default" {
+                        None
+                    } else {
+                        Some(p.clone())
+                    };
                     current_model = None; // reset model; provider may differ
-                    models_cache = None;  // refetch catalog for the new provider
-                    println!("provider switched to: {}", if p == "default" { "default" } else { &p });
+                    models_cache = None; // refetch catalog for the new provider
+                    println!(
+                        "provider switched to: {}",
+                        if p == "default" { "default" } else { &p }
+                    );
                     // If the previous turn failed (e.g. rate limit), offer to
                     // re-send the last prompt with the new provider.
                     if last_turn_failed {
@@ -1070,7 +1212,11 @@ pub async fn connect() -> Result<()> {
             }
             continue;
         }
-        if input == "/mcp_tools" || input == "/mcp_status" || input == "/mcp_reconnect" || input == "/mcp_restart" {
+        if input == "/mcp_tools"
+            || input == "/mcp_status"
+            || input == "/mcp_reconnect"
+            || input == "/mcp_restart"
+        {
             let show_tools = input == "/mcp_tools";
             let reconnect = input == "/mcp_reconnect" || input == "/mcp_restart";
             if reconnect {
@@ -1078,8 +1224,12 @@ pub async fn connect() -> Result<()> {
             }
             let servers = mcp_probe_servers(&mut w, &mut lines).await?;
             if servers.is_empty() {
-                println!("no MCP servers configured, or the daemon timed out waiting for MCP status");
-                println!("  [[mcp.servers]]\n  name = \"server-name\"\n  url = \"https://host/mcp\"");
+                println!(
+                    "no MCP servers configured, or the daemon timed out waiting for MCP status"
+                );
+                println!(
+                    "  [[mcp.servers]]\n  name = \"server-name\"\n  url = \"https://host/mcp\""
+                );
             } else if show_tools {
                 for s in &servers {
                     println!("--- {} ({}) ---", s.name, s.transport);
@@ -1111,8 +1261,11 @@ pub async fn connect() -> Result<()> {
             continue;
         }
         if input == "/session" {
-            let cwd = std::env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-            let all = crate::storage::list_sessions().await
+            let cwd = std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let all = crate::storage::list_sessions()
+                .await
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|s| s.working_dir == cwd)
@@ -1123,11 +1276,16 @@ pub async fn connect() -> Result<()> {
                 continue;
             }
             for (i, s) in sessions_cache.iter().enumerate() {
-                println!("  [{}] {} | model: {} | msgs: {} | updated: {}",
-                    i + 1, s.title, s.model, s.messages.len(),
+                println!(
+                    "  [{}] {} | model: {} | msgs: {} | updated: {}",
+                    i + 1,
+                    s.title,
+                    s.model,
+                    s.messages.len(),
                     chrono::DateTime::<chrono::Utc>::from_timestamp_millis(s.updated_at_ms)
                         .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
-                        .unwrap_or_else(|| "?".to_string()));
+                        .unwrap_or_else(|| "?".to_string())
+                );
             }
             continue;
         }
@@ -1152,9 +1310,18 @@ pub async fn connect() -> Result<()> {
                 Some(s) => {
                     session_id = Some(s.id.clone());
                     current_model = Some(s.model.clone());
-                    println!("resumed session: {} ({} messages, model: {})", s.title, s.messages.len(), s.model);
+                    println!(
+                        "resumed session: {} ({} messages, model: {})",
+                        s.title,
+                        s.messages.len(),
+                        s.model
+                    );
                     for m in &s.messages {
-                        println!("  [{}] {}", m.role, m.content.chars().take(120).collect::<String>());
+                        println!(
+                            "  [{}] {}",
+                            m.role,
+                            m.content.chars().take(120).collect::<String>()
+                        );
                     }
                 }
                 None => println!("no session at number {}", num),
@@ -1162,8 +1329,11 @@ pub async fn connect() -> Result<()> {
             continue;
         }
         if input == "/memory" {
-            let cwd = std::env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+            let cwd = std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
             let notes = crate::memory::load_notes()
+                .await
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|n| n.folder == cwd)
@@ -1173,15 +1343,23 @@ pub async fn connect() -> Result<()> {
                 continue;
             }
             for (i, n) in notes.iter().enumerate() {
-                println!("  [{}] {} ({})", i + 1, n.text, n.id.get(..8).unwrap_or(&n.id));
+                println!(
+                    "  [{}] {} ({})",
+                    i + 1,
+                    n.text,
+                    n.id.get(..8).unwrap_or(&n.id)
+                );
             }
             continue;
         }
         if input == "/forget" || input.starts_with("/forget ") {
             let num = input.strip_prefix("/forget").unwrap_or("").trim();
-            let cwd = std::env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-            let notes = crate::memory::load_notes().unwrap_or_default();
-            let notes_in_folder: Vec<&crate::memory::MemoryNote> = notes.iter().filter(|n| n.folder == cwd).collect();
+            let cwd = std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let notes = crate::memory::load_notes().await.unwrap_or_default();
+            let notes_in_folder: Vec<&crate::memory::MemoryNote> =
+                notes.iter().filter(|n| n.folder == cwd).collect();
             if num.is_empty() {
                 println!("usage: /forget <number> (see /memory)");
                 continue;
@@ -1195,7 +1373,7 @@ pub async fn connect() -> Result<()> {
             };
             match notes_in_folder.get(idx) {
                 Some(n) => {
-                    let _ = crate::memory::remove_note(&n.id);
+                    let _ = crate::memory::remove_note(&n.id).await;
                     println!("forgot: {}", n.text);
                 }
                 None => println!("no memory at number {}", num),
@@ -1230,7 +1408,9 @@ pub async fn connect() -> Result<()> {
             .is_ok()
         {}
 
-        let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string());
         let id = crate::protocol::new_message_id();
         // Remember this prompt so we can re-send it after a model/provider
         // switch if the turn fails (e.g. rate limit).
@@ -1241,23 +1421,7 @@ pub async fn connect() -> Result<()> {
             session_id: session_id.clone(),
             content: input,
             tools: if tools_enabled {
-                Some(vec![
-                    "bash".to_string(),
-                    "read".to_string(),
-                    "write".to_string(),
-                    "edit".to_string(),
-                    "list_dir".to_string(),
-                    "glob".to_string(),
-                    "agentgrep".to_string(),
-                    "apply_patch".to_string(),
-                    "plan".to_string(),
-                    "git".to_string(),
-                    "fetch_url".to_string(),
-                    "http_request".to_string(),
-                    "note".to_string(),
-                    "docker".to_string(),
-                    "sql".to_string(),
-                ])
+                Some(builtin_tool_list())
             } else {
                 None
             },
@@ -1274,6 +1438,11 @@ pub async fn connect() -> Result<()> {
         w.write_all(data.as_bytes()).await?;
         w.write_all(b"\n").await?;
         w.flush().await?;
+
+        // Show a spinner right away and animate it through silent stretches so
+        // a slow/reasoning model is visibly still working.
+        let mut waiting = WaitingIndicator::new(std::io::stderr().is_terminal(), dim_tools);
+        waiting.show_now();
 
         let mut in_stream = false;
         let mut cancelled = false;
@@ -1294,9 +1463,11 @@ pub async fn connect() -> Result<()> {
                         Ok(e) => e,
                         Err(_) => continue,
                     };
+                    waiting.activity();
                     match ev {
                         Event::Ack { .. } => {}
                         Event::ToolCall { id: _, calls } => {
+                            waiting.clear();
                             // If the reply is mid-line, finish it first: tool
                             // lines go to stderr, so without this they'd be
                             // appended to the end of a streamed sentence.
@@ -1323,6 +1494,7 @@ pub async fn connect() -> Result<()> {
                             resp_at_line_start = true;
                         }
                         Event::ToolResult { id: _, results } => {
+                            waiting.clear();
                             // Tool result output stays suppressed for a quiet,
                             // readable session — but do show the lines that
                             // actually changed for successful edits/patches.
@@ -1343,6 +1515,7 @@ pub async fn connect() -> Result<()> {
                             // `[server] show_thinking = true`. Other status
                             // messages (e.g. "Executing tool: ...") stay quiet.
                             if show_thinking && message.starts_with("thinking: ") {
+                                waiting.clear();
                                 if !resp_at_line_start {
                                     println!();
                                 }
@@ -1356,6 +1529,7 @@ pub async fn connect() -> Result<()> {
                             // style) a top rule.
                             if !in_stream && !text.is_empty() {
                                 in_stream = true;
+                                waiting.clear();
                                 if chrome {
                                     println!();
                                 }
@@ -1368,6 +1542,7 @@ pub async fn connect() -> Result<()> {
                             std::io::stdout().flush()?;
                         }
                         Event::ApprovalRequired { id, tool_call_id, tool_name, path, reason } => {
+                            waiting.clear();
                             in_stream = false;
                             eprintln!();
                             eprintln!("{}", dim(&format!("[approval] {} — {}", tool_name, reason), dim_tools));
@@ -1401,6 +1576,7 @@ pub async fn connect() -> Result<()> {
                             // Out-of-band swarm event (DM / broadcast / child-agent
                             // completion report). Show it so the parent sees agent
                             // activity live, without corrupting the streamed reply.
+                            waiting.clear();
                             in_stream = false;
                             eprintln!();
                             let from = from_session.as_deref().unwrap_or("system");
@@ -1413,6 +1589,7 @@ pub async fn connect() -> Result<()> {
                             resp_at_line_start = true;
                         }
                         Event::Done { id: _ } => {
+                            waiting.clear();
                             // Close the response block: finish the line, then
                             // (box style) a bottom rule, then a blank line.
                             if in_stream {
@@ -1429,6 +1606,7 @@ pub async fn connect() -> Result<()> {
                             break;
                         }
                         Event::Error { id: _, message } => {
+                            waiting.clear();
                             eprintln!("error: {}", message);
                             last_turn_failed = true;
                             break;
@@ -1454,6 +1632,10 @@ pub async fn connect() -> Result<()> {
                     // aborted turn) so no stale events bleed into the next
                     // request's stream.
                 }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(400)) => {
+                    // Animate the waiting spinner through silent stretches.
+                    waiting.tick();
+                }
                 _ = tokio::time::sleep(std::time::Duration::from_secs(30)), if cancelled => {
                     // Safety net: the daemon should ack the abort promptly.
                     break;
@@ -1473,30 +1655,16 @@ pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool, mcp: b
     let mut lines = BufReader::new(r).lines();
 
     // Each `jancode run` starts a fresh session (one-shot, no resume).
-    let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().to_string());
     let id = crate::protocol::new_message_id();
     let req = Request::Message {
         id,
         session_id: None,
         content: prompt.to_string(),
         tools: if tools {
-            Some(vec![
-                "bash".to_string(),
-                "read".to_string(),
-                "write".to_string(),
-                "edit".to_string(),
-                "list_dir".to_string(),
-                "glob".to_string(),
-                "agentgrep".to_string(),
-                "apply_patch".to_string(),
-                "plan".to_string(),
-                "git".to_string(),
-                "fetch_url".to_string(),
-                "http_request".to_string(),
-                "note".to_string(),
-                "docker".to_string(),
-                "sql".to_string(),
-            ])
+            Some(builtin_tool_list())
         } else {
             None
         },
@@ -1530,15 +1698,31 @@ pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool, mcp: b
     // Files (and pre-call contents) for in-flight mutating tool calls; see the
     // interactive loop.
     let mut pending_diffs: HashMap<String, Vec<Snapshot>> = HashMap::new();
-    while let Some(line) = lines.next_line().await? {
+    let mut waiting = WaitingIndicator::new(std::io::stderr().is_terminal(), dim_tools);
+    waiting.show_now();
+    loop {
+        let line = tokio::select! {
+            line = lines.next_line() => {
+                match line? {
+                    Some(l) => l,
+                    None => break,
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(400)) => {
+                waiting.tick();
+                continue;
+            }
+        };
         let ev: Event = match serde_json::from_str(&line) {
             Ok(e) => e,
             Err(_) => continue,
         };
+        waiting.activity();
         match ev {
             Event::TextDelta { id: _, text } => {
                 if !any_output && !text.is_empty() {
                     any_output = true;
+                    waiting.clear();
                     if chrome {
                         println!();
                     }
@@ -1551,6 +1735,7 @@ pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool, mcp: b
                 std::io::stdout().flush()?;
             }
             Event::ToolCall { id: _, calls } => {
+                waiting.clear();
                 // Finish a mid-line reply first: tool lines go to stderr and
                 // would otherwise be appended to a streamed sentence.
                 if !resp_at_line_start {
@@ -1558,7 +1743,20 @@ pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool, mcp: b
                 }
                 for c in &calls {
                     let arg_str = tool_arg_summary(&c.name, &c.input);
-                    eprintln!("{}", dim(&format!("[tool] {}", if arg_str.is_empty() { c.name.clone() } else { format!("{} {}", c.name, arg_str) }), dim_tools));
+                    eprintln!(
+                        "{}",
+                        dim(
+                            &format!(
+                                "[tool] {}",
+                                if arg_str.is_empty() {
+                                    c.name.clone()
+                                } else {
+                                    format!("{} {}", c.name, arg_str)
+                                }
+                            ),
+                            dim_tools
+                        )
+                    );
                     // Snapshot the files this call is about to change; the
                     // difference is shown once the daemon confirms success.
                     if show_diffs {
@@ -1571,6 +1769,7 @@ pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool, mcp: b
                 resp_at_line_start = true;
             }
             Event::ToolResult { id: _, results } => {
+                waiting.clear();
                 // Tool output stays suppressed, but show what changed for
                 // successful edits/patches.
                 for r in &results {
@@ -1587,6 +1786,7 @@ pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool, mcp: b
             }
             Event::Status { .. } => {}
             Event::Done { id: _ } => {
+                waiting.clear();
                 if any_output {
                     if !resp_at_line_start {
                         println!();
@@ -1601,6 +1801,7 @@ pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool, mcp: b
                 break;
             }
             Event::Error { id: _, message } => {
+                waiting.clear();
                 anyhow::bail!(message);
             }
             _ => {}
@@ -1642,7 +1843,10 @@ mod tests {
         let mut at_start = true;
         // Empty gutter -> exact passthrough, but line state is still tracked so
         // the Done handler knows whether to append a trailing newline.
-        assert_eq!(apply_gutter("hello\nworld", &mut at_start, ""), "hello\nworld");
+        assert_eq!(
+            apply_gutter("hello\nworld", &mut at_start, ""),
+            "hello\nworld"
+        );
         assert!(!at_start);
         // Text ending in a newline leaves us at line start.
         assert_eq!(apply_gutter("done\n", &mut at_start, ""), "done\n");
@@ -1697,11 +1901,23 @@ mod tests {
         assert_eq!(colorize_diff_line("+new", false), "+new");
         assert_eq!(colorize_diff_line("-old", false), "-old");
         // Colour on -> marker-driven SGR, reset at the end.
-        assert_eq!(colorize_diff_line("+new", true), format!("{}+new{}", ANSI_GREEN, ANSI_RESET));
-        assert_eq!(colorize_diff_line("-old", true), format!("{}-old{}", ANSI_RED, ANSI_RESET));
-        assert_eq!(colorize_diff_line("@@ -1 +1 @@", true), format!("{}@@ -1 +1 @@{}", ANSI_CYAN, ANSI_RESET));
+        assert_eq!(
+            colorize_diff_line("+new", true),
+            format!("{}+new{}", ANSI_GREEN, ANSI_RESET)
+        );
+        assert_eq!(
+            colorize_diff_line("-old", true),
+            format!("{}-old{}", ANSI_RED, ANSI_RESET)
+        );
+        assert_eq!(
+            colorize_diff_line("@@ -1 +1 @@", true),
+            format!("{}@@ -1 +1 @@{}", ANSI_CYAN, ANSI_RESET)
+        );
         // Unmarked lines (e.g. a truncation note) stay plain.
-        assert_eq!(colorize_diff_line("  ... (+3 more)", true), "  ... (+3 more)");
+        assert_eq!(
+            colorize_diff_line("  ... (+3 more)", true),
+            "  ... (+3 more)"
+        );
     }
 
     #[test]
@@ -1796,10 +2012,16 @@ mod tests {
         // A file-writing shell command is picked up (same detection as the
         // approval gate), and a read-only one is not.
         assert_eq!(
-            mutation_paths_for_call("bash", &serde_json::json!({ "command": "sed -i s/a/b/ s.css" })),
+            mutation_paths_for_call(
+                "bash",
+                &serde_json::json!({ "command": "sed -i s/a/b/ s.css" })
+            ),
             vec!["s.css".to_string()]
         );
-        assert!(mutation_paths_for_call("bash", &serde_json::json!({ "command": "git status" })).is_empty());
+        assert!(
+            mutation_paths_for_call("bash", &serde_json::json!({ "command": "git status" }))
+                .is_empty()
+        );
         // Read-only tools never report paths, so nothing is snapshotted.
         for name in ["read", "list_dir", "glob", "agentgrep", "plan", "git"] {
             assert!(
@@ -1813,29 +2035,47 @@ mod tests {
     fn snapshot_then_diff_shows_the_change_without_git() {
         // End-to-end of the git-free path: snapshot a real temp file, mutate it
         // behind our back (as the daemon would), then diff.
-        let dir = std::env::temp_dir().join(format!("jancode-snap-{}", crate::protocol::new_message_id()));
+        let dir = std::env::temp_dir().join(format!(
+            "jancode-snap-{}",
+            crate::protocol::new_message_id()
+        ));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let file = dir.join("styles.css");
         std::fs::write(&file, "body { color: #2d6a4f; }\np { margin: 0; }\n").expect("seed");
 
         let snapshots = snapshot_for_call("edit", &serde_json::json!({ "path": file }));
         assert_eq!(snapshots.len(), 1);
-        assert_eq!(snapshots[0].before.as_deref(), Some("body { color: #2d6a4f; }\np { margin: 0; }\n"));
+        assert_eq!(
+            snapshots[0].before.as_deref(),
+            Some("body { color: #2d6a4f; }\np { margin: 0; }\n")
+        );
 
         // The "daemon" applies the change.
         std::fs::write(&file, "body { color: #4a2e1b; }\np { margin: 0; }\n").expect("edit");
         let lines = changed_lines(&snapshots).expect("changed lines");
-        assert_eq!(lines, vec!["@@ -1,1 +1,1 @@", "-body { color: #2d6a4f; }", "+body { color: #4a2e1b; }"]);
+        assert_eq!(
+            lines,
+            vec![
+                "@@ -1,1 +1,1 @@",
+                "-body { color: #2d6a4f; }",
+                "+body { color: #4a2e1b; }"
+            ]
+        );
 
         // A no-op call reports nothing.
-        assert!(changed_lines(&snapshot_for_call("edit", &serde_json::json!({ "path": file }))).is_none());
+        assert!(changed_lines(&snapshot_for_call(
+            "edit",
+            &serde_json::json!({ "path": file })
+        ))
+        .is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn snapshot_of_missing_file_is_treated_as_a_creation() {
-        let dir = std::env::temp_dir().join(format!("jancode-new-{}", crate::protocol::new_message_id()));
+        let dir =
+            std::env::temp_dir().join(format!("jancode-new-{}", crate::protocol::new_message_id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let file = dir.join("fresh.txt");
         let snapshots = snapshot_for_call("write", &serde_json::json!({ "path": file }));
@@ -1866,7 +2106,10 @@ mod tests {
 
     #[test]
     fn tool_arg_summary_picks_the_right_field() {
-        assert_eq!(tool_arg_summary("read", &serde_json::json!({ "path": "src/a.rs" })), "src/a.rs");
+        assert_eq!(
+            tool_arg_summary("read", &serde_json::json!({ "path": "src/a.rs" })),
+            "src/a.rs"
+        );
         assert_eq!(
             tool_arg_summary("agentgrep", &serde_json::json!({ "query": "fn main" })),
             "fn main"
@@ -1876,18 +2119,29 @@ mod tests {
             "**/*.rs"
         );
         assert_eq!(
-            tool_arg_summary("git", &serde_json::json!({ "action": "checkout", "branch": "main" })),
+            tool_arg_summary(
+                "git",
+                &serde_json::json!({ "action": "checkout", "branch": "main" })
+            ),
             "checkout main"
         );
-        assert_eq!(tool_arg_summary("git", &serde_json::json!({ "action": "status" })), "status");
         assert_eq!(
-            tool_arg_summary("http_request", &serde_json::json!({ "method": "post", "url": "http://x" })),
+            tool_arg_summary("git", &serde_json::json!({ "action": "status" })),
+            "status"
+        );
+        assert_eq!(
+            tool_arg_summary(
+                "http_request",
+                &serde_json::json!({ "method": "post", "url": "http://x" })
+            ),
             "POST http://x"
         );
         // Long commands are truncated so the status line stays on one line.
         let long = "x".repeat(200);
         assert_eq!(
-            tool_arg_summary("bash", &serde_json::json!({ "command": long })).chars().count(),
+            tool_arg_summary("bash", &serde_json::json!({ "command": long }))
+                .chars()
+                .count(),
             80
         );
     }

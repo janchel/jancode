@@ -229,6 +229,8 @@ EOF
     warn "config.toml already exists in $home, leaving it untouched."
   fi
   chmod 700 "$home" 2>/dev/null || true
+  # config.toml may hold inline provider keys / MCP bearer tokens.
+  chmod 600 "$home/config.toml" 2>/dev/null || true
   log "Config dir: $home ('JANCODE_HOME' override supported)"
 }
 
