@@ -221,6 +221,14 @@ the moment real output, a tool call, or an approval prompt appears, so you can
 always tell the agent is still working. Terminal-only: piped/redirected output
 stays clean, and `jancode run` gets the same indicator.
 
+#### Image input
+
+In `jancode connect`, attach local images to the next message with
+`/image <path> [path...]` (PNG/JPEG/GIF/WebP/BMP, up to 15 MB each). The files
+are read server-side and sent as multimodal `image_url` parts alongside your
+text, so the model can read screenshots, diagrams, and UI captures. Attachments
+apply to the next message only.
+
 #### Modified lines
 
 Whenever the model changes a file, jancode prints **just the lines it changed**

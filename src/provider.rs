@@ -22,11 +22,46 @@ struct ChatRequest {
     stop: Option<Vec<String>>,
 }
 
+/// Message content: either plain text or OpenAI-style multipart (text + images).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ImageUrl {
+    url: String,
+}
+
+/// Character length of a message's text content (images count as 0).
+fn message_content_len(content: &Option<MessageContent>) -> usize {
+    match content {
+        Some(MessageContent::Text(t)) => t.len(),
+        Some(MessageContent::Parts(parts)) => parts
+            .iter()
+            .map(|p| match p {
+                ContentPart::Text { text } => text.len(),
+                ContentPart::ImageUrl { .. } => 0,
+            })
+            .sum(),
+        None => 0,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChatMessage {
     role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<MessageContent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ApiToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -448,6 +483,7 @@ pub async fn send_message(
     memory_context: &str,
     instructions: &str,
     tool_budget: Option<u32>,
+    images: &[String],
 ) -> Result<Vec<Event>> {
     let provider = crate::config::resolve_provider(cfg, provider_name);
     let api_key = resolve_api_key(&provider)?;
@@ -546,7 +582,7 @@ The user's time and tokens are limited. Be concise and direct.".to_string()
     let mut messages: Vec<ChatMessage> = Vec::new();
     messages.push(ChatMessage {
         role: "system".to_string(),
-        content: Some(system),
+        content: Some(MessageContent::Text(system)),
         tool_calls: None,
         tool_call_id: None,
     });
@@ -576,7 +612,10 @@ The user's time and tokens are limited. Be concise and direct.".to_string()
                 // A tool result becomes a user message describing the output.
                 messages.push(ChatMessage {
                     role: "user".to_string(),
-                    content: Some(format!("[tool result]: {}", m.content)),
+                    content: Some(MessageContent::Text(format!(
+                        "[tool result]: {}",
+                        m.content
+                    ))),
                     tool_calls: None,
                     tool_call_id: None,
                 });
@@ -595,14 +634,14 @@ The user's time and tokens are limited. Be concise and direct.".to_string()
                 };
                 messages.push(ChatMessage {
                     role: "assistant".to_string(),
-                    content: Some(text),
+                    content: Some(MessageContent::Text(text)),
                     tool_calls: None,
                     tool_call_id: None,
                 });
             } else {
                 messages.push(ChatMessage {
                     role: m.role.clone(),
-                    content: Some(m.content.clone()),
+                    content: Some(MessageContent::Text(m.content.clone())),
                     tool_calls: None,
                     tool_call_id: None,
                 });
@@ -619,7 +658,7 @@ The user's time and tokens are limited. Be concise and direct.".to_string()
             content: if m.tool_calls.is_some() {
                 None
             } else {
-                Some(m.content.clone())
+                Some(MessageContent::Text(m.content.clone()))
             },
             tool_calls: m.tool_calls.as_ref().map(|tcs| {
                 tcs.iter()
@@ -637,6 +676,37 @@ The user's time and tokens are limited. Be concise and direct.".to_string()
             }),
             tool_call_id: m.tool_call_id.clone(),
         }));
+    }
+
+    // Attach multimodal images to the most recent user message (OpenAI-style
+    // multipart content: text + image_url parts).
+    if !images.is_empty() {
+        for m in messages.iter_mut().rev() {
+            if m.role == "user" {
+                let mut parts: Vec<ContentPart> = Vec::new();
+                match &m.content {
+                    Some(MessageContent::Text(t)) if !t.is_empty() => {
+                        parts.push(ContentPart::Text { text: t.clone() });
+                    }
+                    Some(MessageContent::Parts(existing)) => {
+                        parts.extend(existing.clone());
+                    }
+                    _ => {}
+                }
+                if parts.is_empty() {
+                    parts.push(ContentPart::Text {
+                        text: String::new(),
+                    });
+                }
+                for url in images {
+                    parts.push(ContentPart::ImageUrl {
+                        image_url: ImageUrl { url: url.clone() },
+                    });
+                }
+                m.content = Some(MessageContent::Parts(parts));
+                break;
+            }
+        }
     }
 
     let tool_defs = tools.map(|tds| {
@@ -673,7 +743,7 @@ The user's time and tokens are limited. Be concise and direct.".to_string()
         // the budget. Always keep at least the system prompt + last 2 turns.
         let min_keep = 3; // system + user + assistant
         for i in (min_keep..messages.len()).rev() {
-            let content_len = messages[i].content.as_deref().map_or(0, |c| c.len());
+            let content_len = message_content_len(&messages[i].content);
             let tool_len = messages[i].tool_calls.as_ref().map_or(0, |tcs| {
                 tcs.iter()
                     .map(|tc| tc.function.arguments.as_deref().map_or(0, |s| s.len()))
@@ -1169,6 +1239,31 @@ fn resolve_api_key(provider: &ProviderConfig) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multipart_content_serializes() {
+        let parts = MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "look".to_string(),
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,AAAA".to_string(),
+                },
+            },
+        ]);
+        assert_eq!(
+            serde_json::to_value(parts).unwrap(),
+            serde_json::json!([
+                {"type": "text", "text": "look"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+            ])
+        );
+        assert_eq!(
+            serde_json::to_value(MessageContent::Text("hi".to_string())).unwrap(),
+            serde_json::json!("hi")
+        );
+    }
 
     #[test]
     fn parses_flattened_tool_calls() {

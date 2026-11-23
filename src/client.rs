@@ -940,6 +940,8 @@ pub async fn connect() -> Result<()> {
     // Plan mode: read-only tools run freely, gated (mutating) operations are
     // auto-denied. Toggled with /plan.
     let mut plan_mode = false;
+    // Images attached with `/image` and sent with the next message.
+    let mut pending_images: Vec<String> = Vec::new();
     let mut session_id = Some(format!("connect-{}", crate::protocol::new_message_id()));
     println!(
         "swarm session id: {} (spawn agents with `jancode swarm spawn --parent {}`)",
@@ -1019,6 +1021,21 @@ pub async fn connect() -> Result<()> {
         }
         if input == "/quit" || input == "/exit" || input == "/q" {
             break;
+        }
+        if input == "/image" || input.starts_with("/image ") {
+            let rest = input.strip_prefix("/image").unwrap_or("").trim();
+            if rest.is_empty() {
+                println!("usage: /image <path> [path...]  (attached to the next message)");
+                continue;
+            }
+            for p in rest.split_whitespace() {
+                pending_images.push(p.to_string());
+            }
+            println!(
+                "attached {} image(s); send your message next",
+                pending_images.len()
+            );
+            continue;
         }
         if input == "/plan" {
             plan_mode = !plan_mode;
@@ -1592,7 +1609,7 @@ pub async fn connect() -> Result<()> {
             continue;
         }
         if input == "/help" {
-            println!("Available commands: /quit, /exit, /q (quit), /plan (toggle plan mode: read-only, mutations denied), /tools (toggle tool calling), /model (list models and switch), /provider (list/switch providers), /diff (show modified lines via git diff), /mcp (list MCP servers / send with MCP tools), /mcp_tools (list tools exposed by MCP servers), /mcp_status (MCP server connection status), /mcp_reconnect (reload config + reconnect MCP servers), /session (list sessions), /resume <number>, /export [number] [path] (write a session as Markdown), /search <text> (find matches across sessions), /memory (list memories), /forget <number>, /help (Ctrl+C cancels the running request; Ctrl+D quits)");
+            println!("Available commands: /quit, /exit, /q (quit), /plan (toggle plan mode: read-only, mutations denied), /image <path> (attach image(s) to the next message), /tools (toggle tool calling), /model (list models and switch), /provider (list/switch providers), /diff (show modified lines via git diff), /mcp (list MCP servers / send with MCP tools), /mcp_tools (list tools exposed by MCP servers), /mcp_status (MCP server connection status), /mcp_reconnect (reload config + reconnect MCP servers), /session (list sessions), /resume <number>, /export [number] [path] (write a session as Markdown), /search <text> (find matches across sessions), /memory (list memories), /forget <number>, /help (Ctrl+C cancels the running request; Ctrl+D quits)");
             continue;
         }
         // Drain any queued Ctrl+C first so a stray keypress while idle can't
@@ -1624,11 +1641,14 @@ pub async fn connect() -> Result<()> {
             cwd,
             interactive: true,
             plan_mode,
+            images: pending_images.clone(),
             // MCP tools only for turns started with `/mcp <message>`.
             mcp: mcp_requested,
         };
         // MCP opt-in is per-turn: reset so the next message is built-in only.
         mcp_requested = false;
+        // Images are attached to this message only.
+        pending_images.clear();
         let data = serde_json::to_string(&req)?;
         w.write_all(data.as_bytes()).await?;
         w.write_all(b"\n").await?;
@@ -1870,6 +1890,7 @@ pub async fn run_prompt(prompt: &str, model: Option<String>, tools: bool, mcp: b
         cwd,
         interactive: false,
         plan_mode: false,
+        images: Vec::new(),
     };
     let data = serde_json::to_string(&req)?;
     w.write_all(data.as_bytes()).await?;

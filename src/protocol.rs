@@ -38,6 +38,9 @@ pub enum Request {
         /// operation is auto-denied instead of prompting.
         #[serde(default)]
         plan_mode: bool,
+        /// Local image files to attach to this message (multimodal input).
+        #[serde(default)]
+        images: Vec<String>,
     },
     Cancel {
         id: u64,

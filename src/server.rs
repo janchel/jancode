@@ -231,6 +231,7 @@ async fn handle_client(
                 cwd,
                 interactive,
                 plan_mode,
+                images,
             } => {
                 let session_id_s = session_id.unwrap_or_else(|| format!("session-{}", id));
                 let working_dir = cwd.clone().unwrap_or_else(|| {
@@ -371,6 +372,7 @@ async fn handle_client(
                         tool_registry,
                         interactive,
                         plan_mode,
+                        images,
                         provider,
                     )
                     .await
@@ -807,6 +809,64 @@ fn policy_allows(name: &str, input: &Value, sec: &crate::config::SecurityConfig)
     false
 }
 
+/// Minimal standard base64 encoder (no external dependency).
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((n >> 6) & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(n & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Read local image files and encode them as data URLs for multimodal input.
+async fn load_image_data(working_dir: &str, paths: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for p in paths {
+        let full = if std::path::Path::new(p).is_absolute() {
+            std::path::PathBuf::from(p)
+        } else {
+            std::path::Path::new(working_dir).join(p)
+        };
+        let bytes = tokio::fs::read(&full)
+            .await
+            .with_context(|| format!("reading image {}", full.display()))?;
+        if bytes.len() > 15 * 1024 * 1024 {
+            anyhow::bail!("image {} is larger than 15 MB", full.display());
+        }
+        let mime = match full
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .as_deref()
+        {
+            Some("png") => "image/png",
+            Some("jpg") | Some("jpeg") => "image/jpeg",
+            Some("gif") => "image/gif",
+            Some("webp") => "image/webp",
+            Some("bmp") => "image/bmp",
+            _ => "application/octet-stream",
+        };
+        out.push(format!("data:{};base64,{}", mime, base64_encode(&bytes)));
+    }
+    Ok(out)
+}
+
 /// Normalize a path string for use as a cache key.
 /// Handles variations like "index.html", "./index.html", "dir/../index.html"
 /// by resolving to a canonical form without touching the filesystem.
@@ -855,8 +915,11 @@ async fn handle_message_turn(
     tool_registry: Option<crate::tools::ToolRegistry>,
     interactive: bool,
     plan_mode: bool,
+    images: Vec<String>,
     provider: Option<String>,
 ) -> Result<()> {
+    let image_data = load_image_data(&working_dir, &images).await?;
+
     // Build the tool definitions to send to the provider. If the active
     // provider/model doesn't support structured tool calling
     // (`supports_tools = false`), we skip tools entirely so the model answers
@@ -1066,6 +1129,7 @@ async fn handle_message_turn(
             &memory_context,
             &instructions,
             remaining_budget,
+            &image_data,
         )
         .await;
 
@@ -1993,6 +2057,7 @@ async fn run_headless_agent(
             "",
             &instructions,
             None,
+            &[],
         )
         .await
         {
@@ -2911,5 +2976,30 @@ mod tests {
             &sec
         ));
         assert!(!policy_allows("read", &serde_json::json!({}), &sec));
+    }
+
+    #[test]
+    fn base64_encoding_matches_reference() {
+        assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_encode(b""), "");
+    }
+
+    #[tokio::test]
+    async fn image_files_become_data_urls() {
+        let dir = std::env::temp_dir().join(format!("jancode-img-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("pic.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n").unwrap();
+        let urls = load_image_data(dir.to_str().unwrap(), &["pic.png".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(urls.len(), 1);
+        assert!(urls[0].starts_with("data:image/png;base64,"));
+        assert!(urls[0].ends_with("=") || urls[0].len() > "data:image/png;base64,".len());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
