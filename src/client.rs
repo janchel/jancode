@@ -834,6 +834,7 @@ pub async fn handle_swarm(sub: crate::SwarmCommands) -> Result<()> {
             Event::ToolCall { .. } => {}
             Event::ToolResult { .. } => {}
             Event::ApprovalRequired { .. } => {}
+            Event::Compacted { .. } => {}
         }
         // Exit once the expected response for this subcommand has been seen so
         // one-shot CLI calls return instead of hanging on the open connection.
@@ -1456,6 +1457,37 @@ pub async fn connect() -> Result<()> {
             }
             continue;
         }
+        if input == "/compact" {
+            let id = crate::protocol::new_message_id();
+            let req = Request::Compact {
+                id,
+                session_id: session_id.clone(),
+            };
+            let data = serde_json::to_string(&req)?;
+            w.write_all(data.as_bytes()).await?;
+            w.write_all(b"\n").await?;
+            w.flush().await?;
+            println!("compacting…");
+            loop {
+                let line = match lines.next_line().await? {
+                    Some(l) => l,
+                    None => break,
+                };
+                match serde_json::from_str::<Event>(&line) {
+                    Ok(Event::Compacted { removed, kept, .. }) => {
+                        println!("compacted: removed {} messages, kept {}", removed, kept);
+                        break;
+                    }
+                    Ok(Event::Error { message, .. }) => {
+                        println!("compact failed: {}", message);
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
+            continue;
+        }
         if input == "/export" || input.starts_with("/export ") {
             let rest = input.strip_prefix("/export").unwrap_or("").trim();
             let mut parts = rest.split_whitespace();
@@ -1609,7 +1641,7 @@ pub async fn connect() -> Result<()> {
             continue;
         }
         if input == "/help" {
-            println!("Available commands: /quit, /exit, /q (quit), /plan (toggle plan mode: read-only, mutations denied), /image <path> (attach image(s) to the next message), /tools (toggle tool calling), /model (list models and switch), /provider (list/switch providers), /diff (show modified lines via git diff), /mcp (list MCP servers / send with MCP tools), /mcp_tools (list tools exposed by MCP servers), /mcp_status (MCP server connection status), /mcp_reconnect (reload config + reconnect MCP servers), /session (list sessions), /resume <number>, /export [number] [path] (write a session as Markdown), /search <text> (find matches across sessions), /memory (list memories), /forget <number>, /help (Ctrl+C cancels the running request; Ctrl+D quits)");
+            println!("Available commands: /quit, /exit, /q (quit), /plan (toggle plan mode: read-only, mutations denied), /image <path> (attach image(s) to the next message), /tools (toggle tool calling), /model (list models and switch), /provider (list/switch providers), /diff (show modified lines via git diff), /mcp (list MCP servers / send with MCP tools), /mcp_tools (list tools exposed by MCP servers), /mcp_status (MCP server connection status), /mcp_reconnect (reload config + reconnect MCP servers), /session (list sessions), /resume <number>, /export [number] [path] (write a session as Markdown), /search <text> (find matches across sessions), /compact (summarize older messages), /memory (list memories), /forget <number>, /help (Ctrl+C cancels the running request; Ctrl+D quits)");
             continue;
         }
         // Drain any queued Ctrl+C first so a stray keypress while idle can't
@@ -1825,6 +1857,14 @@ pub async fn connect() -> Result<()> {
                             eprintln!("error: {}", message);
                             last_turn_failed = true;
                             break;
+                        }
+                        Event::Compacted {
+                            id: _,
+                            removed,
+                            kept,
+                        } => {
+                            waiting.clear();
+                            println!("compacted: removed {} messages, kept {}", removed, kept);
                         }
                         _ => {}
                     }

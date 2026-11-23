@@ -172,6 +172,11 @@ idle_timeout_secs = 300
 # Max model turns / total tool calls per request. Raise for big-project analysis.
 # max_tool_loops = 50
 # max_total_tool_calls = 75
+# Auto-compact the conversation when the estimated context exceeds this
+# fraction of the provider's context_window (0 disables; /compact still works).
+# compact_threshold = 0.8
+# Messages kept verbatim after a compaction.
+# compact_keep = 6
 
 # Hosts/CIDRs the web tools (fetch_url/http_request/download/jenkins) may reach
 # even when they resolve to private/loopback addresses, e.g. an internal

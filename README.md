@@ -229,6 +229,14 @@ are read server-side and sent as multimodal `image_url` parts alongside your
 text, so the model can read screenshots, diagrams, and UI captures. Attachments
 apply to the next message only.
 
+#### Context compaction
+
+Long sessions auto-compact when the estimated context exceeds
+`[server] compact_threshold` (default `0.8`) of the provider's `context_window`:
+the older messages are summarized by the model and the most recent
+`[server] compact_keep` (default 6) are kept verbatim. Run `/compact` to trigger
+it on demand; `/export` still writes the full transcript.
+
 #### Modified lines
 
 Whenever the model changes a file, jancode prints **just the lines it changed**

@@ -55,6 +55,11 @@ pub enum Request {
         id: u64,
         session_id: Option<String>,
     },
+    /// Summarize the older part of a session and keep only the recent messages.
+    Compact {
+        id: u64,
+        session_id: Option<String>,
+    },
     /// Probe configured MCP servers: connect, initialize, and list their tools.
     /// Responded with `Event::McpInfo`. Safe read-only introspection.
     McpProbe {
@@ -139,6 +144,12 @@ pub enum Event {
     History {
         id: u64,
         messages: Vec<Message>,
+    },
+    /// Response to `Request::Compact`.
+    Compacted {
+        id: u64,
+        removed: usize,
+        kept: usize,
     },
     Pong {
         id: u64,

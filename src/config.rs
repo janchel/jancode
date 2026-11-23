@@ -203,6 +203,14 @@ pub struct ServerConfig {
     /// without producing a final answer). Default 75.
     #[serde(default = "default_max_total_tool_calls")]
     pub max_total_tool_calls: u32,
+    /// Auto-compact the conversation when the estimated context exceeds this
+    /// fraction of the provider's `context_window` (0.0-1.0). `0` disables
+    /// auto-compaction (`/compact` still works). Default 0.8.
+    #[serde(default = "default_compact_threshold")]
+    pub compact_threshold: f64,
+    /// Messages kept verbatim after a compaction. Default 6.
+    #[serde(default = "default_compact_keep")]
+    pub compact_keep: usize,
 }
 
 fn default_base_url() -> String {
@@ -257,6 +265,14 @@ fn default_max_total_tool_calls() -> u32 {
     75
 }
 
+fn default_compact_threshold() -> f64 {
+    0.8
+}
+
+fn default_compact_keep() -> usize {
+    6
+}
+
 // Hand-written so a config file with no `[server]` section gets the SAME
 // defaults as an empty `[server]` (serde uses this impl for the missing field,
 // while the `default = "..."` attrs cover missing individual keys). A derived
@@ -273,6 +289,8 @@ impl Default for ServerConfig {
             show_diffs: default_show_diffs(),
             max_tool_loops: default_max_tool_loops(),
             max_total_tool_calls: default_max_total_tool_calls(),
+            compact_threshold: default_compact_threshold(),
+            compact_keep: default_compact_keep(),
         }
     }
 }

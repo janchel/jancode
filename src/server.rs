@@ -220,6 +220,69 @@ async fn handle_client(
                 };
                 send(&w, &Event::History { id, messages: msgs }).await?;
             }
+            Request::Compact { id, session_id } => {
+                let sid = match session_id {
+                    Some(s) if !s.is_empty() => s,
+                    _ => {
+                        send(
+                            &w,
+                            &Event::Error {
+                                id: Some(id),
+                                message: "compact: session_id required".to_string(),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
+                let (model, messages) = {
+                    let map = sessions.read().await;
+                    match map.get(&sid) {
+                        Some(entry) => (entry.model.clone(), entry.messages.clone()),
+                        None => {
+                            send(
+                                &w,
+                                &Event::Error {
+                                    id: Some(id),
+                                    message: format!("compact: no session {}", sid),
+                                },
+                            )
+                            .await?;
+                            continue;
+                        }
+                    }
+                };
+                match compact_messages(&cfg, None, &model, &messages, cfg.server.compact_keep).await
+                {
+                    Ok((new_messages, removed, kept)) => {
+                        let snapshot = {
+                            let mut map = sessions.write().await;
+                            match map.get_mut(&sid) {
+                                Some(entry) => {
+                                    entry.messages = new_messages;
+                                    entry.updated_at_ms = chrono::Utc::now().timestamp_millis();
+                                    Some(entry.clone())
+                                }
+                                None => None,
+                            }
+                        };
+                        if let Some(snap) = snapshot {
+                            let _ = crate::storage::save_session(&snap).await;
+                        }
+                        send(&w, &Event::Compacted { id, removed, kept }).await?;
+                    }
+                    Err(e) => {
+                        send(
+                            &w,
+                            &Event::Error {
+                                id: Some(id),
+                                message: format!("compact failed: {}", e),
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
             Request::Message {
                 id,
                 session_id,
@@ -867,6 +930,92 @@ async fn load_image_data(working_dir: &str, paths: &[String]) -> Result<Vec<Stri
     Ok(out)
 }
 
+/// Rough token estimate for a message list (~4 chars/token).
+fn estimate_messages_tokens(messages: &[Message]) -> u64 {
+    messages
+        .iter()
+        .map(|m| {
+            let content = m.content.len() as u64;
+            let tools = m.tool_calls.as_ref().map_or(0u64, |tcs| {
+                tcs.iter().map(|tc| tc.arguments.len() as u64).sum()
+            });
+            (content + tools) / 4
+        })
+        .sum()
+}
+
+/// Summarize the older part of a session with the provider and return a new
+/// message list: a `[compacted context]` user message plus the kept tail.
+async fn compact_messages(
+    cfg: &crate::config::Config,
+    provider_name: Option<&str>,
+    model: &str,
+    messages: &[Message],
+    keep: usize,
+) -> Result<(Vec<Message>, usize, usize)> {
+    if messages.len() <= keep + 2 {
+        anyhow::bail!("nothing to compact");
+    }
+    let max_cut = messages.len().saturating_sub(keep);
+    // Prefer a user message without tool calls as the boundary so the kept tail
+    // never starts with an orphaned tool result.
+    let mut cut = max_cut;
+    for i in (1..=max_cut).rev() {
+        if messages[i].role == "user" && messages[i].tool_calls.is_none() {
+            cut = i;
+            break;
+        }
+    }
+    if cut == 0 || cut >= messages.len() {
+        anyhow::bail!("nothing to compact");
+    }
+    let kept = &messages[cut..];
+
+    let mut summary_input: Vec<Message> = messages[..cut].to_vec();
+    summary_input.push(Message {
+        role: "user".to_string(),
+        content: "Summarize the conversation above concisely. Preserve decisions, file paths, commands, errors, and pending tasks. Output only the summary.".to_string(),
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        tool_calls: None,
+        tool_call_id: None,
+    });
+
+    let events = crate::provider::send_message(
+        cfg,
+        provider_name,
+        model,
+        &summary_input,
+        None,
+        "",
+        "",
+        None,
+        &[],
+    )
+    .await?;
+
+    let mut summary = String::new();
+    for ev in events {
+        if let crate::protocol::Event::TextDelta { text, .. } = ev {
+            summary.push_str(&text);
+        }
+    }
+    let summary = summary.trim().to_string();
+    if summary.is_empty() {
+        anyhow::bail!("compaction produced an empty summary");
+    }
+
+    let mut new_messages = Vec::with_capacity(kept.len() + 1);
+    new_messages.push(Message {
+        role: "user".to_string(),
+        content: format!("[compacted context]\n{}", summary),
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        tool_calls: None,
+        tool_call_id: None,
+    });
+    new_messages.extend_from_slice(kept);
+    Ok((new_messages, cut, kept.len()))
+}
+
 /// Normalize a path string for use as a cache key.
 /// Handles variations like "index.html", "./index.html", "dir/../index.html"
 /// by resolving to a canonical form without touching the filesystem.
@@ -919,6 +1068,70 @@ async fn handle_message_turn(
     provider: Option<String>,
 ) -> Result<()> {
     let image_data = load_image_data(&working_dir, &images).await?;
+
+    // Auto-compact once per turn when the estimated context is near the
+    // provider's window. `/compact` does the same on demand.
+    if cfg.server.compact_threshold > 0.0 {
+        let compaction_model = {
+            let map = sessions.read().await;
+            map.get(&session_id_s)
+                .map(|e| e.model.clone())
+                .unwrap_or_default()
+        };
+        let provider_cfg = crate::config::resolve_provider(cfg, provider.as_deref());
+        if provider_cfg.context_window > 0 && !compaction_model.is_empty() {
+            let current = {
+                let map = sessions.read().await;
+                map.get(&session_id_s)
+                    .map(|e| e.messages.clone())
+                    .unwrap_or_default()
+            };
+            let est = estimate_messages_tokens(&current);
+            let threshold =
+                (provider_cfg.context_window as f64 * cfg.server.compact_threshold) as u64;
+            if est > threshold {
+                info!(
+                    "auto-compacting session {}: est {} > threshold {}",
+                    session_id_s, est, threshold
+                );
+                match compact_messages(
+                    cfg,
+                    provider.as_deref(),
+                    &compaction_model,
+                    &current,
+                    cfg.server.compact_keep,
+                )
+                .await
+                {
+                    Ok((new_messages, removed, _)) => {
+                        let snapshot = {
+                            let mut map = sessions.write().await;
+                            match map.get_mut(&session_id_s) {
+                                Some(entry) => {
+                                    entry.messages = new_messages;
+                                    entry.updated_at_ms = chrono::Utc::now().timestamp_millis();
+                                    Some(entry.clone())
+                                }
+                                None => None,
+                            }
+                        };
+                        if let Some(snap) = snapshot {
+                            let _ = crate::storage::save_session(&snap).await;
+                        }
+                        let _ = send(
+                            w,
+                            &Event::Status {
+                                id: Some(id),
+                                message: format!("compacted {} older messages", removed),
+                            },
+                        )
+                        .await;
+                    }
+                    Err(e) => warn!("auto-compact failed: {}", e),
+                }
+            }
+        }
+    }
 
     // Build the tool definitions to send to the provider. If the active
     // provider/model doesn't support structured tool calling
@@ -2985,6 +3198,32 @@ mod tests {
         assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
         assert_eq!(base64_encode(b""), "");
+    }
+
+    #[test]
+    fn token_estimate_counts_content_and_tool_args() {
+        let msgs = vec![
+            Message {
+                role: "user".to_string(),
+                content: "abcd".to_string(),
+                timestamp_ms: 0,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: String::new(),
+                timestamp_ms: 0,
+                tool_calls: Some(vec![crate::storage::StoredToolCall {
+                    id: "1".to_string(),
+                    name: "read".to_string(),
+                    arguments: "{\"path\":\"x\"}".to_string(),
+                }]),
+                tool_call_id: None,
+            },
+        ];
+        // (4 + 0)/4 + (0 + 12)/4 = 1 + 3 = 4
+        assert_eq!(estimate_messages_tokens(&msgs), 4);
     }
 
     #[tokio::test]
