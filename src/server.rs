@@ -734,6 +734,19 @@ fn gate_tool(name: &str, input: &Value, ctx: &ToolContext) -> Option<ApprovalGat
                 reason: format!("ssh {}: {}", host, preview),
             })
         }
+        "ssh_copy" => {
+            // Writes to a remote host (copy_to) or the workspace (copy_from).
+            let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            let host = input.get("host").and_then(|v| v.as_str()).unwrap_or("");
+            let remote_path = input
+                .get("remote_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            Some(ApprovalGate {
+                path: None,
+                reason: format!("scp {} {}:{}", action, host, remote_path),
+            })
+        }
         _ => None,
     }
 }
@@ -2725,6 +2738,20 @@ mod tests {
         assert!(gate_tool(
             "ssh",
             &serde_json::json!({"host": "server1", "command": "uptime"}),
+            &ctx
+        )
+        .is_some());
+
+        // ssh_copy: remote/local writes are always gated.
+        assert!(gate_tool(
+            "ssh_copy",
+            &serde_json::json!({"action": "copy_to", "host": "server1", "path": "a.conf", "remote_path": "/etc/nginx/a.conf"}),
+            &ctx
+        )
+        .is_some());
+        assert!(gate_tool(
+            "ssh_copy",
+            &serde_json::json!({"action": "copy_from", "host": "server1", "path": "out.log", "remote_path": "/var/log/nginx/error.log"}),
             &ctx
         )
         .is_some());

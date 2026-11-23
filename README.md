@@ -323,6 +323,9 @@ jancode ships with these tools (plus any discovered via [MCP servers](#mcp-model
 - `ssh` — run a shell command on a remote host over SSH (uses `~/.ssh/config`
   and key auth, `BatchMode=yes`), with optional remote `cwd` and stdin. Always
   approval-gated because it executes remote code.
+- `ssh_copy` — copy files with `scp`: `copy_to` (workspace → remote) and
+  `copy_from` (remote → workspace), with `recursive` for directories. Local
+  paths are workspace-confined; always approval-gated.
 - `note` — persistent freeform notes in `.jancode-notes.md`
   (`create` / `append` / `show` / `clear`). Ungated; it only touches its own
   file.
@@ -360,7 +363,8 @@ consent before the daemon executes them:
   gate selectively: `git` mutating actions, `http_request` non-GET/HEAD
   methods, `docker` state-changing actions, non-read-only `sql` statements,
   `gh` mutating actions, `test` with a custom command, `sandbox`
-  create/run/copy/destroy actions, and every `ssh` call require approval.
+  create/run/copy/destroy actions, every `ssh` call, and every `ssh_copy`
+  transfer require approval.
 
   **`bash` is gated when it escapes the workspace OR modifies files.** Because
   `bash` can read, search, or write anywhere on the host, jancode scans the

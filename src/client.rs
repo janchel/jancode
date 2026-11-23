@@ -475,6 +475,25 @@ fn tool_arg_summary(name: &str, input: &serde_json::Value) -> String {
             },
         ]),
         "ssh" => join_nonempty(&[arg("host"), &truncate(arg("command"), 60)]),
+        "ssh_copy" => {
+            if arg("action") == "copy_to" {
+                format!(
+                    "{} {} -> {}:{}",
+                    arg("action"),
+                    arg("path"),
+                    arg("host"),
+                    arg("remote_path")
+                )
+            } else {
+                format!(
+                    "{} {}:{} -> {}",
+                    arg("action"),
+                    arg("host"),
+                    arg("remote_path"),
+                    arg("path")
+                )
+            }
+        }
         "git" => git_arg_summary(input),
         // Unknown (e.g. MCP) tools: show a truncated JSON dump of the arguments
         // so the call is still identifiable.

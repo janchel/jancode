@@ -98,6 +98,7 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "test",
     "sandbox",
     "ssh",
+    "ssh_copy",
 ];
 
 /// Resolve a path for a *writing* tool and enforce workspace confinement.
@@ -608,6 +609,7 @@ pub fn default_registry() -> ToolRegistry {
     r.register(TestTool);
     r.register(SandboxTool);
     r.register(SshTool);
+    r.register(SshCopyTool);
     r
 }
 
@@ -3566,6 +3568,144 @@ impl Tool for SshTool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ssh_copy
+// ---------------------------------------------------------------------------
+
+/// Build an `scp` argv. Uses key auth (`BatchMode=yes`) and the local SSH
+/// config, so hosts behave exactly like they do for `ssh`.
+fn scp_argv(source: &str, dest: &str, recursive: bool) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ConnectTimeout=10".into(),
+    ];
+    if recursive {
+        args.push("-r".into());
+    }
+    args.push(source.to_string());
+    args.push(dest.to_string());
+    args
+}
+
+/// Copy files between the local workspace and a remote host over scp. Local
+/// paths are workspace-confined; remote paths are passed through to scp.
+/// Approval-gated because it writes to a remote host (and to the workspace).
+pub struct SshCopyTool;
+
+#[async_trait]
+impl Tool for SshCopyTool {
+    fn name(&self) -> &str {
+        "ssh_copy"
+    }
+
+    fn description(&self) -> &str {
+        "Copy files between the local workspace and a remote host over scp.\n\
+         action=copy_to: local 'path' -> 'remote_path' on 'host'.\n\
+         action=copy_from: 'remote_path' on 'host' -> local 'path'.\n\
+         Uses ~/.ssh/config and key auth. Approval-gated."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["copy_to", "copy_from"],
+                    "description": "copy_to = local -> remote; copy_from = remote -> local."
+                },
+                "host": {
+                    "type": "string",
+                    "description": "SSH host alias (from ~/.ssh/config) or user@hostname."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Local path (source for copy_to, destination for copy_from)."
+                },
+                "remote_path": {
+                    "type": "string",
+                    "description": "Remote path (destination for copy_to, source for copy_from)."
+                },
+                "recursive": {
+                    "type": "boolean",
+                    "description": "Copy directories recursively (default false)."
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": "Timeout in seconds (default 300)."
+                }
+            },
+            "required": ["action", "host", "path", "remote_path"]
+        })
+    }
+
+    async fn execute(&self, input: &Value, ctx: &ToolContext) -> Result<String> {
+        let action = input
+            .get("action")
+            .and_then(|v| v.as_str())
+            .context("ssh_copy: missing 'action'")?;
+        let host = input
+            .get("host")
+            .and_then(|v| v.as_str())
+            .context("ssh_copy: missing 'host'")?;
+        let path = input
+            .get("path")
+            .and_then(|v| v.as_str())
+            .context("ssh_copy: missing 'path'")?;
+        let remote_path = input
+            .get("remote_path")
+            .and_then(|v| v.as_str())
+            .context("ssh_copy: missing 'remote_path'")?;
+        let recursive = input
+            .get("recursive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let timeout = input
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(300);
+
+        let local = resolve_within(ctx, path)?;
+        if action == "copy_from" {
+            if let Some(parent) = local.parent() {
+                tokio::fs::create_dir_all(parent).await.ok();
+            }
+        }
+
+        let (source, dest) = match action {
+            "copy_to" => (
+                local.display().to_string(),
+                format!("{}:{}", host, remote_path),
+            ),
+            "copy_from" => (
+                format!("{}:{}", host, remote_path),
+                local.display().to_string(),
+            ),
+            other => {
+                return Ok(format!(
+                    "ssh_copy: unknown action '{}' (copy_to|copy_from)",
+                    other
+                ))
+            }
+        };
+
+        let args = scp_argv(&source, &dest, recursive);
+        let output = run_cli("scp", ctx, args, timeout, &[]).await?;
+        let truncated: String = output.chars().take(20000).collect();
+        if truncated.len() < output.len() {
+            Ok(format!(
+                "{}\n\n[truncated: {} bytes total]",
+                truncated,
+                output.len()
+            ))
+        } else {
+            Ok(truncated)
+        }
+    }
+}
+
 fn parse_mysql_url(url: &str) -> Option<(String, String, String, String)> {
     let rest = url.strip_prefix("mysql://")?;
     let (auth, hostport) = match rest.split_once('@') {
@@ -4112,6 +4252,33 @@ mod tests {
             "cd '/tmp/it'\\''s' && echo hi"
         );
         assert_eq!(shell_single_quote("abc"), "'abc'");
+    }
+
+    #[test]
+    fn scp_argv_shape() {
+        assert_eq!(
+            scp_argv("local.txt", "server1:/tmp/x", false),
+            vec![
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "local.txt",
+                "server1:/tmp/x"
+            ]
+        );
+        assert_eq!(
+            scp_argv("server1:/tmp/x", "local.txt", true),
+            vec![
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-r",
+                "server1:/tmp/x",
+                "local.txt"
+            ]
+        );
     }
 
     #[test]
