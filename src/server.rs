@@ -724,6 +724,16 @@ fn gate_tool(name: &str, input: &Value, ctx: &ToolContext) -> Option<ApprovalGat
                 })
             }
         }
+        "ssh" => {
+            // Remote code execution: always gated in interactive mode.
+            let host = input.get("host").and_then(|v| v.as_str()).unwrap_or("");
+            let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            let preview: String = command.chars().take(60).collect();
+            Some(ApprovalGate {
+                path: None,
+                reason: format!("ssh {}: {}", host, preview),
+            })
+        }
         _ => None,
     }
 }
@@ -2707,6 +2717,14 @@ mod tests {
         assert!(gate_tool(
             "sandbox",
             &serde_json::json!({"action": "destroy", "sandbox": "x"}),
+            &ctx
+        )
+        .is_some());
+
+        // ssh: remote code execution is always gated.
+        assert!(gate_tool(
+            "ssh",
+            &serde_json::json!({"host": "server1", "command": "uptime"}),
             &ctx
         )
         .is_some());

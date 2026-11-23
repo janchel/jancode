@@ -97,6 +97,7 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "gh",
     "test",
     "sandbox",
+    "ssh",
 ];
 
 /// Resolve a path for a *writing* tool and enforce workspace confinement.
@@ -606,6 +607,7 @@ pub fn default_registry() -> ToolRegistry {
     r.register(GhTool);
     r.register(TestTool);
     r.register(SandboxTool);
+    r.register(SshTool);
     r
 }
 
@@ -3449,6 +3451,121 @@ impl Tool for SandboxTool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ssh
+// ---------------------------------------------------------------------------
+
+/// Single-quote a string for a POSIX remote shell.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Build the remote command string, optionally after a `cd`.
+fn ssh_remote_command(command: &str, cwd: Option<&str>) -> String {
+    match cwd {
+        Some(d) if !d.trim().is_empty() => {
+            format!("cd {} && {}", shell_single_quote(d.trim()), command)
+        }
+        _ => command.to_string(),
+    }
+}
+
+/// Run a command on a remote host over SSH. Uses the local `~/.ssh/config`
+/// and key auth (`BatchMode=yes` fails fast instead of prompting for a
+/// password). Approval-gated because it executes remote code.
+pub struct SshTool;
+
+#[async_trait]
+impl Tool for SshTool {
+    fn name(&self) -> &str {
+        "ssh"
+    }
+
+    fn description(&self) -> &str {
+        "Run a shell command on a remote host over SSH (uses ~/.ssh/config and\n\
+         key auth). Optional remote working directory and stdin. Approval-gated\n\
+         because it executes remote code."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "host": {
+                    "type": "string",
+                    "description": "SSH host alias (from ~/.ssh/config) or user@hostname."
+                },
+                "command": {
+                    "type": "string",
+                    "description": "Shell command to run on the remote host."
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Optional remote working directory (absolute path)."
+                },
+                "stdin": {
+                    "type": "string",
+                    "description": "Optional text piped to the remote command's stdin."
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": "Timeout in seconds (default 120)."
+                }
+            },
+            "required": ["host", "command"]
+        })
+    }
+
+    async fn execute(&self, input: &Value, ctx: &ToolContext) -> Result<String> {
+        let host = input
+            .get("host")
+            .and_then(|v| v.as_str())
+            .context("ssh: missing 'host'")?;
+        let command = input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .context("ssh: missing 'command'")?;
+        let cwd = input
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let timeout = input
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(120);
+
+        let remote = ssh_remote_command(command, cwd);
+        let args = vec![
+            "-o".to_string(),
+            "BatchMode=yes".to_string(),
+            "-o".to_string(),
+            "ConnectTimeout=10".to_string(),
+            host.to_string(),
+            remote,
+        ];
+
+        let output = match input
+            .get("stdin")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            Some(data) => run_cli_with_stdin("ssh", ctx, args, data, timeout, &[]).await?,
+            None => run_cli("ssh", ctx, args, timeout, &[]).await?,
+        };
+
+        let truncated: String = output.chars().take(20000).collect();
+        if truncated.len() < output.len() {
+            Ok(format!(
+                "{}\n\n[truncated: {} bytes total]",
+                truncated,
+                output.len()
+            ))
+        } else {
+            Ok(truncated)
+        }
+    }
+}
+
 fn parse_mysql_url(url: &str) -> Option<(String, String, String, String)> {
     let rest = url.strip_prefix("mysql://")?;
     let (auth, hostport) = match rest.split_once('@') {
@@ -3981,6 +4098,20 @@ mod tests {
                 joined
             );
         }
+    }
+
+    #[test]
+    fn ssh_remote_command_quoting() {
+        assert_eq!(ssh_remote_command("echo hi", None), "echo hi");
+        assert_eq!(
+            ssh_remote_command("echo hi", Some("/tmp/x")),
+            "cd '/tmp/x' && echo hi"
+        );
+        assert_eq!(
+            ssh_remote_command("echo hi", Some("/tmp/it's")),
+            "cd '/tmp/it'\\''s' && echo hi"
+        );
+        assert_eq!(shell_single_quote("abc"), "'abc'");
     }
 
     #[test]

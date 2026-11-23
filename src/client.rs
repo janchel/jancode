@@ -474,6 +474,7 @@ fn tool_arg_summary(name: &str, input: &serde_json::Value) -> String {
                 arg("image")
             },
         ]),
+        "ssh" => join_nonempty(&[arg("host"), &truncate(arg("command"), 60)]),
         "git" => git_arg_summary(input),
         // Unknown (e.g. MCP) tools: show a truncated JSON dump of the arguments
         // so the call is still identifiable.
