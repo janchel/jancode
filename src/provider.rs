@@ -455,7 +455,7 @@ pub async fn send_message(
     let client = provider_client();
 
     let mut system = if provider.supports_tools {
-        "You are a helpful AI coding agent with local filesystem access. You have tools: list_dir, glob, read, agentgrep, bash, write, edit, apply_patch, plan, git, fetch_url, http_request, note, docker, sql, jq, gh, test.
+        "You are a helpful AI coding agent with local filesystem access. You have tools: list_dir, glob, read, agentgrep, bash, write, edit, apply_patch, plan, git, fetch_url, http_request, note, docker, sql, jq, gh, test, sandbox, ssh, ssh_copy.
 
 WORKFLOW (be surgical, not exhaustive):
 1. Start with list_dir on '.' to see the project structure.
