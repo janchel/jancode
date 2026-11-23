@@ -489,8 +489,8 @@ The user's time and tokens are limited. Be concise and direct.".to_string()
         "You are a helpful AI assistant. You do NOT have access to any tools or the filesystem. Answer the user's questions directly and concisely based on your knowledge. If you don't know something, say so. Do not mention tools, files, or directories — just answer the question.".to_string()
     };
     if !instructions.is_empty() {
-        system.push_str("\n\n# Project instructions (AGENTS.md)\n");
-        system.push_str("Follow the project instructions below. They come from the repository's AGENTS.md/CLAUDE.md files and describe the project's conventions, build/test commands, and operating rules. They take precedence over generic guidance, but never override the user's direct request.\n");
+        system.push_str("\n\n# Project instructions (AGENTS.md / CLAUDE.md / skills)\n");
+        system.push_str("Follow the project instructions below. They come from the repository's AGENTS.md/CLAUDE.md/SKILLS.md files and skill directories and describe the project's conventions, build/test commands, and operating rules. They take precedence over generic guidance, but never override the user's direct request.\n");
         system.push_str(instructions);
     }
     if !memory_context.is_empty() {
