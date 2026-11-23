@@ -330,14 +330,22 @@ jancode ships with these tools (plus any discovered via [MCP servers](#mcp-model
   (`create` / `append` / `show` / `clear`). Ungated; it only touches its own
   file.
 
-### Project instructions (AGENTS.md)
+### Project instructions (AGENTS.md / CLAUDE.md / skills)
 
 Before each turn, jancode reads instruction files from `AGENTS.md`, `agents.md`,
-`CLAUDE.md`, and `.claude/CLAUDE.md` and injects them into the system prompt:
+`AGENT.md`, `CLAUDE.md`, `SKILLS.md`, `skills.md`, `.claude/CLAUDE.md`, and
+`.claude/AGENTS.md` and injects them into the system prompt:
 
 - A **global** file at `~/.config/jancode/AGENTS.md` (machine-wide rules),
 - Every instruction file found while walking **up from the working directory**
   to the filesystem root; the closest file wins on conflicts.
+
+It also discovers **skill directories** — `<dir>/<name>/SKILL.md` under
+`skills/`, `.claude/skills/`, `.kilo/skills/`, or `.jancode/skills/` in the
+workspace, plus `~/.config/jancode/skills/`, `~/.config/kilo/skills/`, and
+`~/.config/claude/skills/`. Names/descriptions come from YAML frontmatter
+(`name:`, `description:`); an index is injected into the system prompt and the
+model reads a matching skill's `SKILL.md` with `read`.
 
 Put build/test commands, project conventions, and operational rules there and
 the agent will follow them in every session, `run`, and swarm spawn in that
