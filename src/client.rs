@@ -1389,7 +1389,7 @@ pub async fn connect() -> Result<()> {
             }
             continue;
         }
-        if input == "/session" {
+        if input == "/session" || input.starts_with("/session ") {
             let cwd = std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
@@ -1400,6 +1400,18 @@ pub async fn connect() -> Result<()> {
                 .filter(|s| s.working_dir == cwd)
                 .collect::<Vec<_>>();
             sessions_cache = all;
+            let arg = input.strip_prefix("/session").unwrap_or("").trim();
+            let wanted: Option<usize> = if arg.is_empty() {
+                None
+            } else {
+                match arg.parse::<usize>() {
+                    Ok(n) if n >= 1 => Some(n),
+                    _ => {
+                        println!("usage: /session [number]");
+                        continue;
+                    }
+                }
+            };
             if sessions_cache.is_empty() {
                 println!("no saved sessions for {}", cwd);
                 continue;
@@ -1415,6 +1427,33 @@ pub async fn connect() -> Result<()> {
                         .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
                         .unwrap_or_else(|| "?".to_string())
                 );
+            }
+            // `/session <n>` prints that session's full message history
+            // (without switching to it; use /resume to continue it).
+            if let Some(n) = wanted {
+                match sessions_cache.get(n - 1) {
+                    Some(s) => {
+                        println!(
+                            "\nsession {} — {} messages ({})",
+                            s.id,
+                            s.messages.len(),
+                            s.working_dir
+                        );
+                        for m in &s.messages {
+                            println!("\n[{}] {}", m.role, fmt_epoch_ms(m.timestamp_ms));
+                            if !m.content.is_empty() {
+                                println!("{}", m.content);
+                            }
+                            if let Some(calls) = &m.tool_calls {
+                                for c in calls {
+                                    println!("[tool] {}{}", c.name, c.arguments);
+                                }
+                            }
+                        }
+                        println!();
+                    }
+                    None => println!("no session at number {}", n),
+                }
             }
             continue;
         }
@@ -1641,7 +1680,7 @@ pub async fn connect() -> Result<()> {
             continue;
         }
         if input == "/help" {
-            println!("Available commands: /quit, /exit, /q (quit), /plan (toggle plan mode: read-only, mutations denied), /image <path> (attach image(s) to the next message), /tools (toggle tool calling), /model (list models and switch), /provider (list/switch providers), /diff (show modified lines via git diff), /mcp (list MCP servers / send with MCP tools), /mcp_tools (list tools exposed by MCP servers), /mcp_status (MCP server connection status), /mcp_reconnect (reload config + reconnect MCP servers), /session (list sessions), /resume <number>, /export [number] [path] (write a session as Markdown), /search <text> (find matches across sessions), /compact (summarize older messages), /memory (list memories), /forget <number>, /help (Ctrl+C cancels the running request; Ctrl+D quits)");
+            println!("Available commands: /quit, /exit, /q (quit), /plan (toggle plan mode: read-only, mutations denied), /image <path> (attach image(s) to the next message), /tools (toggle tool calling), /model (list models and switch), /provider (list/switch providers), /diff (show modified lines via git diff), /mcp (list MCP servers / send with MCP tools), /mcp_tools (list tools exposed by MCP servers), /mcp_status (MCP server connection status), /mcp_reconnect (reload config + reconnect MCP servers), /session [number] (list sessions, or show one session's messages), /resume <number>, /export [number] [path] (write a session as Markdown), /search <text> (find matches across sessions), /compact (summarize older messages), /memory (list memories), /forget <number>, /help (Ctrl+C cancels the running request; Ctrl+D quits)");
             continue;
         }
         // Drain any queued Ctrl+C first so a stray keypress while idle can't
