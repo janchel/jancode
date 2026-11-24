@@ -139,9 +139,19 @@ In interactive mode, use these commands:
   user for file paths.
 - `/session` — List saved sessions for the current folder with numbers
   (`[1]`, `[2]`, ...), including model, message count, and last-updated time.
-- `/resume <number>` — Resume a session listed by `/session`. Prints its
-  history, then subsequent messages continue that conversation (saved back to
-  the same session file on each turn).
+- `/session <number>` — Print one session's **full** message history (roles,
+  timestamps, complete content, tool calls) without switching to it.
+- `/resume <number>` — Resume a session listed by `/session`: print its history
+  (each message truncated to 120 chars), then continue that conversation. Saved
+  back to the same session file on each turn.
+- `/export [number] [path]` — Write a session as Markdown (default
+  `./jancode-session-<id>.md`). Without a number, exports the current session.
+- `/search <text>` — Case-insensitive search across all stored sessions, with a
+  snippet around each match.
+- `/compact` — Summarize older messages now (auto-compact also runs when the
+  context gets large).
+- `/image <path> [path...]` — Attach image(s) to the next message.
+- `/plan` — Toggle plan mode (read-only: mutating operations are auto-denied).
 - `/model` — List available models with numbers and switch (the prompt shows
   the current model, e.g. `gpt-4o>`). Also accepts `/model <number>` to pick
   from the last listed catalog, `/model 0` to return to the config default,
@@ -175,6 +185,26 @@ In interactive mode, use these commands:
 - `/help` — List available slash commands.
 - `/quit`, `/exit`, `/q` — End the session (handled locally, never sent to the
   model).
+
+#### Sessions: resume, inspect, export
+
+```text
+LongCat-2.5-Preview> /session
+  [1] agent-1795482386628245513 | model: LongCat-2.5-Preview | msgs: 12 | updated: 2026-11-24 01:07
+  [2] session-1795481768579468320 | model: LongCat-2.5-Preview | msgs: 94 | updated: 2026-11-24 01:03
+
+LongCat-2.5-Preview> /session 1          # full transcript of session 1 (read-only)
+LongCat-2.5-Preview> /resume 2           # continue session 2 from here on
+resumed session: session-1795481768579468320 (94 messages, model: LongCat-2.5-Preview)
+LongCat-2.5-Preview> /export 2 result.md # write a session to Markdown without switching
+exported 94 messages to result.md
+```
+
+- `/session <n>` inspects without switching; `/resume <n>` switches and continues
+  that conversation (each turn is saved back to the same file).
+- `jancode run` is always a fresh one-shot; use `connect` to resume earlier work.
+- Transcripts are JSON under `$JANCODE_HOME/sessions/` (`~/.jancode/sessions/` by
+  default); `/search <text>` scans them all.
 
 Tool-calling is **enabled by default** in interactive mode. Tool activity is
 shown compactly as `[tool] <name> <target>` lines (e.g. `[tool] read
@@ -655,16 +685,39 @@ jancode swarm spawn "Create style.css with a red color rule" --parent $SID --lab
 # Pin a model for a specific agent (per-spawn override)
 jancode swarm spawn "Refactor the parser" --parent $SID --model free-stack
 
+# Detached agent (no --parent): returns immediately, runs in the daemon.
+# Read the result later with `swarm status` or /session + /export.
+jancode swarm spawn "Check whether the mail stack can add a new domain" --label mail-check
+# -> spawned agent agent-... "(mail-check)"
+
 # Manage swarm
-jancode swarm list                       # all members
-jancode swarm status --session $SID      # one member
+jancode swarm list                       # all members and their status
+jancode swarm status --session $SID      # one member (status + detail/report)
 jancode swarm dm --to $SID "Message"     # DMs surface in that chat
 jancode swarm stop $SID                  # stop one member (--force outside your subtree)
 ```
 
+Status values you’ll see: `running` (spawned, in progress), `completed` /
+`failed` (finished; the completion/failure report is kept as the member detail),
+`idle` (a restored headless session), `active` (your interactive chat), and
+`stopped`.
+
 Completion reports (and DMs/broadcasts) surface in the parent's `connect` chat
 as `[report] from agent-...` / `[DM] from ...` notifications on the chat's next
 read from the daemon.
+
+For a **detached** agent (no `--parent`), retrieve the result on demand:
+
+```bash
+jancode swarm status --session agent-...     # status + completion report
+# or read/export the full transcript:
+jancode connect                              # /session <n>, /resume <n>, /export <n> out.md
+```
+
+The daemon stays up while swarm agents are running (the idle timeout only
+applies once they finish), so a detached agent survives closing the terminal
+that spawned it. Each agent gets its own tool budget (`[server] max_tool_loops`
+/ `max_total_tool_calls`); send `continue` in a session to resume after a limit.
 
 **Ending swarm sessions:**
 
