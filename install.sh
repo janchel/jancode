@@ -79,7 +79,7 @@ REQUIRED_RUST_MINOR=88
 rust_version_ok() {
   command -v cargo >/dev/null 2>&1 || return 1
   local v major minor
-  v="$(cargo --version 2>/dev/null | awk '{print $2}')"
+  v="$(cargo --version 2>/dev/null | awk '{print $2}' || true)"
   [ -n "$v" ] || return 1
   major="${v%%.*}"
   minor="$(printf '%s' "$v" | cut -d. -f2)"
@@ -94,8 +94,10 @@ rust_version_ok() {
 
 require_rust_version() {
   rust_version_ok && return 0
-  local found
-  found="$(cargo --version 2>/dev/null | awk '{print $2}')"
+  local found=""
+  if command -v cargo >/dev/null 2>&1; then
+    found="$(cargo --version 2>/dev/null | awk '{print $2}' || true)"
+  fi
   die "jancode requires Rust >= ${REQUIRED_RUST_MAJOR}.${REQUIRED_RUST_MINOR} (found: ${found:-none}).
 
 Distro packages are usually too old. Install a current toolchain with rustup:
@@ -134,8 +136,10 @@ check_rust() {
     return 0
   fi
 
-  local found
-  found="$(cargo --version 2>/dev/null | awk '{print $2}')"
+  local found=""
+  if command -v cargo >/dev/null 2>&1; then
+    found="$(cargo --version 2>/dev/null | awk '{print $2}' || true)"
+  fi
 
   # Root: bootstrap a current toolchain with rustup (distro packages are too
   # old for the dependency set).
