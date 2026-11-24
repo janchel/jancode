@@ -719,6 +719,43 @@ applies once they finish), so a detached agent survives closing the terminal
 that spawned it. Each agent gets its own tool budget (`[server] max_tool_loops`
 / `max_total_tool_calls`); send `continue` in a session to resume after a limit.
 
+#### Example: website + nginx agents on one host
+
+Yes. Agents share the daemon and the host, run in parallel, and a child inherits
+its **parent session’s working directory**. Start the hub chat in the project
+directory, then spawn both children from anywhere:
+
+```bash
+# Terminal 1 — hub chat, started in the site directory
+cd ~/Projects/CoffeeWebsite
+jancode connect
+# -> swarm session id: connect-...   (set SID to that)
+
+# Terminal 2 — two agents at once, same server
+jancode swarm spawn "Implement the homepage redesign in this directory" \
+  --parent $SID --label website &
+
+jancode swarm spawn "Set up nginx for this site on this host: write
+  /etc/nginx/conf.d/coffee.conf, run 'nginx -t', then 'systemctl reload nginx'" \
+  --parent $SID --label nginx &
+
+jancode swarm list                        # both show [running], then [completed]
+jancode swarm status --session agent-...  # status + report for one agent
+```
+
+Notes:
+- Without `--parent`, a child gets the **daemon’s** cwd — with the systemd
+  service that is usually `/`, so prefer spawning from a hub chat started in the
+  project directory.
+- `write`/`edit`/`apply_patch` are workspace-confined, so the nginx agent makes
+  host changes via `bash` (headless agents auto-approve) or tests first in an
+  isolated container: `sandbox run image=nginx command="nginx -t"
+  mounts=["/etc/nginx:/etc/nginx:ro"]`.
+- Give each agent a disjoint scope (`--label`) so they don’t edit the same
+  files. Reports land in the hub chat; detached agents are read with
+  `swarm status` / `/session` / `/export`.
+- Pin a different model per agent with `--model <name>` if useful.
+
 **Ending swarm sessions:**
 
 ```bash
