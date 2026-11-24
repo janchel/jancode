@@ -110,11 +110,23 @@ systemctl --user enable --now jancode   # user service
 ```
 
 > **Daemon secrets.** The installer creates `$JANCODE_HOME/service.env`
-> (chmod 600) and wires it into the unit via `EnvironmentFile=`. systemd
-> services **don't** inherit your shell environment, so put provider keys
-> (`OPENAI_API_KEY`, `GROQ_API_KEY`, ...) and MCP bearer tokens
-> (`bearer_env`) there, then `sudo systemctl restart jancode`. (MCP servers can
-> alternatively use an inline `bearer = "..."` in `config.toml` — see
+> (e.g. `/root/.jancode/service.env`, chmod 600) and wires it into the unit via
+> `EnvironmentFile=`. It is an **environment file for secrets, not a replacement
+> for `config.toml`** (which still holds `base_url`, model, tools, etc.). systemd
+> services **don't** inherit your shell environment, so put env-sourced keys
+> there, one `KEY=VALUE` per line, no quotes/export:
+>
+> ```bash
+> OPENAI_API_KEY=sk-...
+> GROQ_API_KEY=gsk_...
+> OPS_MCP_KEY=your-mcp-bearer-token   # referenced by an MCP server's bearer_env
+> ```
+>
+> Then reference them with `api_key_env = "OPENAI_API_KEY"` (and MCP
+> `bearer_env = "OPS_MCP_KEY"`) in `config.toml`, and
+> `sudo systemctl restart jancode`. Inline `api_key = "sk-..."` in
+> `config.toml` also works if you prefer not to use env vars. (MCP servers can
+> likewise use an inline `bearer = "..."` — see
 > [MCP servers](#mcp-model-context-protocol-servers).)
 
 The `serve` command below is only for **advanced/foreground** use — e.g. running
