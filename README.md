@@ -49,7 +49,8 @@ registers a systemd service for always-on deployment.
 > **version 4**, and the dependency set (`reqwest` → `url`/`idna` → `icu_*`)
 > requires a recent compiler. Distro packages are often older (e.g. Ubuntu 24.04
 > ships cargo 1.75), so install Rust via **rustup** if your system cargo is too
-> old (`install.sh` now checks this and prints the same guidance):
+> old (`install.sh` checks this and, when run as root, bootstraps a current
+> rustup toolchain automatically; non-root runs print the same guidance):
 >
 > ```bash
 > curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
