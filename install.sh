@@ -218,10 +218,10 @@ install_binary() {
 # Config + data dirs
 # ---------------------------------------------------------------------------
 setup_config() {
-  local home="${JANCODE_HOME:-$HOME/.jancode}"
+  local home="${JANCODE_HOME:-${HOME:-/root}/.jancode}"
   mkdir -p "$home"
   if [ ! -f "$home/config.toml" ]; then
-    cat > "$home/config.toml" << EOF
+    cat > "$home/config.toml" << 'EOF'
 # jancode configuration — edit this file.
 [server]
 idle_timeout_secs = 300
@@ -356,18 +356,15 @@ get_runtime_dir_default() {
 install_service() {
   local unit user runtime_home exec_path
   exec_path="$PREFIX/bin/$BIN_NAME"
-  runtime_home="${JANCODE_HOME:-$HOME/.jancode}"
+  runtime_home="${JANCODE_HOME:-${HOME:-/root}/.jancode}"
 
   if [ "$SERVICE_MODE" = "system" ]; then
     unit="/etc/systemd/system/$BIN_NAME.service"
-    user="root"
-    [ "$(id -u)" -eq 0 ] && user="$USER" || user="root"
-    # For a system service the daemon should run as a dedicated user when
-    # possible; fall back to root if was run with sudo already.
+    # Run as the invoking user when installed via sudo, else root.
     if [ "$(id -u)" -eq 0 ]; then
-      user="${SUDO_USER:-root}"
+      user="${SUDO_USER:-${USER:-root}}"
     else
-      user="$USER"
+      user="${USER:-$(id -un)}"
     fi
     # Secrets for the daemon (provider keys, MCP bearer tokens). systemd
     # services do NOT inherit your shell env, so anything the daemon reads via
@@ -416,7 +413,11 @@ Group=$(id -gn "$user" 2>/dev/null || echo "$user")
 WantedBy=multi-user.target
 EOF
     mkdir -p "$runtime_home"
-    systemctl daemon-reload
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl daemon-reload || warn "systemctl daemon-reload failed; run it manually"
+    else
+      warn "systemctl not found; unit written to $unit but not loaded"
+    fi
     log "Installed system service: $unit"
     log "Daemon secrets file: $env_file (chmod 600) — add MCP bearer keys here"
     log "Start it with: sudo systemctl enable --now $BIN_NAME"
@@ -451,7 +452,11 @@ RestartSec=3
 [Install]
 WantedBy=default.target
 EOF
-    systemctl --user daemon-reload
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl --user daemon-reload || warn "systemctl --user daemon-reload failed; run it manually"
+    else
+      warn "systemctl not found; unit written to $unit but not loaded"
+    fi
     log "Installed user service: $unit"
     log "Daemon secrets file: $env_file (chmod 600) — add MCP bearer keys here"
     log "Start it with: systemctl --user enable --now $BIN_NAME"
