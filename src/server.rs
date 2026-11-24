@@ -100,14 +100,23 @@ pub async fn run() -> Result<()> {
     let shutdown = Arc::new(tokio::sync::Notify::new());
     if idle_secs > 0 {
         let watcher = active_clients.clone();
+        // Don't shut down while a detached swarm agent is still running: the
+        // spawn CLI exits immediately, so connected clients alone would make
+        // the daemon look idle and kill the in-flight agent.
+        let swarm_watch = swarm.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(idle_secs)).await;
-                if watcher.load(Ordering::SeqCst) == 0 {
+                let no_clients = watcher.load(Ordering::SeqCst) == 0;
+                let no_agents = swarm_watch.read().await.tasks.is_empty();
+                if no_clients && no_agents {
                     info!("idle timeout reached ({}s), shutting down", idle_secs);
                     shutdown.notify_one();
                     return;
+                }
+                if !no_agents {
+                    tracing::debug!("idle timeout pending: swarm agents still running");
                 }
             }
         });
