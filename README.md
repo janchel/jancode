@@ -41,10 +41,12 @@ git clone <repo-url> && cd jancode
 
 The script detects the OS, ensures a Rust toolchain (searches `~/.cargo/bin`
 for rustup installs, or offers to install the distro `cargo`/`rust` package),
-builds in release mode, installs to your prefix, writes a starter
-`config.toml` into `$JANCODE_HOME` (`~/.jancode` by default), and with
-`--service` writes the unit, runs `systemctl daemon-reload`, enables and starts
-it (`systemctl enable --now jancode`), then prints `systemctl status`.
+builds in release mode, installs to your prefix, copies the versioned
+`config.example.toml` to `$JANCODE_HOME/config.toml` on first install (it never
+overwrites an existing file), and with `--service` also creates
+`$JANCODE_HOME/service.env`, writes the unit, runs `systemctl daemon-reload`,
+enables and starts it (`systemctl enable --now jancode`), then prints
+`systemctl status`.
 
 > **Toolchain requirement: Rust ≥ 1.88.** The repo's `Cargo.lock` uses lock file
 > **version 4**, and the dependency set (`reqwest` → `url`/`idna` → `icu_*`)
@@ -110,11 +112,23 @@ systemctl --user enable --now jancode   # user service
 ```
 
 > **Daemon secrets.** The installer creates `$JANCODE_HOME/service.env`
-> (chmod 600) and wires it into the unit via `EnvironmentFile=`. systemd
-> services **don't** inherit your shell environment, so put provider keys
-> (`OPENAI_API_KEY`, `GROQ_API_KEY`, ...) and MCP bearer tokens
-> (`bearer_env`) there, then `sudo systemctl restart jancode`. (MCP servers can
-> alternatively use an inline `bearer = "..."` in `config.toml` — see
+> (e.g. `/root/.jancode/service.env`, chmod 600) and wires it into the unit via
+> `EnvironmentFile=`. It is an **environment file for secrets, not a replacement
+> for `config.toml`** (which still holds `base_url`, model, tools, etc.). systemd
+> services **don't** inherit your shell environment, so put env-sourced keys
+> there, one `KEY=VALUE` per line, no quotes/export:
+>
+> ```bash
+> OPENAI_API_KEY=sk-...
+> GROQ_API_KEY=gsk_...
+> OPS_MCP_KEY=your-mcp-bearer-token   # referenced by an MCP server's bearer_env
+> ```
+>
+> Then reference them with `api_key_env = "OPENAI_API_KEY"` (and MCP
+> `bearer_env = "OPS_MCP_KEY"`) in `config.toml`, and
+> `sudo systemctl restart jancode`. Inline `api_key = "sk-..."` in
+> `config.toml` also works if you prefer not to use env vars. (MCP servers can
+> likewise use an inline `bearer = "..."` — see
 > [MCP servers](#mcp-model-context-protocol-servers).)
 
 The `serve` command below is only for **advanced/foreground** use — e.g. running
@@ -788,7 +802,8 @@ directly in the config:
 export OPENAI_API_KEY=sk-...
 ```
 
-Or edit `$JANCODE_HOME/config.toml` (defaults to `~/.jancode/config.toml`).
+Or edit `$JANCODE_HOME/config.toml` (defaults to `~/.jancode/config.toml`; the
+installer copies the repo's versioned `config.example.toml` there on first run).
 
 ### Single provider (legacy)
 
