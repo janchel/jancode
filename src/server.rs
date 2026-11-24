@@ -88,6 +88,11 @@ pub async fn run() -> Result<()> {
             let is_headless = s.is_headless || legacy_agent;
             let member = swarm::make_member(&s.id, None, s.parent_session_id.clone(), is_headless);
             sw.register_member(member);
+            if is_headless {
+                sw.update_status(&s.id, "idle", None);
+            } else {
+                sw.update_status(&s.id, "active", None);
+            }
         }
     }
 
@@ -327,6 +332,7 @@ async fn handle_client(
                                 false,
                             );
                             sw.register_member(member);
+                            sw.update_status(&session_id_s, "active", None);
                         }
                     }
                     // Persist membership so the roster survives a restart.
@@ -2575,16 +2581,23 @@ async fn handle_swarm_spawn(
             task_provider.as_deref(),
         )
         .await;
-        let report = match result {
-            Ok(text) if text.starts_with("ERROR: ") => {
-                format!("Agent {} failed: {}", task_session_id, text)
-            }
-            Ok(text) => format!("Agent {} completed: {}", task_session_id, text),
-            Err(e) => format!("Agent {} failed: {}", task_session_id, e),
+        let (status, report) = match result {
+            Ok(text) if text.starts_with("ERROR: ") => (
+                "failed",
+                format!("Agent {} failed: {}", task_session_id, text),
+            ),
+            Ok(text) => (
+                "completed",
+                format!("Agent {} completed: {}", task_session_id, text),
+            ),
+            Err(e) => ("failed", format!("Agent {} failed: {}", task_session_id, e)),
         };
         {
             let mut sw = task_swarm.write().await;
-            sw.update_status(&task_session_id, "completed", None);
+            // Keep the completion/failure report on the member so
+            // `swarm status --session <id>` shows it even when the agent had
+            // no parent to notify.
+            sw.update_status(&task_session_id, status, Some(report.clone()));
             sw.tasks.remove(&task_session_id);
         }
         if let Some(parent_id) = &task_parent {
