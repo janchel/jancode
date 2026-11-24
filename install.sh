@@ -415,12 +415,19 @@ EOF
     mkdir -p "$runtime_home"
     if command -v systemctl >/dev/null 2>&1; then
       systemctl daemon-reload || warn "systemctl daemon-reload failed; run it manually"
+      if systemctl enable --now "$BIN_NAME"; then
+        log "Service enabled and started."
+      else
+        warn "could not enable/start the service; run: sudo systemctl enable --now $BIN_NAME"
+      fi
+      echo
+      systemctl status "$BIN_NAME" --no-pager || true
     else
       warn "systemctl not found; unit written to $unit but not loaded"
     fi
     log "Installed system service: $unit"
     log "Daemon secrets file: $env_file (chmod 600) — add MCP bearer keys here"
-    log "Start it with: sudo systemctl enable --now $BIN_NAME"
+    log "Manage it with: sudo systemctl {start|stop|restart|status} $BIN_NAME"
   else
     unit="$HOME/.config/systemd/user/$BIN_NAME.service"
     mkdir -p "$(dirname "$unit")"
@@ -454,12 +461,19 @@ WantedBy=default.target
 EOF
     if command -v systemctl >/dev/null 2>&1; then
       systemctl --user daemon-reload || warn "systemctl --user daemon-reload failed; run it manually"
+      if systemctl --user enable --now "$BIN_NAME"; then
+        log "User service enabled and started."
+      else
+        warn "could not enable/start the user service; run: systemctl --user enable --now $BIN_NAME"
+      fi
+      echo
+      systemctl --user status "$BIN_NAME" --no-pager || true
     else
       warn "systemctl not found; unit written to $unit but not loaded"
     fi
     log "Installed user service: $unit"
     log "Daemon secrets file: $env_file (chmod 600) — add MCP bearer keys here"
-    log "Start it with: systemctl --user enable --now $BIN_NAME"
+    log "Manage it with: systemctl --user {start|stop|restart|status} $BIN_NAME"
   fi
 }
 
