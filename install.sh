@@ -219,105 +219,19 @@ install_binary() {
 # ---------------------------------------------------------------------------
 setup_config() {
   local home="${JANCODE_HOME:-${HOME:-/root}/.jancode}"
+  local here
+  here="$(cd "$(dirname "$0")" && pwd)"
   mkdir -p "$home"
   if [ ! -f "$home/config.toml" ]; then
-    cat > "$home/config.toml" << 'EOF'
-# jancode configuration — edit this file.
-[server]
-idle_timeout_secs = 300
-# Approval policy for risky tool calls (file writes/edits/patches and reads
-# outside the working directory). "prompt" is interactive-only; "auto" never
-# asks; "deny" always blocks.
-# approve_mode = "prompt"
-# How aggressively the `bash` tool is gated when its command references files
-# outside the working directory. "off" never gates; "basic" gates on obvious
-# escapes (absolute paths, ~, $HOME, .., cd out); "strict" also gates on any
-# cd / $PWD / $OLDPWD.
-# bash_gate = "basic"
-# Print the model's reasoning as [thinking] lines (default false = hidden).
-# show_thinking = false
-# Response border/box around model replies (terminal-only). "gutter" (default
-# left bar), "box" (gutter + top/bottom rules), or "none".
-# response_border = "gutter"
-# Dim the [tool]/[approval] status lines so the reply stands out (default true).
-# dim_tool_lines = true
-# Show the lines the model changed under each successful edit/apply_patch.
-# show_diffs = true
-# Max model turns / total tool calls per request. Raise for big-project analysis.
-# max_tool_loops = 50
-# max_total_tool_calls = 75
-# Auto-compact the conversation when the estimated context exceeds this
-# fraction of the provider's context_window (0 disables; /compact still works).
-# compact_threshold = 0.8
-# Messages kept verbatim after a compaction.
-# compact_keep = 6
-
-# Hosts/CIDRs the web tools (fetch_url/http_request/download/jenkins) may reach
-# even when they resolve to private/loopback addresses, e.g. an internal
-# Jenkins. Exact names, domain suffixes, or IPv4 CIDRs.
-# [tools]
-# allowed_private_hosts = ["192.168.5.0/24", "jenkins.local"]
-
-# Approval policy rules: skip prompts for specific tools/commands/hosts, or
-# always deny a tool.
-# [security]
-# allow_tools = ["edit", "apply_patch"]
-# deny_tools = ["docker"]
-# allow_bash_patterns = ["^cargo (test|clippy)"]
-# allow_hosts = ["server1"]
-
-# Single-provider setup (legacy): use the `[provider]` table.
-[provider]
-base_url = "https://api.openai.com/v1"
-# Option A: inline key (easiest for single-user setups)
-# api_key = "sk-..."
-# Option B: name an env var to read the key from
-api_key_env = "OPENAI_API_KEY"
-default_model = "gpt-4o-mini"
-# Optional: cap the model's response length (sent as max_tokens). 0 = no cap.
-# max_tokens = 4096
-# Optional: context window in tokens. When set, jancode trims the oldest
-# conversation messages to fit this budget (reduces token usage / rate limits).
-# context_window = 32768
-
-# Multi-provider setup: use `[[providers]]` entries + `default_provider`.
-# When `providers` is non-empty it takes precedence over `[provider]`.
-# NOTE: `default_provider` must be at the ROOT level (before any [table]
-# header) to be read — placing it after [server] makes TOML treat it as
-# server.default_provider, which is ignored.
-# default_provider = "groq"
-# [[providers]]
-# name = "groq"
-# base_url = "https://api.groq.com/openai/v1"
-# api_key_env = "GROQ_API_KEY"
-# default_model = "openai/gpt-oss-20b"
-# max_tokens = 4096
-# context_window = 16000
-#
-# [[providers]]
-# name = "lmstudio"
-# base_url = "http://192.168.5.39:1234/v1"
-# api_key = "dummy"
-# default_model = "qwen2.5-coder-7b-instruct"
-# tool_call_style = "flattened"
-#
-# Tool-calling flexibility (per provider):
-#   tool_call_style = "openai"     # structured tool_calls (default)
-#   tool_call_style = "flattened"  # text markers for providers that reject tool roles
-#   tool_call_style = "auto"       # try openai, also parse text markers as fallback
-#   supports_tools = false         # disable tool calling entirely (model answers directly)
-#                                  # use for reasoning models / routers that emit
-#                                  # malformed tool calls and loop
-
-# [[mcp.servers]]
-# name = "ops"
-# url = "https://your-mcp-server.example.com/mcp"
-# transport = "http-streamable"
-# bearer = "your-token-here"       # inline token (recommended; works with systemd)
-# # bearer_env = "OPS_MCP_KEY"     # or: name an env var holding the token
-EOF
-    log "Created config template: $home/config.toml"
-    log " -> set your API key in \$OPENAI_API_KEY (or put api_key in config.toml)."
+    # The official template lives in the repo so it's versioned and reviewable;
+    # install.sh only copies it (never overwrites an existing config).
+    if [ -f "$here/config.example.toml" ]; then
+      cp "$here/config.example.toml" "$home/config.toml"
+    else
+      die "config template not found: $here/config.example.toml (run install.sh from the repository)"
+    fi
+    log "Created config: $home/config.toml (from config.example.toml)"
+    log " -> set your API key in \$OPENAI_API_KEY or edit api_key in that file."
   else
     warn "config.toml already exists in $home, leaving it untouched."
   fi

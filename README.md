@@ -41,10 +41,12 @@ git clone <repo-url> && cd jancode
 
 The script detects the OS, ensures a Rust toolchain (searches `~/.cargo/bin`
 for rustup installs, or offers to install the distro `cargo`/`rust` package),
-builds in release mode, installs to your prefix, writes a starter
-`config.toml` into `$JANCODE_HOME` (`~/.jancode` by default), and with
-`--service` writes the unit, runs `systemctl daemon-reload`, enables and starts
-it (`systemctl enable --now jancode`), then prints `systemctl status`.
+builds in release mode, installs to your prefix, copies the versioned
+`config.example.toml` to `$JANCODE_HOME/config.toml` on first install (it never
+overwrites an existing file), and with `--service` also creates
+`$JANCODE_HOME/service.env`, writes the unit, runs `systemctl daemon-reload`,
+enables and starts it (`systemctl enable --now jancode`), then prints
+`systemctl status`.
 
 > **Toolchain requirement: Rust ≥ 1.88.** The repo's `Cargo.lock` uses lock file
 > **version 4**, and the dependency set (`reqwest` → `url`/`idna` → `icu_*`)
@@ -710,7 +712,8 @@ directly in the config:
 export OPENAI_API_KEY=sk-...
 ```
 
-Or edit `$JANCODE_HOME/config.toml` (defaults to `~/.jancode/config.toml`).
+Or edit `$JANCODE_HOME/config.toml` (defaults to `~/.jancode/config.toml`; the
+installer copies the repo's versioned `config.example.toml` there on first run).
 
 ### Single provider (legacy)
 
