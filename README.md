@@ -42,8 +42,9 @@ git clone <repo-url> && cd jancode
 The script detects the OS, ensures a Rust toolchain (searches `~/.cargo/bin`
 for rustup installs, or offers to install the distro `cargo`/`rust` package),
 builds in release mode, installs to your prefix, writes a starter
-`config.toml` into `$JANCODE_HOME` (`~/.jancode` by default), and optionally
-registers a systemd service for always-on deployment.
+`config.toml` into `$JANCODE_HOME` (`~/.jancode` by default), and with
+`--service` writes the unit, runs `systemctl daemon-reload`, enables and starts
+it (`systemctl enable --now jancode`), then prints `systemctl status`.
 
 > **Toolchain requirement: Rust ≥ 1.88.** The repo's `Cargo.lock` uses lock file
 > **version 4**, and the dependency set (`reqwest` → `url`/`idna` → `icu_*`)
