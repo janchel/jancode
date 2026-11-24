@@ -45,10 +45,11 @@ builds in release mode, installs to your prefix, writes a starter
 `config.toml` into `$JANCODE_HOME` (`~/.jancode` by default), and optionally
 registers a systemd service for always-on deployment.
 
-> **Toolchain requirement.** The repo's `Cargo.lock` uses lock file **version 4**,
-> which requires **cargo ≥ 1.78**. Distro packages are often older (e.g. Ubuntu
-> 22.04 ships cargo 1.75), so install Rust via **rustup** if your system cargo is
-> too old:
+> **Toolchain requirement: Rust ≥ 1.88.** The repo's `Cargo.lock` uses lock file
+> **version 4**, and the dependency set (`reqwest` → `url`/`idna` → `icu_*`)
+> requires a recent compiler. Distro packages are often older (e.g. Ubuntu 24.04
+> ships cargo 1.75), so install Rust via **rustup** if your system cargo is too
+> old (`install.sh` now checks this and prints the same guidance):
 >
 > ```bash
 > curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable

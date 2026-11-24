@@ -72,6 +72,39 @@ detect_os() {
 # ---------------------------------------------------------------------------
 # Toolchain check
 # ---------------------------------------------------------------------------
+# Minimum supported toolchain. Keep in sync with `rust-version` in Cargo.toml.
+REQUIRED_RUST_MAJOR=1
+REQUIRED_RUST_MINOR=88
+
+rust_version_ok() {
+  command -v cargo >/dev/null 2>&1 || return 1
+  local v major minor
+  v="$(cargo --version 2>/dev/null | awk '{print $2}')"
+  [ -n "$v" ] || return 1
+  major="${v%%.*}"
+  minor="$(printf '%s' "$v" | cut -d. -f2)"
+  case "$major" in ''|*[!0-9]*) return 1 ;; esac
+  case "$minor" in ''|*[!0-9]*) minor=0 ;; esac
+  if [ "$major" -gt "$REQUIRED_RUST_MAJOR" ]; then return 0; fi
+  if [ "$major" -eq "$REQUIRED_RUST_MAJOR" ] && [ "$minor" -ge "$REQUIRED_RUST_MINOR" ]; then
+    return 0
+  fi
+  return 1
+}
+
+require_rust_version() {
+  rust_version_ok && return 0
+  local found
+  found="$(cargo --version 2>/dev/null | awk '{print $2}')"
+  die "jancode requires Rust >= ${REQUIRED_RUST_MAJOR}.${REQUIRED_RUST_MINOR} (found: ${found:-none}).
+
+Distro packages are usually too old. Install a current toolchain with rustup:
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+  source \"\$HOME/.cargo/env\"    # or start a new shell
+then re-run this script. To install an already-built binary instead:
+  ./install.sh --skip-build"
+}
+
 check_rust() {
   # rustup installs to ~/.cargo/bin which is often not on a non-login PATH.
   for cand in "$HOME/.cargo/bin" "/usr/local/cargo/bin" "/usr/bin" "/opt/cargo/bin"; do
@@ -81,6 +114,7 @@ check_rust() {
     fi
   done
   if command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then
+    require_rust_version
     log "Rust toolchain found (cargo $(cargo --version | awk '{print $2}'))"
     return 0
   fi
@@ -96,6 +130,7 @@ check_rust() {
     die "Rust/cargo not found. Install it: 'curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh' then re-run, or run this script as root so it can install the distro Rust package."
   fi
   command -v cargo >/dev/null 2>&1 || die "cargo still not available after install."
+  require_rust_version
 }
 
 # ---------------------------------------------------------------------------
