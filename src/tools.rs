@@ -53,15 +53,24 @@ pub struct ToolContext {
     /// this turn (populated by the approval gate). Shared through clones so the
     /// concurrent read-only tool fan-out sees the same set.
     pub allowed_outside: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Hosts/CIDRs the web tools may reach even when they resolve to private,
+    /// loopback, or link-local addresses (see `[tools] allowed_private_hosts`).
+    pub allowed_private_hosts: Vec<String>,
 }
 
 impl ToolContext {
-    pub fn new(working_dir: PathBuf, database_url: String, bash_gate: String) -> Self {
+    pub fn new(
+        working_dir: PathBuf,
+        database_url: String,
+        bash_gate: String,
+        allowed_private_hosts: Vec<String>,
+    ) -> Self {
         Self {
             working_dir,
             database_url,
             bash_gate,
             allowed_outside: Arc::new(Mutex::new(HashSet::new())),
+            allowed_private_hosts,
         }
     }
 
@@ -99,6 +108,8 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "sandbox",
     "ssh",
     "ssh_copy",
+    "download",
+    "jenkins",
 ];
 
 /// Resolve a path for a *writing* tool and enforce workspace confinement.
@@ -610,6 +621,8 @@ pub fn default_registry() -> ToolRegistry {
     r.register(SandboxTool);
     r.register(SshTool);
     r.register(SshCopyTool);
+    r.register(DownloadTool);
+    r.register(JenkinsTool);
     r
 }
 
@@ -2031,30 +2044,75 @@ fn is_non_global_ip(ip: &std::net::IpAddr) -> bool {
     }
 }
 
-/// Reject URLs whose host is (or resolves to) a non-global address.
-async fn assert_public_url(url: &str) -> Result<()> {
+/// True when `ip` matches an allow-list entry (exact address or IPv4 CIDR).
+fn ip_allowed(ip: &std::net::IpAddr, allow: &[String]) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => allow.iter().any(|e| {
+            let e = e.trim();
+            if e == v4.to_string() {
+                return true;
+            }
+            if let Some((net, bits)) = e.split_once('/') {
+                if let (Ok(net_ip), Ok(prefix)) =
+                    (net.parse::<std::net::Ipv4Addr>(), bits.parse::<u32>())
+                {
+                    if prefix <= 32 {
+                        let mask = if prefix == 0 {
+                            0u32
+                        } else {
+                            u32::MAX << (32 - prefix)
+                        };
+                        return (u32::from(net_ip) & mask) == (u32::from(*v4) & mask);
+                    }
+                }
+            }
+            false
+        }),
+        std::net::IpAddr::V6(v6) => allow.iter().any(|e| e.trim() == v6.to_string()),
+    }
+}
+
+/// True when a host name matches an allow-list entry (exact or domain suffix).
+fn host_allowed(host: &str, allow: &[String]) -> bool {
+    let h = host.to_lowercase();
+    allow.iter().any(|e| {
+        let e = e.trim().to_lowercase();
+        !e.is_empty() && (h == e || h.ends_with(&format!(".{}", e)))
+    })
+}
+
+/// Enforce the web-tool URL policy: public addresses are always allowed;
+/// non-global addresses must be covered by `[tools] allowed_private_hosts`.
+async fn assert_url_allowed(url: &str, ctx: &ToolContext) -> Result<()> {
     let parsed = reqwest::Url::parse(url).context("invalid URL")?;
     let host = parsed.host_str().context("URL has no host")?.to_string();
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        if is_non_global_ip(&ip) {
-            anyhow::bail!("refusing to fetch non-global address {}", ip);
-        }
-        return Ok(());
-    }
-    let port = parsed.port_or_known_default().unwrap_or(80);
-    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
-        .await
-        .context("resolving URL host")?
-        .collect();
+    let addrs: Vec<std::net::IpAddr> = if let Ok(ip) = host.parse() {
+        vec![ip]
+    } else {
+        let port = parsed.port_or_known_default().unwrap_or(80);
+        tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .context("resolving URL host")?
+            .map(|a| a.ip())
+            .collect()
+    };
     if addrs.is_empty() {
         anyhow::bail!("URL host did not resolve: {}", host);
     }
-    for addr in addrs {
-        if is_non_global_ip(&addr.ip()) {
-            anyhow::bail!("refusing to fetch non-global address {}", addr.ip());
-        }
+    if addrs.iter().all(|ip| !is_non_global_ip(ip)) {
+        return Ok(());
     }
-    Ok(())
+    if host_allowed(&host, &ctx.allowed_private_hosts)
+        || addrs
+            .iter()
+            .any(|ip| ip_allowed(ip, &ctx.allowed_private_hosts))
+    {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to access non-global address {} (not in [tools] allowed_private_hosts)",
+        host
+    )
 }
 
 pub struct WebFetchTool;
@@ -2087,12 +2145,12 @@ impl Tool for WebFetchTool {
         })
     }
 
-    async fn execute(&self, input: &Value, _ctx: &ToolContext) -> Result<String> {
+    async fn execute(&self, input: &Value, ctx: &ToolContext) -> Result<String> {
         let url = input
             .get("url")
             .and_then(|v| v.as_str())
             .context("missing 'url'")?;
-        assert_public_url(url).await?;
+        assert_url_allowed(url, ctx).await?;
         let max_chars = input
             .get("max_chars")
             .and_then(|v| v.as_u64())
@@ -2160,12 +2218,12 @@ impl Tool for HttpRequestTool {
         })
     }
 
-    async fn execute(&self, input: &Value, _ctx: &ToolContext) -> Result<String> {
+    async fn execute(&self, input: &Value, ctx: &ToolContext) -> Result<String> {
         let url = input
             .get("url")
             .and_then(|v| v.as_str())
             .context("missing 'url'")?;
-        assert_public_url(url).await?;
+        assert_url_allowed(url, ctx).await?;
         let method = input
             .get("method")
             .and_then(|v| v.as_str())
@@ -2233,6 +2291,311 @@ impl Tool for HttpRequestTool {
                 truncated
             ))
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// download
+// ---------------------------------------------------------------------------
+
+/// Max size for a single download (500 MB) so a bad URL can't fill the disk.
+const MAX_DOWNLOAD_BYTES: u64 = 500 * 1024 * 1024;
+
+/// GET a URL and return the body as text, enforcing the URL policy.
+async fn http_get_text(
+    url: &str,
+    ctx: &ToolContext,
+    headers: &[(String, String)],
+    basic_auth: Option<(&str, &str)>,
+    timeout_secs: u64,
+) -> Result<String> {
+    assert_url_allowed(url, ctx).await?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()?;
+    let mut req = client.get(url);
+    for (k, v) in headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    if let Some((user, pass)) = basic_auth {
+        req = req.basic_auth(user, Some(pass));
+    }
+    let resp = req.send().await.context("request failed")?;
+    let status = resp.status();
+    let body = resp.text().await.context("reading response body")?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "GET {} -> HTTP {}: {}",
+            url,
+            status.as_u16(),
+            body.chars().take(500).collect::<String>()
+        );
+    }
+    Ok(body)
+}
+
+/// GET a URL and stream the bytes to a workspace file, enforcing the URL
+/// policy and a size cap.
+async fn http_download_file(
+    url: &str,
+    ctx: &ToolContext,
+    dest: &Path,
+    headers: &[(String, String)],
+    basic_auth: Option<(&str, &str)>,
+    timeout_secs: u64,
+) -> Result<u64> {
+    use tokio::io::AsyncWriteExt;
+    assert_url_allowed(url, ctx).await?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()?;
+    let mut req = client.get(url);
+    for (k, v) in headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    if let Some((user, pass)) = basic_auth {
+        req = req.basic_auth(user, Some(pass));
+    }
+    let mut resp = req.send().await.context("request failed")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "GET {} -> HTTP {}: {}",
+            url,
+            status.as_u16(),
+            body.chars().take(300).collect::<String>()
+        );
+    }
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await.ok();
+    }
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .context("creating download file")?;
+    let mut total = 0u64;
+    while let Some(chunk) = resp.chunk().await.context("reading response body")? {
+        total += chunk.len() as u64;
+        if total > MAX_DOWNLOAD_BYTES {
+            anyhow::bail!(
+                "download exceeds {} MB limit (at {} bytes)",
+                MAX_DOWNLOAD_BYTES / (1024 * 1024),
+                total
+            );
+        }
+        file.write_all(&chunk).await.context("writing download")?;
+    }
+    file.flush().await.ok();
+    Ok(total)
+}
+
+pub struct DownloadTool;
+
+#[async_trait]
+impl Tool for DownloadTool {
+    fn name(&self) -> &str {
+        "download"
+    }
+
+    fn description(&self) -> &str {
+        "Download a URL to a file in the workspace (binary-safe, streamed, 500 MB\n\
+         cap). Honors [tools] allowed_private_hosts for internal URLs. Writes\n\
+         only inside the workspace."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string" },
+                "path": { "type": "string", "description": "Destination path relative to the workspace." },
+                "headers": { "type": "object", "description": "Optional request headers (e.g. Authorization)." },
+                "timeout_secs": { "type": "integer" }
+            },
+            "required": ["url", "path"]
+        })
+    }
+
+    async fn execute(&self, input: &Value, ctx: &ToolContext) -> Result<String> {
+        let url = input
+            .get("url")
+            .and_then(|v| v.as_str())
+            .context("missing 'url'")?;
+        let path = input
+            .get("path")
+            .and_then(|v| v.as_str())
+            .context("missing 'path'")?;
+        let dest = resolve_within(ctx, path)?;
+        let timeout = input
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(120);
+        let mut headers = Vec::new();
+        if let Some(h) = input.get("headers").and_then(|v| v.as_object()) {
+            for (k, v) in h {
+                if let Some(s) = v.as_str() {
+                    headers.push((k.clone(), s.to_string()));
+                }
+            }
+        }
+        let n = http_download_file(url, ctx, &dest, &headers, None, timeout).await?;
+        Ok(format!(
+            "downloaded {} bytes to {} ({})",
+            n,
+            dest.display(),
+            url
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// jenkins
+// ---------------------------------------------------------------------------
+
+const JENKINS_ACTIONS: &[&str] = &["job_info", "console", "artifacts", "artifact"];
+
+/// Read Jenkins credentials from env (token via `token_env`, default
+/// `JENKINS_API_TOKEN`; user via `user` param or `JENKINS_USER`).
+fn jenkins_credentials(input: &Value) -> (Option<String>, Option<String>) {
+    let token_env = input
+        .get("token_env")
+        .and_then(|v| v.as_str())
+        .unwrap_or("JENKINS_API_TOKEN");
+    let token = std::env::var(token_env).ok().filter(|s| !s.is_empty());
+    let user = input
+        .get("user")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("JENKINS_USER").ok().filter(|s| !s.is_empty()));
+    (user, token)
+}
+
+pub struct JenkinsTool;
+
+#[async_trait]
+impl Tool for JenkinsTool {
+    fn name(&self) -> &str {
+        "jenkins"
+    }
+
+    fn description(&self) -> &str {
+        "Query Jenkins: job_info (/api/json), console (/consoleText),\n\
+         artifacts (artifact list), artifact (download to the workspace).\n\
+         Uses basic auth from JENKINS_API_TOKEN (+ JENKINS_USER) or the\n\
+         token_env/user params. Honors [tools] allowed_private_hosts."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": JENKINS_ACTIONS },
+                "base_url": { "type": "string", "description": "Jenkins base URL, e.g. https://jenkins.internal:8080" },
+                "job": { "type": "string", "description": "Job path, e.g. 'myjob' or 'folder/myjob'." },
+                "build": { "type": "string", "description": "Build number or 'lastBuild' (default)." },
+                "artifact": { "type": "string", "description": "Artifact relative path (action=artifact)." },
+                "path": { "type": "string", "description": "Local destination (action=artifact)." },
+                "token_env": { "type": "string", "description": "Env var holding the API token (default JENKINS_API_TOKEN)." },
+                "user": { "type": "string", "description": "Jenkins user (default $JENKINS_USER)." },
+                "timeout_secs": { "type": "integer" }
+            },
+            "required": ["action", "base_url", "job"]
+        })
+    }
+
+    async fn execute(&self, input: &Value, ctx: &ToolContext) -> Result<String> {
+        let action = input
+            .get("action")
+            .and_then(|v| v.as_str())
+            .context("missing 'action'")?;
+        let base = input
+            .get("base_url")
+            .and_then(|v| v.as_str())
+            .context("missing 'base_url'")?
+            .trim_end_matches('/')
+            .to_string();
+        let job = input
+            .get("job")
+            .and_then(|v| v.as_str())
+            .context("missing 'job'")?
+            .trim_matches('/')
+            .to_string();
+        let build = input
+            .get("build")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("lastBuild");
+        let timeout = input
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(120);
+        let (user, token) = jenkins_credentials(input);
+        let auth = match (&user, &token) {
+            (Some(u), Some(t)) => Some((u.as_str(), t.as_str())),
+            _ => None,
+        };
+
+        match action {
+            "job_info" => {
+                let url = format!("{}/{}/api/json", base, job);
+                let body = http_get_text(&url, ctx, &[], auth, timeout).await?;
+                Ok(truncate_chars(body, 20000))
+            }
+            "console" => {
+                let url = format!("{}/{}/{}/consoleText", base, job, build);
+                let body = http_get_text(&url, ctx, &[], auth, timeout).await?;
+                Ok(truncate_chars(body, 40000))
+            }
+            "artifacts" => {
+                let url = format!(
+                    "{}/{}/{}/api/json?tree=artifacts[fileName,relativePath,url]",
+                    base, job, build
+                );
+                let body = http_get_text(&url, ctx, &[], auth, timeout).await?;
+                Ok(truncate_chars(body, 20000))
+            }
+            "artifact" => {
+                let artifact = input
+                    .get("artifact")
+                    .and_then(|v| v.as_str())
+                    .context("jenkins artifact: missing 'artifact'")?;
+                let path = input
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .context("jenkins artifact: missing 'path'")?;
+                let dest = resolve_within(ctx, path)?;
+                let url = format!(
+                    "{}/{}/{}/artifact/{}",
+                    base,
+                    job,
+                    build,
+                    artifact.trim_start_matches('/')
+                );
+                let n = http_download_file(&url, ctx, &dest, &[], auth, timeout).await?;
+                Ok(format!(
+                    "downloaded artifact {} ({} bytes) to {}",
+                    artifact,
+                    n,
+                    dest.display()
+                ))
+            }
+            other => Ok(format!(
+                "jenkins: unknown action '{}' (available: {})",
+                other,
+                JENKINS_ACTIONS.join(", ")
+            )),
+        }
+    }
+}
+
+/// Truncate a string to `max` chars, noting the original size.
+fn truncate_chars(body: String, max: usize) -> String {
+    let truncated: String = body.chars().take(max).collect();
+    if truncated.len() < body.len() {
+        format!("{}\n\n[truncated: {} bytes total]", truncated, body.len())
+    } else {
+        truncated
     }
 }
 
@@ -4052,6 +4415,7 @@ mod tests {
             Path::new("/work/proj").to_path_buf(),
             String::new(),
             "basic".to_string(),
+            Vec::new(),
         );
         assert!(resolve_within(&ctx, "src/main.rs").is_ok());
         assert!(resolve_within(&ctx, "./src/../src/main.rs").is_ok());
@@ -4129,7 +4493,12 @@ mod tests {
         {
             return;
         }
-        let ctx = ToolContext::new(std::env::temp_dir(), String::new(), "basic".to_string());
+        let ctx = ToolContext::new(
+            std::env::temp_dir(),
+            String::new(),
+            "basic".to_string(),
+            Vec::new(),
+        );
         let out = JqTool
             .execute(
                 &serde_json::json!({
@@ -4146,7 +4515,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_tool_runs_custom_command_and_summarizes() {
-        let ctx = ToolContext::new(std::env::temp_dir(), String::new(), "basic".to_string());
+        let ctx = ToolContext::new(
+            std::env::temp_dir(),
+            String::new(),
+            "basic".to_string(),
+            Vec::new(),
+        );
         let out = TestTool
             .execute(
                 &serde_json::json!({
@@ -4208,6 +4582,7 @@ mod tests {
             Path::new("/work/proj").to_path_buf(),
             String::new(),
             "basic".to_string(),
+            Vec::new(),
         );
         let (host, container, ro) =
             parse_sandbox_mount("nginx.conf:/etc/nginx/nginx.conf:ro", &ctx).unwrap();
@@ -4279,6 +4654,22 @@ mod tests {
                 "local.txt"
             ]
         );
+    }
+
+    #[test]
+    fn private_host_allowlist() {
+        let allow = vec![
+            "192.168.5.0/24".to_string(),
+            "jenkins.local".to_string(),
+            "10.0.0.5".to_string(),
+        ];
+        assert!(host_allowed("jenkins.local", &allow));
+        assert!(host_allowed("ci.jenkins.local", &allow));
+        assert!(!host_allowed("evil.com", &allow));
+        assert!(ip_allowed(&"192.168.5.39".parse().unwrap(), &allow));
+        assert!(!ip_allowed(&"192.168.6.1".parse().unwrap(), &allow));
+        assert!(ip_allowed(&"10.0.0.5".parse().unwrap(), &allow));
+        assert!(!ip_allowed(&"10.0.0.6".parse().unwrap(), &allow));
     }
 
     #[test]

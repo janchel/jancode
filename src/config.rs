@@ -21,6 +21,39 @@ pub struct Config {
     pub mcp: McpConfig,
     #[serde(default)]
     pub database: DatabaseConfig,
+    #[serde(default)]
+    pub tools: ToolsConfig,
+    #[serde(default)]
+    pub security: SecurityConfig,
+}
+
+/// Approval policy rules. These reduce prompt fatigue (allow) or force a
+/// prompt/deny (deny) for specific tools, bash commands, or SSH hosts.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct SecurityConfig {
+    /// Tools that never prompt, even if they would normally be gated.
+    #[serde(default)]
+    pub allow_tools: Vec<String>,
+    /// Tools that are always denied.
+    #[serde(default)]
+    pub deny_tools: Vec<String>,
+    /// Bash commands matching any regex never prompt.
+    #[serde(default)]
+    pub allow_bash_patterns: Vec<String>,
+    /// SSH hosts (`ssh`/`ssh_copy`) that never prompt.
+    #[serde(default)]
+    pub allow_hosts: Vec<String>,
+}
+
+/// Tool-level settings that don't belong to a single tool.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ToolsConfig {
+    /// Hosts/CIDRs the web tools (`fetch_url`, `http_request`, `download`,
+    /// `jenkins`) may reach even though they resolve to private/loopback
+    /// addresses. Exact names (`jenkins.local`), suffixes (`internal`), or
+    /// IPv4 CIDRs (`192.168.5.0/24`).
+    #[serde(default)]
+    pub allowed_private_hosts: Vec<String>,
 }
 
 /// Optional database used by the `sql` tool. When a query runs without an
@@ -170,6 +203,14 @@ pub struct ServerConfig {
     /// without producing a final answer). Default 75.
     #[serde(default = "default_max_total_tool_calls")]
     pub max_total_tool_calls: u32,
+    /// Auto-compact the conversation when the estimated context exceeds this
+    /// fraction of the provider's `context_window` (0.0-1.0). `0` disables
+    /// auto-compaction (`/compact` still works). Default 0.8.
+    #[serde(default = "default_compact_threshold")]
+    pub compact_threshold: f64,
+    /// Messages kept verbatim after a compaction. Default 6.
+    #[serde(default = "default_compact_keep")]
+    pub compact_keep: usize,
 }
 
 fn default_base_url() -> String {
@@ -224,6 +265,14 @@ fn default_max_total_tool_calls() -> u32 {
     75
 }
 
+fn default_compact_threshold() -> f64 {
+    0.8
+}
+
+fn default_compact_keep() -> usize {
+    6
+}
+
 // Hand-written so a config file with no `[server]` section gets the SAME
 // defaults as an empty `[server]` (serde uses this impl for the missing field,
 // while the `default = "..."` attrs cover missing individual keys). A derived
@@ -240,6 +289,8 @@ impl Default for ServerConfig {
             show_diffs: default_show_diffs(),
             max_tool_loops: default_max_tool_loops(),
             max_total_tool_calls: default_max_total_tool_calls(),
+            compact_threshold: default_compact_threshold(),
+            compact_keep: default_compact_keep(),
         }
     }
 }

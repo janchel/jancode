@@ -34,6 +34,13 @@ pub enum Request {
         /// (`Event::ApprovalRequired`). Headless clients leave this false.
         #[serde(default)]
         interactive: bool,
+        /// Plan mode: read-only tools run freely, but any gated (mutating)
+        /// operation is auto-denied instead of prompting.
+        #[serde(default)]
+        plan_mode: bool,
+        /// Local image files to attach to this message (multimodal input).
+        #[serde(default)]
+        images: Vec<String>,
     },
     Cancel {
         id: u64,
@@ -45,6 +52,11 @@ pub enum Request {
     /// Fetch one session's history. `session_id` is required; omitting it
     /// returns an empty list (never another session's messages).
     GetHistory {
+        id: u64,
+        session_id: Option<String>,
+    },
+    /// Summarize the older part of a session and keep only the recent messages.
+    Compact {
         id: u64,
         session_id: Option<String>,
     },
@@ -132,6 +144,12 @@ pub enum Event {
     History {
         id: u64,
         messages: Vec<Message>,
+    },
+    /// Response to `Request::Compact`.
+    Compacted {
+        id: u64,
+        removed: usize,
+        kept: usize,
     },
     Pong {
         id: u64,

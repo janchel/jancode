@@ -172,6 +172,25 @@ idle_timeout_secs = 300
 # Max model turns / total tool calls per request. Raise for big-project analysis.
 # max_tool_loops = 50
 # max_total_tool_calls = 75
+# Auto-compact the conversation when the estimated context exceeds this
+# fraction of the provider's context_window (0 disables; /compact still works).
+# compact_threshold = 0.8
+# Messages kept verbatim after a compaction.
+# compact_keep = 6
+
+# Hosts/CIDRs the web tools (fetch_url/http_request/download/jenkins) may reach
+# even when they resolve to private/loopback addresses, e.g. an internal
+# Jenkins. Exact names, domain suffixes, or IPv4 CIDRs.
+# [tools]
+# allowed_private_hosts = ["192.168.5.0/24", "jenkins.local"]
+
+# Approval policy rules: skip prompts for specific tools/commands/hosts, or
+# always deny a tool.
+# [security]
+# allow_tools = ["edit", "apply_patch"]
+# deny_tools = ["docker"]
+# allow_bash_patterns = ["^cargo (test|clippy)"]
+# allow_hosts = ["server1"]
 
 # Single-provider setup (legacy): use the `[provider]` table.
 [provider]
